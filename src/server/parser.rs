@@ -297,6 +297,16 @@ pub struct ToolConfig {
 }
 
 impl ToolConfig {
+    pub fn for_nemotron_moe() -> Self {
+        Self {
+            start_token_ids: HashSet::new(),
+            end_token_ids: HashSet::new(),
+            start_token_str: "<tool_call>".to_string(),
+            end_token_str: "</tool_call>".to_string(),
+            start_is_special: false,
+            end_is_special: false,
+        }
+    }
     /// Create tool config for a specific model type
     pub fn for_model_type(model_type: &ModelType) -> Self {
         let mut start_ids = HashSet::new();
@@ -360,6 +370,14 @@ impl ToolConfig {
                     end_is_special: false,
                 }
             }
+            ModelType::NemotronH => ToolConfig {
+                start_token_ids: start_ids,
+                end_token_ids: end_ids,
+                start_token_str: "<TOOLCALL>".to_string(),
+                end_token_str: "</TOOLCALL>".to_string(),
+                start_is_special: false,
+                end_is_special: false,
+            },
             ModelType::Gemma | ModelType::Gemma3 => {
                 // Gemma 2/3 - uses text-only matching
                 ToolConfig {
@@ -716,7 +734,13 @@ pub fn detect_prefilled_reasoning_end_marker(prompt: &str) -> Option<String> {
 impl StreamToolParser {
     /// Create a new parser for the given model type
     pub fn new(model_type: ModelType, model_id: String) -> Self {
-        let config = ToolConfig::for_model_type(&model_type);
+        let config = if matches!(model_type, ModelType::NemotronH)
+            && model_id.to_ascii_lowercase().contains("nemotron-3")
+        {
+            ToolConfig::for_nemotron_moe()
+        } else {
+            ToolConfig::for_model_type(&model_type)
+        };
         Self::new_with_config(&model_type, model_id, config, Vec::new(), None)
     }
 
@@ -753,6 +777,10 @@ impl StreamToolParser {
                 );
             }
             name
+        } else if matches!(model_type, ModelType::NemotronH)
+            && config.start_token_str == "<tool_call>"
+        {
+            "qwen_coder"
         } else {
             Self::parser_name_for_model(model_type, &model_id)
         };
@@ -1631,7 +1659,21 @@ impl StreamToolParser {
 
         parsed_calls
             .into_iter()
-            .map(crate::tools::tool_call_from_parser)
+            .map(|parsed| {
+                let mut call = crate::tools::tool_call_from_parser(parsed);
+                if self.config.start_token_str == "<TOOLCALL>" {
+                    if let Some(encoded) = call.function.arguments.as_deref() {
+                        if let Ok(Value::String(inner)) = serde_json::from_str::<Value>(encoded) {
+                            if serde_json::from_str::<Value>(&inner)
+                                .is_ok_and(|value| value.is_object() || value.is_array())
+                            {
+                                call.function.arguments = Some(inner);
+                            }
+                        }
+                    }
+                }
+                call
+            })
             .collect()
     }
 
@@ -1639,6 +1681,15 @@ impl StreamToolParser {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return "{}".to_string();
+        }
+        if self.config.start_token_str == "<TOOLCALL>" {
+            if let Ok(Value::String(inner)) = serde_json::from_str::<Value>(trimmed) {
+                if serde_json::from_str::<Value>(&inner)
+                    .is_ok_and(|value| value.is_object() || value.is_array())
+                {
+                    return inner;
+                }
+            }
         }
         if serde_json::from_str::<Value>(trimmed).is_ok() {
             return trimmed.to_string();
@@ -1691,6 +1742,13 @@ impl StreamToolParser {
             ModelType::Gemma | ModelType::Gemma3 | ModelType::Gemma4 => "json",
             ModelType::LLaMa4 => "pythonic",
             ModelType::Phi | ModelType::Phi4 => "qwen",
+            ModelType::NemotronH => {
+                if model_lower.contains("nemotron-3") {
+                    "qwen_coder"
+                } else {
+                    "json"
+                }
+            }
             ModelType::GLM4 | ModelType::GLM4MoE | ModelType::GLM4MoeLite | ModelType::GLM5 => {
                 "glm47_moe"
             }
@@ -3237,6 +3295,65 @@ abc
             StreamToolParser::parser_name_for_model(&ModelType::MiniMax, "MiniMax-M2.5-NVFP4"),
             "minimax_m2"
         );
+    }
+
+    #[tokio::test]
+    async fn test_nemotron_h_toolcall_envelope() {
+        let tools = vec![crate::tools::function_tool("search", "desc").build()];
+        let parser = StreamToolParser::new_with_config(
+            &ModelType::NemotronH,
+            "nvidia/NVIDIA-Nemotron-Nano-9B-v2-Japanese".to_string(),
+            ToolConfig::for_model_type(&ModelType::NemotronH),
+            tools,
+            None,
+        );
+        assert_eq!(
+            StreamToolParser::parser_name_for_model(&ModelType::NemotronH, "nemotron"),
+            "json"
+        );
+        let calls = parser
+            .parse_complete_with_fallback(
+                r#"<TOOLCALL>[{"name":"search","arguments":"{\"query\":\"東京\"}"}]</TOOLCALL>"#,
+            )
+            .await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "search");
+        let args: Value =
+            serde_json::from_str(calls[0].function.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["query"], "東京");
+        assert_eq!(
+            parser.finalize_streamed_arguments(r#""{\"query\":\"東京\"}""#),
+            r#"{"query":"東京"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nemotron_3_xml_toolcall_envelope() {
+        let parser = StreamToolParser::new_with_config(
+            &ModelType::NemotronH,
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4".to_string(),
+            ToolConfig::for_nemotron_moe(),
+            vec![crate::tools::function_tool("search", "desc").build()],
+            None,
+        );
+        assert_eq!(parser.config.start_token_str, "<tool_call>");
+        assert_eq!(
+            StreamToolParser::parser_name_for_model(
+                &ModelType::NemotronH,
+                "NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+            ),
+            "qwen_coder"
+        );
+        let calls = parser
+            .parse_complete_with_fallback(
+                "<tool_call>\n<function=search>\n<parameter=query>\n東京\n</parameter>\n</function>\n</tool_call>",
+            )
+            .await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "search");
+        let args: Value =
+            serde_json::from_str(calls[0].function.arguments.as_deref().unwrap()).unwrap();
+        assert_eq!(args["query"], "東京");
     }
 
     #[test]

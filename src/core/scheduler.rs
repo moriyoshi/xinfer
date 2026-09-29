@@ -151,7 +151,7 @@ impl Scheduler {
                     .architectures
                     .as_ref()
                     .and_then(|arches| arches.first())
-                    .map(|arch| crate::utils::is_qwen3_hybrid_arch_name(arch))
+                    .map(|arch| crate::utils::is_stateful_hybrid_arch_name(arch))
                     .unwrap_or(false),
                 mamba_snapshot_default_stride_blocks,
             ),

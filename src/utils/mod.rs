@@ -1228,6 +1228,10 @@ pub fn is_qwen3_hybrid_arch_name(arch: &str) -> bool {
     )
 }
 
+pub fn is_stateful_hybrid_arch_name(arch: &str) -> bool {
+    is_qwen3_hybrid_arch_name(arch) || arch == "NemotronHForCausalLM"
+}
+
 fn is_qwen_chat_template_arch_name(arch: &str) -> bool {
     matches!(
         arch,
@@ -1370,6 +1374,23 @@ pub fn resolve_qwen3_hybrid_config(config: &Config) -> Qwen3HybridConfig {
 }
 
 pub fn qwen3_hybrid_layer_types(config: &Config) -> Option<Vec<String>> {
+    if config.architectures.as_ref()?.first()?.as_str() == "NemotronHForCausalLM" {
+        let raw: serde_json::Value =
+            serde_json::from_str(config.extra_config_json.as_ref()?).ok()?;
+        let pattern = raw.get("hybrid_override_pattern")?.as_str()?;
+        if pattern.len() != config.num_hidden_layers {
+            return None;
+        }
+        return pattern
+            .bytes()
+            .map(|kind| match kind {
+                b'M' => Some("linear_attention".to_string()),
+                b'*' => Some("full_attention".to_string()),
+                b'-' | b'E' => Some("mlp".to_string()),
+                _ => None,
+            })
+            .collect();
+    }
     if !is_qwen3_hybrid_arch(config) {
         return None;
     }
@@ -2219,6 +2240,7 @@ pub fn get_arch_rope(
         ("GlmMoeDsaForCausalLM", true),
         ("Phi3ForCausalLM", false),
         ("Phi4ForCausalLM", false),
+        ("NemotronHForCausalLM", false),
         ("MistralForCausalLM", false),
         ("Mistral3ForConditionalGeneration", false),
         ("LlamaForCausalLM", false),
@@ -2277,6 +2299,7 @@ pub fn get_arch_rope(
             ModelType::Qwen3_5,
             "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n".to_string(),
         ),
+        "NemotronHForCausalLM" => (ModelType::NemotronH, "{}".to_string()),
         "Qwen3_5MoeForCausalLM" | "Qwen3NextForCausalLM" | "qwen35moe" => (
             ModelType::Qwen3_5MoE,
             "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n".to_string(),

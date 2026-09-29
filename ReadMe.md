@@ -147,6 +147,8 @@ Add `--kvcache-dtype` to compress KV cache and extend context length:
 * ✅ Qwen3 Next
 * ✅ Qwen3.5/3.6/3.8 Dense/MoE (27B, 35B, 122B, 397B, Multimodal model)
 * ✅ Qwen3.8-Next/Qwen4
+* ✅ NVIDIA Nemotron Nano 9B v2 Japanese (Nemotron-H; BF16 Safetensors, single GPU)
+* ✅ NVIDIA Nemotron 3 Nano 30B A3B NVFP4 (Nemotron-H MoE; mixed BF16/NVFP4 Safetensors, single GPU)
 * ✅ Mistral v1, v2
 * ✅ Mistral-3-VL Reasoning (3B, 8B, 14B, Multimodal model)
 * ✅ GLM4 (0414)

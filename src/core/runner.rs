@@ -4,6 +4,7 @@ use crate::models::gemma4::Gemma4ForCausalLM;
 use crate::models::layers::distributed::Comm;
 use crate::models::layers::linear::set_linear_is_prefill;
 use crate::models::layers::VarBuilderX;
+use crate::models::nemotron_h::NemotronHForCausalLM;
 use crate::models::qwen3_5_mtp::Qwen3_5MtpHead;
 use crate::server::EmbeddingStrategy;
 use crate::transfer::Transfer;
@@ -91,6 +92,7 @@ fn guided_decoding_requests<'a>(
 }
 
 pub enum Model {
+    NemotronH(Arc<NemotronHForCausalLM>),
     Qwen3(Arc<Qwen3ForCausalLM>),
     Qwen3MoE(Arc<Qwen3MoEForCausalLM>),
     Qwen3_5(Arc<Qwen3_5ForCausalLM>),
@@ -378,6 +380,7 @@ impl ModelRunner {
             reporter,
             {
                 Qwen3 => Qwen3ForCausalLM,
+                NemotronH => NemotronHForCausalLM,
                 Qwen3MoE => Qwen3MoEForCausalLM,
                 Qwen3_5 => Qwen3_5ForCausalLM,
                 Qwen3_5MoE => Qwen3_5MoEForCausalLM,
@@ -405,6 +408,7 @@ impl ModelRunner {
             device,
             {
                 Qwen3 => EmbedInputs,
+                NemotronH => EmbedInputs,
                 Qwen3MoE => EmbedInputs,
                 Qwen3_5 => EmbedInputs,
                 Qwen3_5MoE => EmbedInputs,
@@ -433,6 +437,7 @@ impl ModelRunner {
                 device,
                 {
                     Qwen3 => EmbedInputs,
+                    NemotronH => EmbedInputs,
                     Qwen3MoE => EmbedInputs,
                     Qwen3_5 => EmbedInputs,
                     Qwen3_5MoE => EmbedInputs,
@@ -504,7 +509,9 @@ impl ModelRunner {
         };
 
         let is_hybrid_mamba_model = match &model {
-            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) => true,
+            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) | Model::NemotronH(_) => {
+                true
+            }
             Model::Qwen3VL(m) => m.uses_hybrid_mamba_text_model(),
             _ => false,
         };
@@ -570,6 +577,10 @@ impl ModelRunner {
             mamba_prefix_capacity = mamba_prefix_capacity.max(mamba_cache_capacity.max(1));
         }
         match &model {
+            Model::NemotronH(model) => {
+                model.preallocate_mamba_cache(mamba_cache_capacity)?;
+                model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
+            }
             Model::Qwen3_5(model) => {
                 model.preallocate_mamba_cache(mamba_cache_capacity)?;
                 model.set_mamba_prefix_cache_capacity(mamba_prefix_capacity);
@@ -751,7 +762,7 @@ impl ModelRunner {
             && comm.rank() == 0
             && matches!(
                 model,
-                Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_)
+                Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) | Model::NemotronH(_)
             )
         {
             crate::log_info!(
@@ -933,7 +944,11 @@ impl ModelRunner {
 
     fn restore_mamba_prefix_states_for_prefill(&self, seqs: &[&Sequence]) -> Result<()> {
         match &self.model {
-            Model::Qwen3_5(_) | Model::Qwen3_5MoE(_) | Model::Qwen4(_) | Model::Qwen3VL(_) => {
+            Model::Qwen3_5(_)
+            | Model::Qwen3_5MoE(_)
+            | Model::Qwen4(_)
+            | Model::Qwen3VL(_)
+            | Model::NemotronH(_) => {
                 for seq in seqs {
                     if seq.num_cached_tokens == 0 {
                         continue;
@@ -967,6 +982,7 @@ impl ModelRunner {
 
     fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         match &self.model {
+            Model::NemotronH(model) => model.restore_mamba_prefix_state(seq_id, hash),
             Model::Qwen3_5(model) => model.restore_mamba_prefix_state(seq_id, hash),
             Model::Qwen3_5MoE(model) => model.restore_mamba_prefix_state(seq_id, hash),
             Model::Qwen4(model) => model.restore_mamba_prefix_state(seq_id, hash),
@@ -982,6 +998,7 @@ impl ModelRunner {
         preserve: bool,
     ) -> Result<bool> {
         match &self.model {
+            Model::NemotronH(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
             Model::Qwen3_5(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
             Model::Qwen3_5MoE(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
             Model::Qwen4(model) => model.capture_mamba_prefix_state(seq_id, hash, preserve),
@@ -992,6 +1009,7 @@ impl ModelRunner {
 
     pub fn has_mamba_prefix_state(&self, hash: u64) -> Result<bool> {
         match &self.model {
+            Model::NemotronH(model) => Ok(model.has_mamba_prefix_state(hash)),
             Model::Qwen3_5(model) => Ok(model.has_mamba_prefix_state(hash)),
             Model::Qwen3_5MoE(model) => Ok(model.has_mamba_prefix_state(hash)),
             Model::Qwen4(model) => Ok(model.has_mamba_prefix_state(hash)),
@@ -1002,6 +1020,7 @@ impl ModelRunner {
 
     pub fn remove_mamba_prefix_state(&self, hash: u64) -> Result<bool> {
         match &self.model {
+            Model::NemotronH(model) => Ok(model.remove_mamba_prefix_state(hash)),
             Model::Qwen3_5(model) => Ok(model.remove_mamba_prefix_state(hash)),
             Model::Qwen3_5MoE(model) => Ok(model.remove_mamba_prefix_state(hash)),
             Model::Qwen4(model) => Ok(model.remove_mamba_prefix_state(hash)),
@@ -1184,6 +1203,7 @@ impl ModelRunner {
                 (&input_ids, &positions, kv_pairs, &input_metadata),
                 {
                     Qwen3 => false,
+                    NemotronH => false,
                     Qwen3MoE => false,
                     Qwen3_5 => false,
                     Qwen3_5MoE => false,
@@ -1224,6 +1244,7 @@ impl ModelRunner {
             (&input_ids, &positions, kv_pairs, &input_metadata),
             {
                 Qwen3 => false,
+                NemotronH => false,
                 Qwen3MoE => false,
                 Qwen3_5 => false,
                 Qwen3_5MoE => false,
@@ -1973,6 +1994,7 @@ impl ModelRunner {
         }
         match &self.model {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
+            Model::NemotronH(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),
             Model::Qwen4(model) => model.release_sequence_state(id),
             Model::Qwen3VL(model) => model.release_sequence_state(id),
@@ -1984,6 +2006,7 @@ impl ModelRunner {
     pub fn get_model_vocab_size(&self) -> usize {
         match &self.model {
             Model::Qwen3(model) => model.get_vocab_size(),
+            Model::NemotronH(model) => model.get_vocab_size(),
             Model::Qwen3MoE(model) => model.get_vocab_size(),
             Model::Qwen3_5(model) => model.get_vocab_size(),
             Model::Qwen3_5MoE(model) => model.get_vocab_size(),
@@ -2007,11 +2030,12 @@ impl ModelRunner {
 
     #[cfg(all(feature = "cuda", feature = "graph"))]
     pub fn warmup_capture(&mut self) -> Result<()> {
-        if matches!(self.model_type, ModelType::DeepSeekV4) {
-            // V4 keeps recurrent compressor/indexer state per request and swaps
-            // those GPU handles between requests, which a captured graph cannot
-            // follow. Decode always runs eagerly for this model.
-            crate::log_warn!("CUDA graph capture disabled for DeepSeek V4");
+        if matches!(
+            self.model_type,
+            ModelType::DeepSeekV4 | ModelType::NemotronH
+        ) {
+            // Recurrent state is keyed by sequence and is not graph stable.
+            crate::log_warn!("CUDA graph capture disabled for this recurrent model");
             return Ok(());
         }
         let kv_cache_lock = self.gpu_kv_cache.lock().unwrap();
@@ -2036,6 +2060,7 @@ impl ModelRunner {
         }
 
         match &self.model {
+            Model::NemotronH(model) => model.reset_mamba_cache()?,
             Model::Qwen3_5(model) => model.reset_mamba_cache()?,
             Model::Qwen3_5MoE(model) => model.reset_mamba_cache()?,
             Model::Qwen4(model) => model.reset_mamba_cache()?,

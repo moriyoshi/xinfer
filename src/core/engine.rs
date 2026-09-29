@@ -168,7 +168,7 @@ impl LLMEngine {
             "Only one architecture is supported at the moment!"
         );
         let arch = config.architectures.as_ref().unwrap()[0].clone();
-        if crate::utils::is_qwen3_hybrid_arch_name(arch.as_str()) {
+        if crate::utils::is_stateful_hybrid_arch_name(arch.as_str()) {
             if let Some(p_cfg) = &econfig.pd_config {
                 let role = match p_cfg.role {
                     PdRole::Server => "pd-server",
@@ -496,6 +496,20 @@ impl LLMEngine {
 
         // Preserve model-specific tool token detection for non-guided paths.
         let mut tool_config = ToolConfig::for_model_type(&model_type);
+        if matches!(model_type, ModelType::NemotronH)
+            && config
+                .extra_config_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|root| {
+                    root.get("hybrid_override_pattern")
+                        .and_then(|value| value.as_str())
+                        .map(|pattern| pattern.contains('E'))
+                })
+                .unwrap_or(false)
+        {
+            tool_config = ToolConfig::for_nemotron_moe();
+        }
         tool_config.validate_with_tokenizer(&tokenizer, &model_type);
         let tool_call_start_ids = tool_config.tool_call_start_ids(&tokenizer);
         let tool_call_end_ids = tool_config.tool_call_end_ids(&tokenizer);

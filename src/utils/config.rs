@@ -273,6 +273,14 @@ impl RopeScalingValue {
     }
 }
 
+fn default_hidden_act() -> candle_nn::Activation {
+    candle_nn::Activation::Silu
+}
+
+fn default_rms_norm_eps() -> f64 {
+    1e-5
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     pub architectures: Option<Vec<String>>,
@@ -285,6 +293,7 @@ pub struct Config {
     pub max_model_len: Option<usize>,
     #[serde(default, alias = "ffn_hidden_size", alias = "feed_forward_length")]
     pub intermediate_size: usize,
+    #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f64,
     pub vocab_size: Option<usize>,
     pub rope_theta: Option<f64>,
@@ -302,7 +311,7 @@ pub struct Config {
     pub partial_rotary_factor: Option<f32>,
     #[serde(default)]
     pub output_gate_type: Option<String>,
-    #[serde(alias = "hidden_activation")]
+    #[serde(default = "default_hidden_act", alias = "hidden_activation")]
     pub hidden_act: candle_nn::Activation,
     #[serde(alias = "rope_parameters")]
     pub rope_scaling: Option<HashMap<String, RopeScalingValue>>,
@@ -958,6 +967,7 @@ impl Default for SamplingParams {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ModelType {
+    NemotronH,
     Qwen3,
     Qwen3MoE,
     Qwen3_5,
@@ -987,6 +997,7 @@ impl ModelType {
     /// Convert architecture string to ModelType
     pub fn from_architectures(architectures: &[String]) -> Option<Self> {
         architectures.first().and_then(|arch| match arch.as_str() {
+            "NemotronHForCausalLM" => Some(ModelType::NemotronH),
             "Qwen3ForCausalLM" => Some(ModelType::Qwen3),
             "Qwen3MoEForCausalLM" => Some(ModelType::Qwen3MoE),
             "Qwen3_5ForCausalLM" => Some(ModelType::Qwen3_5),

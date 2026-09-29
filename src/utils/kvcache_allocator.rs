@@ -356,9 +356,37 @@ impl KVCacheAllocator {
             config.num_hidden_layers
         };
 
-        let (hybrid_mamba_slot_bytes, hybrid_num_gdn_layers) = if let Some(block_types) =
-            qwen3_hybrid_layer_types(config)
+        let (hybrid_mamba_slot_bytes, hybrid_num_gdn_layers) = if config
+            .architectures
+            .as_ref()
+            .and_then(|a| a.first())
+            .is_some_and(|a| a == "NemotronHForCausalLM")
         {
+            let raw: serde_json::Value = config
+                .extra_config_json
+                .as_ref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or_default();
+            let get = |key: &str| raw.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let heads = get("mamba_num_heads");
+            let head_dim = get("mamba_head_dim");
+            let groups = get("n_groups");
+            let state_dim = get("ssm_state_size");
+            let kernel = get("conv_kernel");
+            let num_mamba = qwen3_hybrid_layer_types(config)
+                .unwrap_or_default()
+                .iter()
+                .filter(|t| t.as_str() == "linear_attention")
+                .count();
+            let conv_dim = heads
+                .saturating_mul(head_dim)
+                .saturating_add(2usize.saturating_mul(groups).saturating_mul(state_dim));
+            let per_layer = conv_dim
+                .saturating_mul(kernel.saturating_sub(1))
+                .saturating_add(heads.saturating_mul(head_dim).saturating_mul(state_dim))
+                .saturating_mul(DType::F32.size_in_bytes());
+            (Some(num_mamba.saturating_mul(per_layer)), num_mamba)
+        } else if let Some(block_types) = qwen3_hybrid_layer_types(config) {
             let num_gdn_layers = block_types
                 .iter()
                 .filter(|t| t.as_str() == "linear_attention")

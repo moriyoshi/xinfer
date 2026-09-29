@@ -11,6 +11,7 @@ pub mod llama;
 pub mod llama4;
 pub mod minimax;
 pub mod mistral3_vl;
+pub mod nemotron_h;
 pub mod phi4;
 pub mod qwen3;
 pub mod qwen3_5;
