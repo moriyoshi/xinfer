@@ -1005,10 +1005,10 @@ fn merge_multimodal_top_level_config(
 ) -> Result<()> {
     if let Some(qcfg) = raw_root.get("quantization_config") {
         if !qcfg.is_null() {
-            let mut parsed = serde_json::from_value::<QuantConfig>(qcfg.clone())
+            let parsed = serde_json::from_value::<QuantConfig>(qcfg.clone())
                 .map_err(candle_core::Error::wrap)?;
-            parsed.normalize_compressed_tensors();
             config.quantization_config = Some(parsed);
+            config.normalize_quantization_config();
         }
     }
 
@@ -1690,8 +1690,8 @@ pub fn init_config_tokenizer(
             }
         }
 
-        if let Some(qcfg) = &mut config.quantization_config {
-            qcfg.normalize_compressed_tensors();
+        config.normalize_quantization_config();
+        if let Some(qcfg) = &config.quantization_config {
             if let Some(mode) = &qcfg.mode {
                 if mode.eq_ignore_ascii_case("mxfp4") && qcfg.quant_method.is_empty() {
                     panic!(

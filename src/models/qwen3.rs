@@ -176,6 +176,10 @@ impl Qwen3ForCausalLM {
         progress_reporter: Arc<RwLock<Box<dyn ProgressLike>>>,
         prefix: Option<String>,
     ) -> Result<Self> {
+        // Public constructors can receive a serde-parsed config directly,
+        // without passing through the engine's normalized config loader.
+        let mut config = config.clone();
+        config.normalize_quantization_config();
         let has_prefix = prefix.is_some();
         let mut prefix = prefix.unwrap_or("model.".to_string());
         let gguf_prefix = if has_prefix {
@@ -222,7 +226,7 @@ impl Qwen3ForCausalLM {
             } else {
                 dtype
             },
-            config,
+            &config,
             &vb.device(),
             is_rope_i,
             config.rope_theta,
@@ -243,7 +247,7 @@ impl Qwen3ForCausalLM {
                 .as_str()),
                 comm.clone(),
                 rotary_emb.clone(),
-                config,
+                &config,
                 dtype,
             )?;
             layers.push(layer);
@@ -290,7 +294,7 @@ impl Qwen3ForCausalLM {
             norm,
             lm_head,
             device: device.clone(),
-            config: config.clone(),
+            config,
             dtype,
             vocab_size,
             is_qvar_builder,

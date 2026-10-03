@@ -366,6 +366,15 @@ impl fmt::Debug for Config {
 }
 
 impl Config {
+    /// Resolve quantization formats and parameters after deserialization.
+    /// Direct model constructors may receive a raw `Config`; call this once
+    /// before interpreting `quantization_config` fields such as `group_size`.
+    pub fn normalize_quantization_config(&mut self) {
+        if let Some(quantization) = self.quantization_config.as_mut() {
+            quantization.normalize_compressed_tensors();
+        }
+    }
+
     pub fn apply_generation_cfg(&mut self, generation_cfg: Option<&GenerationConfig>) {
         let Some(gcfg) = generation_cfg else { return };
 
@@ -1491,6 +1500,28 @@ impl std::fmt::Display for ReasoningEffort {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen3_nvfp4_direct_config_normalizes_group_size() {
+        let mut config: Config = serde_json::from_str(include_str!(
+            "../../tests/fixtures/qwen3_0_6b_nvfp4_config.json"
+        ))
+        .unwrap();
+        let raw = config.quantization_config.as_ref().unwrap();
+        assert_eq!(raw.quant_method, "compressed-tensors");
+        assert_eq!(raw.bits, 0);
+        assert_eq!(raw.group_size, 0);
+
+        config.normalize_quantization_config();
+        let normalized = config.quantization_config.as_ref().unwrap().clone();
+        assert_eq!(normalized.quant_method, "nvfp4");
+        assert_eq!(normalized.bits, 4);
+        assert_eq!(normalized.group_size, 16);
+        assert!(normalized.should_skip_module("lm_head"));
+
+        config.normalize_quantization_config();
+        assert_eq!(config.quantization_config, Some(normalized));
+    }
 
     #[test]
     fn test_match_ignore_literal_exact() {
