@@ -3,6 +3,7 @@ pub mod deepstack;
 pub mod deltanet;
 pub mod distributed;
 pub mod ds_v4;
+pub mod gdn_state;
 pub mod indexer;
 pub mod linear;
 pub mod mask;

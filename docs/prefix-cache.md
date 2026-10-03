@@ -71,6 +71,32 @@ snapshots are protected from ordinary decode-time snapshot churn. When the CPU
 snapshot tier is full, LRU eviction frees at least 10% of the tier in one batch
 before accepting new GDN/Mamba snapshot offloads.
 
+## Portable GDN state for separate-GPU prefill
+
+`Qwen3_5ForCausalLM::export_gdn_state` and its MoE counterpart export all Gated
+DeltaNet convolution and recurrent states for one sequence after a completed
+prefill boundary. They return a `GdnStateSnapshot` with version, token count,
+absolute decoder layer order, FP32 shapes and dtypes, tensor-parallel rank and
+world size, a payload
+SHA-256, and exact little-endian FP32 bits. `to_bytes` and `from_bytes` provide
+a portable binary envelope. `import_gdn_state` validates the complete snapshot
+before allocating an unused sequence slot on the target model.
+
+```rust
+let snapshot = prefill_model.export_gdn_state(seq_id, prefix_tokens, fingerprint)?;
+let bytes = snapshot.to_bytes()?;
+let snapshot = GdnStateSnapshot::from_bytes(&bytes)?;
+decode_model.import_gdn_state(new_seq_id, prefix_tokens, fingerprint, &snapshot)?;
+```
+
+The caller supplies the same 32-byte SHA-256 model fingerprint on both sides.
+It must identify weights, adapters, and numerical execution settings; xinfer
+does not derive it from loaded weights. The caller must also restore attention
+KV from the **same exact token boundary** before decoding, and must give the
+imported sequence an unused ID with enough Mamba cache capacity. An existing
+slot is rejected so an active sequence cannot be overwritten. The model API
+does not itself store, transport, or publish a combined KV and GDN bundle.
+
 ## Inspecting cache hits
 
 Chat completion responses include the prefix-cache hit count under

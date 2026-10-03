@@ -3,6 +3,9 @@
 use crate::models::layers::attention::Attention;
 use crate::models::layers::deltanet::GatedDeltaNet;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
+use crate::models::layers::gdn_state::{
+    export_gdn_state, import_gdn_state, GdnStateLayout, GdnStateSnapshot,
+};
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -339,6 +342,7 @@ pub struct Qwen3_5MoEForCausalLM {
     norm: NormX,
     lm_head: VocabParallelLinear,
     mamba_cache: RwLock<MambaCache>,
+    gdn_state_layout: Option<GdnStateLayout>,
     device: Device,
     config: Config,
     dtype: DType,
@@ -623,6 +627,20 @@ impl Qwen3_5MoEForCausalLM {
         } else {
             MambaCache::new(0, 1, 1, 2, 1, 1, 1, DType::F32, DType::F32, device)?
         };
+        let gdn_state_layout = if num_gdn_layers > 0 {
+            Some(GdnStateLayout::from_cache(
+                &mamba_cache,
+                layer_types
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, kind)| (kind == "linear_attention").then_some(i as u32))
+                    .collect(),
+                comm.rank() as u32,
+                comm.world_size() as u32,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             embed_tokens,
@@ -630,6 +648,7 @@ impl Qwen3_5MoEForCausalLM {
             norm,
             lm_head,
             mamba_cache: RwLock::new(mamba_cache),
+            gdn_state_layout,
             device: device.clone(),
             config: config.clone(),
             dtype,
@@ -1070,6 +1089,49 @@ impl Qwen3_5MoEForCausalLM {
 
     pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         self.mamba_cache.write().restore_prefix_state(seq_id, hash)
+    }
+
+    /// Export exact FP32 GDN state after a completed prefill boundary.
+    /// Attention KV at that boundary must be exported separately.
+    pub fn export_gdn_state(
+        &self,
+        seq_id: usize,
+        prefix_tokens: u64,
+        model_fingerprint: [u8; 32],
+    ) -> Result<GdnStateSnapshot> {
+        let layout = self
+            .gdn_state_layout
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Qwen3.5 MoE model has no GDN layers".into()))?;
+        export_gdn_state(
+            &self.mamba_cache.read(),
+            layout,
+            seq_id,
+            prefix_tokens,
+            model_fingerprint,
+        )
+    }
+
+    /// Import into an unused sequence ID after validating the whole snapshot.
+    pub fn import_gdn_state(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        snapshot: &GdnStateSnapshot,
+    ) -> Result<()> {
+        let layout = self
+            .gdn_state_layout
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Qwen3.5 MoE model has no GDN layers".into()))?;
+        import_gdn_state(
+            &mut self.mamba_cache.write(),
+            layout,
+            seq_id,
+            expected_prefix_tokens,
+            expected_model_fingerprint,
+            snapshot,
+        )
     }
 
     pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
