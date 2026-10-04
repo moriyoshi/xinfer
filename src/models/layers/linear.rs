@@ -563,6 +563,45 @@ impl Module for LinearX {
 }
 
 impl LinearX {
+    /// Bytes held by this projection's resident tensors. Used for bounded
+    /// expert caches; count the packed tensors rather than dense equivalents.
+    pub fn resident_bytes(&self) -> Result<usize> {
+        fn bytes(t: &Tensor) -> usize {
+            t.elem_count() * t.dtype().size_in_bytes()
+        }
+        fn optional(t: &Option<Tensor>) -> usize {
+            t.as_ref().map(bytes).unwrap_or(0)
+        }
+        Ok(match self {
+            Self::Linear(ln) => bytes(&ln.weight) + optional(&ln.bias),
+            Self::LnFp8(ln) => {
+                bytes(&ln.weight)
+                    + bytes(&ln.weight_scale)
+                    + optional(&ln.weight_scale_cutlass)
+                    + optional(&ln.bias)
+            }
+            Self::LnMxfp4(ln) => bytes(&ln.blocks) + bytes(&ln.scales) + optional(&ln.bias),
+            Self::LnNvfp4(ln) => {
+                bytes(&ln.blocks)
+                    + bytes(&ln.scales)
+                    + optional(&ln.weight_scale_swizzled)
+                    + optional(&ln.bias)
+            }
+            Self::QLinear(ln) => {
+                let Some(w) = &ln.wna16 else {
+                    candle_core::bail!("expert cache cannot account for GGUF/ISQ weights")
+                };
+                bytes(&w.weight)
+                    + optional(&w.bias)
+                    + optional(&w.scales)
+                    + optional(&w.qzeros)
+                    + optional(&w.g_idx)
+                    + optional(&w.workspace)
+                    + optional(&ln.bias)
+            }
+        })
+    }
+
     /// Run a dense linear whose checkpoint dtype may differ from the model
     /// activation dtype.  GGUF GDN tensors that need layout restoration can
     /// be kept in F16 (IQ tensors cannot be requantized), while the rest of

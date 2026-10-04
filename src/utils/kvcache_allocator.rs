@@ -61,6 +61,8 @@ pub struct GpuMemoryBudget {
     pub transient_bytes: u64,
     /// MLA prefill tensors retained per token (query absorption and attention output)
     pub mla_attention_bytes_per_token: u64,
+    /// Space for Nemotron-H routed experts loaded after KV allocation.
+    pub nemotron_expert_cache_bytes: u64,
     /// Total workspace reserve (sum of above)
     pub total_bytes: u64,
 }
@@ -100,6 +102,12 @@ impl GpuMemoryBudget {
             parts.push(format!(
                 "MLA prefill {:.1}K/token",
                 self.mla_attention_bytes_per_token as f64 / 1024.0
+            ));
+        }
+        if self.nemotron_expert_cache_bytes > 0 {
+            parts.push(format!(
+                "Nemotron experts {:.0}M",
+                self.nemotron_expert_cache_bytes as f64 / SIZE_IN_MB
             ));
         }
         crate::log_warn!(
@@ -222,6 +230,7 @@ pub struct KVCacheAllocator {
     /// Whether FlashInfer GPU workspace is actually initialized at runtime.
     /// When false, do not reserve FlashInfer memory in the KV-cache budget.
     use_flashinfer_workspace: bool,
+    nemotron_expert_cache_bytes: u64,
 }
 
 /// Mirrors `skip_flashinfer_init` in `core/runner.rs`.
@@ -623,6 +632,26 @@ impl KVCacheAllocator {
             is_moe,
             prefill_chunk_size: econfig.effective_prefill_chunk_size(),
             use_flashinfer_workspace: uses_flashinfer_workspace(econfig, config),
+            nemotron_expert_cache_bytes: if config
+                .architectures
+                .as_ref()
+                .and_then(|a| a.first())
+                .is_some_and(|a| a == "NemotronHForCausalLM")
+                && config.extra_config_json.as_ref().is_some_and(|raw| {
+                    serde_json::from_str::<serde_json::Value>(raw)
+                        .ok()
+                        .and_then(|json| {
+                            json["hybrid_override_pattern"].as_str().map(str::to_owned)
+                        })
+                        .is_some_and(|pattern| pattern.contains('E'))
+                }) {
+                std::env::var("XINFER_NEMOTRON_EXPERT_CACHE_BYTES")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            },
         }
     }
 
@@ -717,6 +746,7 @@ impl KVCacheAllocator {
             + flash_splitk_bytes
             + transient_bytes
             + mla_attention_bytes;
+        let total_bytes = total_bytes.saturating_add(self.nemotron_expert_cache_bytes);
         let total_bytes = total_bytes.max(MIN_ACTIVATION_RESERVE_BYTES);
 
         GpuMemoryBudget {
@@ -726,6 +756,7 @@ impl KVCacheAllocator {
             flash_splitk_bytes,
             transient_bytes,
             mla_attention_bytes_per_token,
+            nemotron_expert_cache_bytes: self.nemotron_expert_cache_bytes,
             total_bytes,
         }
     }
@@ -737,6 +768,7 @@ impl KVCacheAllocator {
             .flashinfer_bytes
             .saturating_add(workspace.cutlass_bytes)
             .saturating_add(workspace.flash_splitk_bytes)
+            .saturating_add(workspace.nemotron_expert_cache_bytes)
             .saturating_add(MIN_ACTIVATION_RESERVE_BYTES)
     }
 
@@ -1879,6 +1911,34 @@ impl KVCacheAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nemotron_expert_cache_is_reserved_before_kv_allocation() {
+        let raw = include_str!("../../tests/fixtures/nemotron_3_nano_config.json");
+        let mut config: Config = serde_json::from_str(raw).unwrap();
+        config.extra_config_json = Some(raw.to_string());
+        let engine: EngineConfig = serde_json::from_value(serde_json::json!({
+            "num_blocks": 0,
+            "kvcache_memory_bytes": 0,
+            "block_size": 16,
+            "max_num_seqs": 1,
+            "max_num_batched_tokens": 128,
+            "enable_tool_grammar": false
+        }))
+        .unwrap();
+        let mut allocator = KVCacheAllocator::new(&engine, &config, DType::BF16);
+        allocator.nemotron_expert_cache_bytes = 0;
+        let baseline = allocator.compute_workspace_budget();
+        allocator.nemotron_expert_cache_bytes = 2 * 1024 * 1024 * 1024;
+        let reserved = allocator.compute_workspace_budget();
+        assert_eq!(reserved.nemotron_expert_cache_bytes, 2 * 1024 * 1024 * 1024);
+        assert!(reserved.total_bytes >= 2 * 1024 * 1024 * 1024);
+        assert!(reserved.total_bytes > baseline.total_bytes);
+        assert_eq!(
+            allocator.fixed_workspace_bytes(&reserved),
+            allocator.fixed_workspace_bytes(&baseline) + 2 * 1024 * 1024 * 1024
+        );
+    }
 
     #[test]
     fn hybrid_mamba_graph_capture_max_batch_scales_with_max_num_seqs() {

@@ -1,7 +1,11 @@
 //! Nemotron-H: a sequence of Mamba2, MLP, and unrotated attention blocks.
 //! The recurrent path is deliberately expressed in Candle operations so the
 //! checkpoint can run without the optional mamba-ssm CUDA extension.
+mod expert_cache;
 mod state;
+
+pub use expert_cache::NemotronExpertCacheStats;
+use expert_cache::{ExpertCache, ExpertSource};
 
 pub use state::{
     NemotronMambaSnapshot, NemotronMambaStateLayout, NemotronStateDType,
@@ -19,6 +23,7 @@ use crate::utils::progress::ProgressLike;
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::Module;
+use parking_lot::Mutex;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -338,18 +343,38 @@ impl NemotronMlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         self.down.forward(&self.up.forward(xs)?.relu()?.sqr()?)
     }
+
+    fn resident_bytes(&self) -> Result<usize> {
+        Ok(self.up.resident_bytes()? + self.down.resident_bytes()?)
+    }
+}
+
+enum ExpertStore {
+    Eager(Vec<NemotronMlp>),
+    Lazy {
+        count: usize,
+        layer: usize,
+        cache: Arc<Mutex<ExpertCache>>,
+    },
 }
 
 struct NemotronMoe {
     gate: ReplicatedLinear,
     routing: MoeRouting,
     shared: NemotronMlp,
-    experts: Vec<NemotronMlp>,
+    experts: ExpertStore,
     hidden: usize,
 }
 
 impl NemotronMoe {
-    fn new(vb: VarBuilderX, config: &Config, c: &NemotronConfig, dtype: DType) -> Result<Self> {
+    fn new(
+        vb: VarBuilderX,
+        config: &Config,
+        c: &NemotronConfig,
+        dtype: DType,
+        layer: usize,
+        cache: Option<&Arc<Mutex<ExpertCache>>>,
+    ) -> Result<Self> {
         let count = c.n_routed_experts.unwrap();
         let gate = ReplicatedLinear::load_no_bias(
             config.hidden_size,
@@ -380,15 +405,24 @@ impl NemotronMoe {
             c.moe_shared_expert_intermediate_size.unwrap(),
             dtype,
         )?;
-        let mut experts = Vec::with_capacity(count);
-        for index in 0..count {
-            experts.push(NemotronMlp::new(
-                vb.pp(&format!("experts.{index}")),
-                config,
-                c.moe_intermediate_size.unwrap(),
-                dtype,
-            )?);
-        }
+        let experts = if let Some(cache) = cache {
+            ExpertStore::Lazy {
+                count,
+                layer,
+                cache: cache.clone(),
+            }
+        } else {
+            let mut experts = Vec::with_capacity(count);
+            for index in 0..count {
+                experts.push(NemotronMlp::new(
+                    vb.pp(&format!("experts.{index}")),
+                    config,
+                    c.moe_intermediate_size.unwrap(),
+                    dtype,
+                )?);
+            }
+            ExpertStore::Eager(experts)
+        };
         Ok(Self {
             gate,
             routing,
@@ -404,17 +438,34 @@ impl NemotronMoe {
         let (weights, ids) = self.routing.route(&logits, is_prefill)?;
         let ids = ids.to_vec2::<u32>()?;
         let weights = weights.to_vec2::<f32>()?;
-        let mut assignments = vec![Vec::<(u32, f32)>::new(); self.experts.len()];
+        let count = match &self.experts {
+            ExpertStore::Eager(experts) => experts.len(),
+            ExpertStore::Lazy { count, .. } => *count,
+        };
+        let mut assignments = vec![Vec::<(u32, f32)>::new(); count];
         for token in 0..rows {
             for (&expert, &weight) in ids[token].iter().zip(&weights[token]) {
                 assignments[expert as usize].push((token as u32, weight));
             }
         }
         let mut result = Tensor::zeros((rows, self.hidden), DType::F32, xs.device())?;
-        for (expert, assigned) in self.experts.iter().zip(assignments) {
+        for (index, assigned) in assignments.into_iter().enumerate() {
             if assigned.is_empty() {
                 continue;
             }
+            // A prefill can visit more distinct experts than the budget holds.
+            // Resolve each native route just before executing it, preserving
+            // the original expert order and its exact packed checkpoint data.
+            let selected = match &self.experts {
+                ExpertStore::Eager(_) => None,
+                ExpertStore::Lazy { layer, cache, .. } => {
+                    Some(cache.lock().resolve(*layer, index)?)
+                }
+            };
+            let expert: &NemotronMlp = match &self.experts {
+                ExpertStore::Eager(experts) => &experts[index],
+                ExpertStore::Lazy { .. } => selected.as_ref().unwrap(),
+            };
             let indices = assigned.iter().map(|(token, _)| *token).collect::<Vec<_>>();
             let factors = assigned
                 .iter()
@@ -456,9 +507,12 @@ pub struct NemotronHForCausalLM {
     vocab_size: usize,
     state_capacity: AtomicUsize,
     prefix_capacity: AtomicUsize,
+    expert_cache: Option<Arc<Mutex<ExpertCache>>>,
 }
 
 impl NemotronHForCausalLM {
+    /// `XINFER_NEMOTRON_EXPERT_CACHE_BYTES` enables lazy routed experts for
+    /// regular runner construction. Without it, experts load eagerly.
     pub fn new(
         vb: &VarBuilderX,
         comm: Rc<Comm>,
@@ -468,8 +522,45 @@ impl NemotronHForCausalLM {
         device: &Device,
         progress: Arc<RwLock<Box<dyn ProgressLike>>>,
     ) -> Result<Self> {
+        let cache_bytes = std::env::var("XINFER_NEMOTRON_EXPERT_CACHE_BYTES")
+            .ok()
+            .map(|value| {
+                value.parse::<usize>().map_err(|_| {
+                    candle_core::Error::Msg("invalid XINFER_NEMOTRON_EXPERT_CACHE_BYTES".into())
+                })
+            })
+            .transpose()?;
+        Self::new_with_expert_cache(
+            vb,
+            comm,
+            config,
+            dtype,
+            _is_rope_i,
+            device,
+            progress,
+            cache_bytes,
+        )
+    }
+
+    /// Enable selective expert loading with a strict resident weight budget.
+    /// `None` preserves eager loading; `Some(bytes)` uses host safetensors as
+    /// the owned lazy source and loads only experts selected by native routing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_expert_cache(
+        vb: &VarBuilderX,
+        comm: Rc<Comm>,
+        config: &Config,
+        dtype: DType,
+        _is_rope_i: bool,
+        device: &Device,
+        progress: Arc<RwLock<Box<dyn ProgressLike>>>,
+        cache_bytes: Option<usize>,
+    ) -> Result<Self> {
         if vb.is_qvar_builder() || comm.world_size() != 1 {
             candle_core::bail!("Nemotron-H currently requires safetensors and one device")
+        }
+        if cache_bytes == Some(0) {
+            candle_core::bail!("Nemotron expert cache capacity must be positive")
         }
         let c = NemotronConfig::from_config(config)?;
         // ModelOpt publishes its quantization recipe in hf_quant_config.json,
@@ -491,6 +582,16 @@ impl NemotronHForCausalLM {
             quant.normalize_compressed_tensors();
             config.quantization_config = Some(quant);
         }
+        let expert_cache = if c.hybrid_override_pattern.contains('E') {
+            cache_bytes
+                .map(|bytes| {
+                    ExpertSource::new(vb, &config, c.moe_intermediate_size.unwrap(), dtype, device)
+                        .map(|source| Arc::new(Mutex::new(ExpertCache::new(source, bytes))))
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let (embeddings, vocab_size) = embedding(
             config.vocab_size,
             config.hidden_size,
@@ -524,7 +625,14 @@ impl NemotronHForCausalLM {
                     config.intermediate_size,
                     dtype,
                 )?),
-                b'E' => Mixer::Moe(NemotronMoe::new(mvb, &config, &c, dtype)?),
+                b'E' => Mixer::Moe(NemotronMoe::new(
+                    mvb,
+                    &config,
+                    &c,
+                    dtype,
+                    i,
+                    expert_cache.as_ref(),
+                )?),
                 _ => unreachable!(),
             };
             layers.push(Block { norm, mixer });
@@ -558,6 +666,29 @@ impl NemotronHForCausalLM {
             vocab_size,
             state_capacity: AtomicUsize::new(usize::MAX),
             prefix_capacity: AtomicUsize::new(0),
+            expert_cache,
+        })
+    }
+
+    pub fn expert_cache_stats(&self) -> Option<NemotronExpertCacheStats> {
+        self.expert_cache.as_ref().map(|cache| cache.lock().stats())
+    }
+
+    /// Logical device bytes held by routed expert tensors. Gate, shared
+    /// expert, allocator padding, and temporary kernels are excluded.
+    pub fn resident_routed_expert_bytes(&self) -> Result<usize> {
+        if let Some(cache) = &self.expert_cache {
+            return Ok(cache.lock().stats().resident_bytes);
+        }
+        self.layers.iter().try_fold(0usize, |total, block| {
+            if let Mixer::Moe(moe) = &block.mixer {
+                if let ExpertStore::Eager(experts) = &moe.experts {
+                    return experts
+                        .iter()
+                        .try_fold(total, |sum, expert| Ok(sum + expert.resident_bytes()?));
+                }
+            }
+            Ok(total)
         })
     }
 
@@ -882,7 +1013,7 @@ mod tests {
                 num_experts_per_tok: 2,
             },
             shared: expert(1.0)?,
-            experts: vec![expert(1.0)?, expert(2.0)?, expert(3.0)?],
+            experts: ExpertStore::Eager(vec![expert(1.0)?, expert(2.0)?, expert(3.0)?]),
             hidden: 2,
         };
         let xs = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &device)?;

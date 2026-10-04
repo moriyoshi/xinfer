@@ -1381,6 +1381,10 @@ impl TensorParallelRowLinear {
 }
 
 impl ReplicatedLinear {
+    pub fn resident_bytes(&self) -> Result<usize> {
+        self.linear.resident_bytes()
+    }
+
     pub fn from(linear: Linear) -> Result<Self> {
         Ok(Self { linear })
     }
