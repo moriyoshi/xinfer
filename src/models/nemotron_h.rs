@@ -545,6 +545,8 @@ impl NemotronHForCausalLM {
     /// Enable selective expert loading with a strict resident weight budget.
     /// `None` preserves eager loading; `Some(bytes)` uses host safetensors as
     /// the owned lazy source and loads only experts selected by native routing.
+    /// `Some(bytes)` bypasses the env-based KV allocator reservation. Direct
+    /// callers must reserve `bytes` outside their KV and activation budgets.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_expert_cache(
         vb: &VarBuilderX,
@@ -585,8 +587,10 @@ impl NemotronHForCausalLM {
         let expert_cache = if c.hybrid_override_pattern.contains('E') {
             cache_bytes
                 .map(|bytes| {
-                    ExpertSource::new(vb, &config, c.moe_intermediate_size.unwrap(), dtype, device)
-                        .map(|source| Arc::new(Mutex::new(ExpertCache::new(source, bytes))))
+                    let source = ExpertSource::new(vb, &config, &c, dtype, device)?;
+                    Ok::<_, candle_core::Error>(Arc::new(Mutex::new(ExpertCache::new(
+                        source, bytes,
+                    )?)))
                 })
                 .transpose()?
         } else {

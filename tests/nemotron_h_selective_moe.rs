@@ -25,14 +25,24 @@ fn load(
     let raw = std::fs::read_to_string(directory.join("config.json"))?;
     let mut config: Config = serde_json::from_str(&raw)?;
     config.extra_config_json = Some(raw);
-    let path = directory.join("model.safetensors");
-    ensure!(path.exists(), "single-shard MoE checkpoint required");
+    let mut filenames = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    filenames.retain(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == "safetensors")
+    });
+    filenames.sort();
+    ensure!(
+        !filenames.is_empty(),
+        "MoE checkpoint has no safetensors shards"
+    );
     let paths = ModelPaths {
         tokenizer_filename: directory.join("tokenizer.json"),
         tokenizer_config_filename: directory.join("tokenizer_config.json"),
         config_filename: directory.join("config.json"),
         generation_config_filename: directory.join("generation_config.json"),
-        filenames: vec![path],
+        filenames,
         auxiliary_filenames: vec![],
         chat_template_filename: None,
     };
@@ -231,7 +241,9 @@ fn whole_model_eager_and_selective_experts_match() -> Result<()> {
         stats.hits, stats.misses, stats.evictions, eager_samples[8], eager_samples[15], samples[8], samples[15]);
     ensure!(max_abs <= 1e-4, "selective expert loading changed logits");
     ensure!(
-        stats.misses > 0 && stats.resident_bytes <= budget,
+        stats.misses > 0
+            && stats.resident_bytes <= budget
+            && stats.peak_live_expert_bytes <= budget,
         "cache was not exercised within budget"
     );
     Ok(())
