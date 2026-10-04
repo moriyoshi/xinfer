@@ -5,6 +5,7 @@
 //! execution settings; loaded `VarBuilderX` weights have no intrinsic ID.
 
 use super::{Block, MambaState, Mixer};
+use crate::models::layers::state_bytes;
 use bincode::Options;
 use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
@@ -122,19 +123,21 @@ pub struct NemotronMambaSnapshot {
     /// SHA-256 of `payload`.
     pub payload_sha256: [u8; 32],
     /// Little-endian FP32 bits, conv then SSM for each Mamba layer.
+    #[serde(with = "state_bytes")]
     pub payload: Vec<u8>,
 }
 
 impl NemotronMambaSnapshot {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate_payload()?;
-        let encoded = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .serialize(self)
-            .map_err(|e| candle_core::Error::Msg(format!("serialize Nemotron-H state: {e}")))?;
-        let mut bytes = Vec::with_capacity(MAGIC.len() + encoded.len());
+        let mut bytes = Vec::with_capacity(
+            MAGIC.len() + self.payload.len() + self.layout.model_layer_indices.len() * 4 + 256,
+        );
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&encoded);
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize_into(&mut bytes, self)
+            .map_err(|e| candle_core::Error::Msg(format!("serialize Nemotron-H state: {e}")))?;
         Ok(bytes)
     }
 
@@ -194,17 +197,21 @@ impl NemotronMambaSnapshot {
         let ssm_shape = self.layout.ssm_shape.map(|v| v as usize);
         let conv_count = checked_elements(&self.layout.conv_shape)?;
         let ssm_count = checked_elements(&self.layout.ssm_shape)?;
-        let mut chunks = self.payload.chunks_exact(4);
+        let conv_bytes = conv_count * 4;
+        let ssm_bytes = ssm_count * 4;
+        let mut offset = 0;
         let mut states = vec![None; self.layout.decoder_layers as usize];
         for &layer in &self.layout.model_layer_indices {
-            let conv = read_f32(&mut chunks, conv_count)?;
-            let ssm = read_f32(&mut chunks, ssm_count)?;
+            let conv = state_bytes::f32_from_le_bytes(&self.payload[offset..offset + conv_bytes])?;
+            offset += conv_bytes;
+            let ssm = state_bytes::f32_from_le_bytes(&self.payload[offset..offset + ssm_bytes])?;
+            offset += ssm_bytes;
             states[layer as usize] = Some(MambaState {
                 conv: Tensor::from_vec(conv, &conv_shape, device)?,
                 ssm: Tensor::from_vec(ssm, &ssm_shape, device)?,
             });
         }
-        debug_assert!(chunks.remainder().is_empty() && chunks.len() == 0);
+        debug_assert_eq!(offset, self.payload.len());
         Ok(states)
     }
 }
@@ -230,8 +237,8 @@ pub(super) fn capture(
         {
             candle_core::bail!("Nemotron-H Mamba state shape or dtype mismatch at layer {layer}")
         }
-        append_f32(&state.conv, &mut payload)?;
-        append_f32(&state.ssm, &mut payload)?;
+        state_bytes::append_f32_bits(&state.conv, &mut payload)?;
+        state_bytes::append_f32_bits(&state.ssm, &mut payload)?;
     }
     let snapshot = NemotronMambaSnapshot {
         version: NEMOTRON_MAMBA_STATE_VERSION,
@@ -241,7 +248,6 @@ pub(super) fn capture(
         payload_sha256: Sha256::digest(&payload).into(),
         payload,
     };
-    snapshot.validate_payload()?;
     Ok(snapshot)
 }
 
@@ -274,26 +280,6 @@ fn checked_elements(shape: &[u32]) -> Result<usize> {
     })
 }
 
-fn append_f32(tensor: &Tensor, payload: &mut Vec<u8>) -> Result<()> {
-    for value in tensor.contiguous()?.flatten_all()?.to_vec1::<f32>()? {
-        payload.extend_from_slice(&value.to_bits().to_le_bytes());
-    }
-    Ok(())
-}
-
-fn read_f32(chunks: &mut std::slice::ChunksExact<'_, u8>, count: usize) -> Result<Vec<f32>> {
-    let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        let chunk = chunks
-            .next()
-            .ok_or_else(|| candle_core::Error::Msg("truncated Nemotron-H state payload".into()))?;
-        values.push(f32::from_bits(u32::from_le_bytes(
-            chunk.try_into().unwrap(),
-        )));
-    }
-    Ok(values)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +309,41 @@ mod tests {
         states[2] = Some(MambaState { conv, ssm });
         let snapshot = capture(&states, layout.clone(), 12, [7; 32])?;
         Ok((layout, snapshot))
+    }
+
+    #[test]
+    fn bulk_bytes_keep_v1_wire_format() -> Result<()> {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            version: u32,
+            prefix_tokens: u64,
+            model_fingerprint: &'a [u8; 32],
+            layout: &'a NemotronMambaStateLayout,
+            payload_sha256: &'a [u8; 32],
+            payload: &'a Vec<u8>,
+        }
+        let (_, snapshot) = fixture()?;
+        let legacy = Legacy {
+            version: snapshot.version,
+            prefix_tokens: snapshot.prefix_tokens,
+            model_fingerprint: &snapshot.model_fingerprint,
+            layout: &snapshot.layout,
+            payload_sha256: &snapshot.payload_sha256,
+            payload: &snapshot.payload,
+        };
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(
+            &bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .serialize(&legacy)
+                .map_err(candle_core::Error::wrap)?,
+        );
+        assert_eq!(snapshot.to_bytes()?, bytes);
+        assert_eq!(
+            NemotronMambaSnapshot::from_bytes(&bytes)?.payload,
+            snapshot.payload
+        );
+        Ok(())
     }
 
     #[test]

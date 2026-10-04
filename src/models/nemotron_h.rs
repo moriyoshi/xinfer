@@ -765,11 +765,13 @@ impl NemotronHForCausalLM {
         model_fingerprint: [u8; 32],
     ) -> Result<NemotronMambaSnapshot> {
         let layout = state::layout_from_layers(&self.layers)?;
-        let states = self.states.read();
-        let sequence = states.get(&seq_id).ok_or_else(|| {
+        // Mamba steps replace tensors instead of mutating their storage. Clone
+        // the handles at the boundary, then release the map lock before the
+        // device-to-host copies and checksum work.
+        let sequence = self.states.read().get(&seq_id).cloned().ok_or_else(|| {
             candle_core::Error::Msg(format!("Nemotron-H sequence {seq_id} has no Mamba state"))
         })?;
-        state::capture(sequence, layout, prefix_tokens, model_fingerprint)
+        state::capture(&sequence, layout, prefix_tokens, model_fingerprint)
     }
 
     /// Import into an unused sequence ID. Restore attention KV from the same

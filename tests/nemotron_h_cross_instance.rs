@@ -209,9 +209,12 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     let fingerprint: [u8; 32] = Sha256::digest(
         b"nvidia/NVIDIA-Nemotron-Nano-9B-v2-Japanese@3979dd16634988c34cc3bd911583c51e6a731d10/bf16/tp1"
     ).into();
+    let export_start = Instant::now();
     let snapshot = source
         .inner
         .export_mamba_state(0, prefix_len as u64, fingerprint)?;
+    source.device.synchronize()?;
+    let export_s = export_start.elapsed().as_secs_f64();
     ensure!(
         snapshot.layout.model_layer_indices.len() == 27,
         "wrong Mamba layer count"
@@ -220,7 +223,9 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
         snapshot.payload.len() == 145_539_072,
         "wrong Mamba payload size"
     );
+    let encode_start = Instant::now();
     let encoded = snapshot.to_bytes()?;
+    let encode_s = encode_start.elapsed().as_secs_f64();
     let attention = source_cache
         .iter()
         .map(|(key, value)| Ok((export_attention(key)?, export_attention(value)?)))
@@ -228,7 +233,9 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
 
     // A second model owns its own weights, recurrent map, and attention cache.
     let target = Model::load(&directory)?;
+    let decode_start = Instant::now();
     let restored = NemotronMambaSnapshot::from_bytes(&encoded)?;
+    let decode_s = decode_start.elapsed().as_secs_f64();
     let target_cache = attention
         .iter()
         .map(|(key, value)| {
@@ -238,9 +245,12 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
             ))
         })
         .collect::<Result<Cache>>()?;
+    let import_start = Instant::now();
     target
         .inner
         .import_mamba_state(0, prefix_len as u64, fingerprint, &restored)?;
+    target.device.synchronize()?;
+    let import_s = import_start.elapsed().as_secs_f64();
     ensure!(
         target
             .inner
@@ -264,6 +274,9 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
         }
     }
     target.device.synchronize()?;
+    eprintln!(
+        "Nemotron-H snapshot export_s={export_s:.6} encode_s={encode_s:.6} decode_s={decode_s:.6} import_s={import_s:.6}"
+    );
     eprintln!("Nemotron-H cross-instance continuation max_abs_logit_diff={max_abs}");
     ensure!(
         max_abs <= 1e-3,
