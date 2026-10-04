@@ -200,13 +200,12 @@ mod cuda_test {
         let source_kv = source.empty_cache(tokens.len())?;
         source.forward(&tokens[..prefix_len], 0, &source_kv)?;
         source.device.synchronize()?;
-        let exported = source
+        let wire = source
             .inner
-            .export_gdn_state(0, prefix_len as u64, fingerprint)?;
-        anyhow::ensure!(exported.layout.model_layer_indices.len() == 48);
-        anyhow::ensure!(exported.payload.len() == 156_893_184);
-        let wire = exported.to_bytes()?;
+            .export_gdn_state_bytes(0, prefix_len as u64, fingerprint)?;
         let decoded = GdnStateSnapshot::from_bytes(&wire)?;
+        anyhow::ensure!(decoded.layout.model_layer_indices.len() == 48);
+        anyhow::ensure!(decoded.payload.len() == 156_893_184);
 
         // KV crosses host memory too, so no device tensor is shared with B.
         let host_kv = source_kv
@@ -225,7 +224,7 @@ mod cuda_test {
             .collect::<candle_core::Result<Cache>>()?;
         target
             .inner
-            .import_gdn_state(0, prefix_len as u64, fingerprint, &decoded)?;
+            .import_gdn_state_bytes(0, prefix_len as u64, fingerprint, &wire)?;
 
         let mut max_abs_logit_diff = 0.0f32;
         for i in 0..4 {

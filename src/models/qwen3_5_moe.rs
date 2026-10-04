@@ -4,7 +4,8 @@ use crate::models::layers::attention::Attention;
 use crate::models::layers::deltanet::GatedDeltaNet;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::gdn_state::{
-    export_gdn_state, import_gdn_state, GdnStateLayout, GdnStateSnapshot,
+    export_gdn_state, export_gdn_state_bytes, import_gdn_state, import_gdn_state_bytes,
+    GdnStateLayout, GdnStateSnapshot,
 };
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mask::get_attention_causal_mask;
@@ -1112,6 +1113,26 @@ impl Qwen3_5MoEForCausalLM {
         )
     }
 
+    /// Export the v1 GDN envelope directly, avoiding a second checksum pass.
+    pub fn export_gdn_state_bytes(
+        &self,
+        seq_id: usize,
+        prefix_tokens: u64,
+        model_fingerprint: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        let layout = self
+            .gdn_state_layout
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Qwen3.5 MoE model has no GDN layers".into()))?;
+        export_gdn_state_bytes(
+            &self.mamba_cache.read(),
+            layout,
+            seq_id,
+            prefix_tokens,
+            model_fingerprint,
+        )
+    }
+
     /// Import into an unused sequence ID after validating the whole snapshot.
     pub fn import_gdn_state(
         &self,
@@ -1131,6 +1152,28 @@ impl Qwen3_5MoEForCausalLM {
             expected_prefix_tokens,
             expected_model_fingerprint,
             snapshot,
+        )
+    }
+
+    /// Parse and import a v1 GDN envelope with one integrity check.
+    pub fn import_gdn_state_bytes(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let layout = self
+            .gdn_state_layout
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Qwen3.5 MoE model has no GDN layers".into()))?;
+        import_gdn_state_bytes(
+            &mut self.mamba_cache.write(),
+            layout,
+            seq_id,
+            expected_prefix_tokens,
+            expected_model_fingerprint,
+            bytes,
         )
     }
 

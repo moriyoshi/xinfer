@@ -89,6 +89,16 @@ let snapshot = GdnStateSnapshot::from_bytes(&bytes)?;
 decode_model.import_gdn_state(new_seq_id, prefix_tokens, fingerprint, &snapshot)?;
 ```
 
+When the caller stores or transports the complete envelope, use
+`export_gdn_state_bytes` and `import_gdn_state_bytes` on the dense or MoE model.
+They preserve the v1 bytes and check the payload once on each side. The
+snapshot-object methods continue to validate their public mutable fields.
+Qwen3-VL forwards these byte APIs when its text model is a Qwen3.5 hybrid;
+its fingerprint must cover both vision and text weights. Qwen4 exposes the
+same GDN byte APIs when PLE is absent. Qwen4 with PLE rejects export and import
+because its PLE convolution and token-context state is additional recurrent
+state that this GDN envelope does not contain.
+
 The caller supplies the same 32-byte SHA-256 model fingerprint on both sides.
 It must identify weights, adapters, and numerical execution settings; xinfer
 does not derive it from loaded weights. The caller must also restore attention
@@ -96,6 +106,36 @@ KV from the **same exact token boundary** before decoding, and must give the
 imported sequence an unused ID with enough Mamba cache capacity. An existing
 slot is rejected so an active sequence cannot be overwritten. The model API
 does not itself store, transport, or publish a combined KV and GDN bundle.
+
+## Portable Nemotron-H Mamba state
+
+`NemotronHForCausalLM::export_mamba_state` exports the FP32 convolution and
+SSM state for every Mamba layer at a completed token boundary. The returned
+`NemotronMambaSnapshot` carries a version, absolute layer order, tensor shapes
+and dtypes, tensor parallel layout, token boundary, caller supplied model
+fingerprint, and payload SHA-256. `to_bytes` and `from_bytes` use a portable
+binary envelope with little-endian FP32 payload bits.
+
+```rust
+let snapshot = prefill_model.export_mamba_state(seq_id, prefix_tokens, fingerprint)?;
+let bytes = snapshot.to_bytes()?;
+let snapshot = NemotronMambaSnapshot::from_bytes(&bytes)?;
+decode_model.import_mamba_state(new_seq_id, prefix_tokens, fingerprint, &snapshot)?;
+```
+
+For a persisted envelope, `export_mamba_state_bytes` and
+`import_mamba_state_bytes` avoid repeated payload checksum passes while keeping
+the same v1 format. The bytes-first import keeps its validated snapshot private
+until state installation; the snapshot-object API still validates on import.
+
+The 32-byte fingerprint must identify compatible weights, adapters, and
+numerical execution settings. xinfer cannot derive it from loaded weights.
+Restore attention KV from the same exact token boundary before continuation;
+the Mamba snapshot contains no attention KV. Imports reject incompatible
+layouts, boundaries, fingerprints, corrupt payloads, occupied sequence IDs,
+and exhausted state capacity. The pinned Japanese 9B model has 27 Mamba
+layers and exports 145,539,072 payload bytes per sequence. The model API does
+not assemble or persist the combined Mamba and attention bundle.
 
 ## Inspecting cache hits
 

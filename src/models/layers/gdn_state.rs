@@ -5,11 +5,11 @@
 //! execution settings on both sides; xinfer cannot infer that identity from
 //! an already loaded `VarBuilderX`.
 
+use super::state_bytes;
 use attention_rs::mamba_cache::MambaCache;
 use bincode::Options;
 use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 8] = b"XGDN\0\0\0\x01";
 pub const GDN_STATE_VERSION: u32 = 1;
@@ -119,19 +119,27 @@ pub struct GdnStateSnapshot {
     /// SHA-256 of `payload`.
     pub payload_sha256: [u8; 32],
     /// Contiguous little-endian FP32 bits: for each GDN layer, conv then recurrent.
+    #[serde(with = "state_bytes")]
     pub payload: Vec<u8>,
 }
 
 impl GdnStateSnapshot {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate_payload()?;
-        let encoded = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .serialize(self)
-            .map_err(|e| candle_core::Error::Msg(format!("serialize GDN state: {e}")))?;
-        let mut bytes = Vec::with_capacity(MAGIC.len() + encoded.len());
+        self.to_bytes_after_export()
+    }
+
+    // Safe only for the locally constructed snapshot before its public fields
+    // can be mutated by a caller.
+    fn to_bytes_after_export(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(
+            MAGIC.len() + self.payload.len() + self.layout.model_layer_indices.len() * 4 + 256,
+        );
         bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&encoded);
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize_into(&mut bytes, self)
+            .map_err(|e| candle_core::Error::Msg(format!("serialize GDN state: {e}")))?;
         Ok(bytes)
     }
 
@@ -183,7 +191,7 @@ impl GdnStateSnapshot {
                 expected
             )
         }
-        if Sha256::digest(&self.payload).as_slice() != self.payload_sha256 {
+        if state_bytes::sha256(&self.payload) != self.payload_sha256 {
             candle_core::bail!("GDN state payload SHA-256 mismatch")
         }
         Ok(())
@@ -203,19 +211,8 @@ fn checked_elements(shape: &[u32]) -> Result<usize> {
     })
 }
 
-fn append_f32_bits(tensor: &Tensor, payload: &mut Vec<u8>) -> Result<()> {
-    for value in tensor.contiguous()?.flatten_all()?.to_vec1::<f32>()? {
-        payload.extend_from_slice(&value.to_bits().to_le_bytes());
-    }
-    Ok(())
-}
-
 fn tensor_from_f32_bits(bytes: &[u8], shape: &[usize], device: &Device) -> Result<Tensor> {
-    let values = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_bits(u32::from_le_bytes(chunk.try_into().unwrap())))
-        .collect::<Vec<_>>();
-    Tensor::from_vec(values, shape, device)
+    Tensor::from_vec(state_bytes::f32_from_le_bytes(bytes)?, shape, device)
 }
 
 pub fn export_gdn_state(
@@ -238,19 +235,31 @@ pub fn export_gdn_state(
         .ok_or_else(|| candle_core::Error::Msg("GDN state byte count overflow".into()))?;
     let mut payload = Vec::with_capacity(capacity);
     for layer in 0..cache.num_gdn_layers() {
-        append_f32_bits(&cache.get_conv_state(layer, slot)?, &mut payload)?;
-        append_f32_bits(&cache.get_recurrent_state(layer, slot)?, &mut payload)?;
+        state_bytes::append_f32_bits(&cache.get_conv_state(layer, slot)?, &mut payload)?;
+        state_bytes::append_f32_bits(&cache.get_recurrent_state(layer, slot)?, &mut payload)?;
     }
     let snapshot = GdnStateSnapshot {
         version: GDN_STATE_VERSION,
         prefix_tokens,
         model_fingerprint,
         layout: layout.clone(),
-        payload_sha256: Sha256::digest(&payload).into(),
+        payload_sha256: state_bytes::sha256(&payload),
         payload,
     };
-    snapshot.validate_payload()?;
     Ok(snapshot)
+}
+
+/// Export the existing v1 envelope directly, without rehashing a snapshot
+/// just constructed from the cache.
+pub fn export_gdn_state_bytes(
+    cache: &MambaCache,
+    layout: &GdnStateLayout,
+    seq_id: usize,
+    prefix_tokens: u64,
+    model_fingerprint: [u8; 32],
+) -> Result<Vec<u8>> {
+    export_gdn_state(cache, layout, seq_id, prefix_tokens, model_fingerprint)?
+        .to_bytes_after_export()
 }
 
 pub fn import_gdn_state(
@@ -261,8 +270,50 @@ pub fn import_gdn_state(
     expected_model_fingerprint: [u8; 32],
     snapshot: &GdnStateSnapshot,
 ) -> Result<()> {
-    layout.validate_cache(cache)?;
     snapshot.validate_payload()?;
+    import_gdn_state_validated(
+        cache,
+        layout,
+        seq_id,
+        expected_prefix_tokens,
+        expected_model_fingerprint,
+        snapshot,
+    )
+}
+
+/// Parse and validate a v1 envelope once, then import it while the parsed
+/// snapshot remains private and immutable.
+pub fn import_gdn_state_bytes(
+    cache: &mut MambaCache,
+    layout: &GdnStateLayout,
+    seq_id: usize,
+    expected_prefix_tokens: u64,
+    expected_model_fingerprint: [u8; 32],
+    bytes: &[u8],
+) -> Result<()> {
+    if cache.get_slot(seq_id).is_some() {
+        candle_core::bail!("GDN sequence {seq_id} already has a slot; release it before import")
+    }
+    let snapshot = GdnStateSnapshot::from_bytes(bytes)?;
+    import_gdn_state_validated(
+        cache,
+        layout,
+        seq_id,
+        expected_prefix_tokens,
+        expected_model_fingerprint,
+        &snapshot,
+    )
+}
+
+fn import_gdn_state_validated(
+    cache: &mut MambaCache,
+    layout: &GdnStateLayout,
+    seq_id: usize,
+    expected_prefix_tokens: u64,
+    expected_model_fingerprint: [u8; 32],
+    snapshot: &GdnStateSnapshot,
+) -> Result<()> {
+    layout.validate_cache(cache)?;
     if &snapshot.layout != layout {
         candle_core::bail!("GDN state layer order, shape, dtype, or TP layout mismatch")
     }
@@ -359,6 +410,70 @@ mod tests {
                 .unwrap();
         }
         cache
+    }
+
+    #[test]
+    fn bulk_bytes_keep_v1_wire_format() {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            version: u32,
+            prefix_tokens: u64,
+            model_fingerprint: &'a [u8; 32],
+            layout: &'a GdnStateLayout,
+            payload_sha256: &'a [u8; 32],
+            payload: &'a Vec<u8>,
+        }
+        let source = filled_cache();
+        let snapshot = export_gdn_state(&source, &layout(&source), 7, 41, [3; 32]).unwrap();
+        let legacy = Legacy {
+            version: snapshot.version,
+            prefix_tokens: snapshot.prefix_tokens,
+            model_fingerprint: &snapshot.model_fingerprint,
+            layout: &snapshot.layout,
+            payload_sha256: &snapshot.payload_sha256,
+            payload: &snapshot.payload,
+        };
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(
+            &bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .serialize(&legacy)
+                .unwrap(),
+        );
+        assert_eq!(snapshot.to_bytes().unwrap(), bytes);
+        assert_eq!(
+            GdnStateSnapshot::from_bytes(&bytes).unwrap().payload,
+            snapshot.payload
+        );
+    }
+
+    #[test]
+    fn bytes_first_roundtrip_and_rejections() {
+        let source = filled_cache();
+        let source_layout = layout(&source);
+        let wire = export_gdn_state_bytes(&source, &source_layout, 7, 41, [3; 32]).unwrap();
+        let ordinary = export_gdn_state(&source, &source_layout, 7, 41, [3; 32]).unwrap();
+        assert_eq!(wire, ordinary.to_bytes().unwrap());
+        let mut target = cache();
+        let target_layout = layout(&target);
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 42, [3; 32], &wire).is_err()
+        );
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [4; 32], &wire).is_err()
+        );
+        let mut corrupt = wire.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [3; 32], &corrupt).is_err()
+        );
+        assert_eq!(target.get_slot(99), None);
+        import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [3; 32], &wire).unwrap();
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [3; 32], &wire).is_err()
+        );
+        let actual = export_gdn_state(&target, &target_layout, 99, 41, [3; 32]).unwrap();
+        assert_eq!(actual.payload, ordinary.payload);
     }
 
     #[test]
