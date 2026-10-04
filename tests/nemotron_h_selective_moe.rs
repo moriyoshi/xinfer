@@ -6,11 +6,17 @@ use anyhow::{ensure, Context, Result};
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Tensor};
 use parking_lot::RwLock;
-use std::{path::Path, rc::Rc, sync::Arc, time::Instant};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+    time::Instant,
+};
 use xinfer::{
     models::{
         layers::{distributed::Comm, VarBuilderX},
-        nemotron_h::NemotronHForCausalLM,
+        nemotron_h::{NemotronExpertRestoreSource, NemotronHForCausalLM},
     },
     utils::{config::Config, downloader::ModelPaths, progress::ProgressReporter},
 };
@@ -58,6 +64,66 @@ fn load(
         budget,
     )?;
     Ok((model, config))
+}
+
+struct SnapshotDirectory(PathBuf);
+
+impl SnapshotDirectory {
+    fn new() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "xinfer-nemotron-expert-restore-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self, layer: usize, expert: usize) -> PathBuf {
+        self.0.join(format!("{layer}-{expert}.xnex"))
+    }
+}
+
+impl Drop for SnapshotDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+struct FileRestoreSource(PathBuf);
+
+impl NemotronExpertRestoreSource for FileRestoreSource {
+    fn load_expert(&self, layer: usize, expert: usize) -> candle_core::Result<Option<Vec<u8>>> {
+        let path = self.0.join(format!("{layer}-{expert}.xnex"));
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(candle_core::Error::wrap(error)),
+        }
+    }
+}
+
+fn checkpoint_fingerprint(directory: &Path) -> Result<[u8; 32]> {
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"xinfer-nemotron-checkpoint-v1");
+    digest.update(&std::fs::read(directory.join("config.json"))?);
+    let mut shards = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    shards.retain(|path| path.extension().is_some_and(|ext| ext == "safetensors"));
+    shards.sort();
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
+    for path in shards {
+        digest.update(path.file_name().unwrap().as_encoded_bytes());
+        let mut file = std::fs::File::open(path)?;
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+    }
+    Ok(digest.finish().as_ref().try_into()?)
 }
 
 fn cache(config: &Config, device: &Device) -> Result<Vec<(Tensor, Tensor)>> {
@@ -245,6 +311,166 @@ fn whole_model_eager_and_selective_experts_match() -> Result<()> {
             && stats.resident_bytes <= budget
             && stats.peak_live_expert_bytes <= budget,
         "cache was not exercised within budget"
+    );
+    Ok(())
+}
+
+/// Run explicitly with `-- --ignored --nocapture`; writes temporary per-expert
+/// snapshots, then compares three sequential model instances on one GB10.
+#[test]
+#[ignore = "requires the real 30B checkpoint and several GiB of temporary snapshot storage"]
+fn real_checkpoint_persistent_expert_restore_benchmark() -> Result<()> {
+    let directory = std::env::var_os("XINFER_NEMOTRON_MOE_CHECKPOINT")
+        .context("set XINFER_NEMOTRON_MOE_CHECKPOINT to the real 30B checkpoint")?;
+    let directory = PathBuf::from(directory);
+    let budget = 128 * 1024 * 1024;
+    let device = Device::new_cuda(0)?;
+    let free = || -> Result<usize> {
+        device.synchronize()?;
+        Ok(candle_core::cuda_backend::cudarc::driver::result::mem_get_info()?.0)
+    };
+    let run =
+        |model: &NemotronHForCausalLM, config: &Config| -> Result<(Vec<Vec<f32>>, Vec<f64>)> {
+            let kv = cache(config, &device)?;
+            let prefix = [1, 123, 456, 789, 42, 43, 44, 45];
+            let mut outputs = vec![forward(model, &prefix, 0, &kv, &device)?];
+            let mut times = Vec::with_capacity(16);
+            for i in 0..16 {
+                let token = [42 + (i % 4) as u32];
+                let started = Instant::now();
+                outputs.push(forward(model, &token, prefix.len() + i, &kv, &device)?);
+                times.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            times.sort_by(f64::total_cmp);
+            Ok((outputs, times))
+        };
+    let compare = |expected: &[Vec<f32>], actual: &[Vec<f32>]| -> Result<f32> {
+        ensure!(
+            expected.len() == actual.len(),
+            "different number of continuation steps"
+        );
+        let mut max_abs = 0.0f32;
+        for (left, right) in expected.iter().zip(actual) {
+            ensure!(left.len() == right.len(), "different logit vector width");
+            for (&a, &b) in left.iter().zip(right) {
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        Ok(max_abs)
+    };
+
+    let free_before_eager = free()?;
+    let (eager, config) = load(&directory, &device, None)?;
+    let free_after_eager = free()?;
+    let eager_expert_bytes = eager.resident_routed_expert_bytes()?;
+    let (expected, eager_times) = run(&eager, &config)?;
+    drop(eager);
+
+    let free_before_checkpoint = free()?;
+    let (checkpoint, checkpoint_config) = load(&directory, &device, Some(budget))?;
+    let free_after_checkpoint = free()?;
+    let (checkpoint_outputs, checkpoint_times) = run(&checkpoint, &checkpoint_config)?;
+    let checkpoint_max_abs = compare(&expected, &checkpoint_outputs)?;
+    let checkpoint_stats = checkpoint
+        .expert_cache_stats()
+        .context("missing checkpoint cache")?;
+    ensure!(checkpoint_max_abs == 0.0, "checkpoint-lazy logits changed");
+
+    // Hash the actual checkpoint bytes outside the timed inference windows.
+    let fingerprint = checkpoint_fingerprint(&directory)?;
+    let scratch = SnapshotDirectory::new()?;
+    let raw: serde_json::Value =
+        serde_json::from_str(checkpoint_config.extra_config_json.as_ref().unwrap())?;
+    let count = raw["n_routed_experts"].as_u64().context("expert count")? as usize;
+    let pattern = raw["hybrid_override_pattern"]
+        .as_str()
+        .context("layer pattern")?;
+    let export_started = Instant::now();
+    let mut snapshot_count = 0usize;
+    let mut snapshot_bytes = 0usize;
+    for (layer, kind) in pattern.bytes().enumerate() {
+        if kind != b'E' {
+            continue;
+        }
+        for expert in 0..count {
+            let bytes = checkpoint.export_expert_snapshot_bytes(layer, expert, fingerprint)?;
+            snapshot_bytes += bytes.len();
+            std::fs::write(scratch.path(layer, expert), bytes)?;
+            snapshot_count += 1;
+        }
+    }
+    let export_seconds = export_started.elapsed().as_secs_f64();
+    drop(checkpoint);
+
+    let free_before_restored = free()?;
+    let (restored, restored_config) = load(&directory, &device, Some(budget))?;
+    restored
+        .set_expert_restore_source(fingerprint, Arc::new(FileRestoreSource(scratch.0.clone())))?;
+    let free_after_restored = free()?;
+    let (restored_outputs, restored_times) = run(&restored, &restored_config)?;
+    let restored_max_abs = compare(&expected, &restored_outputs)?;
+    let restored_stats = restored
+        .expert_cache_stats()
+        .context("missing restored cache")?;
+    ensure!(restored_max_abs == 0.0, "restored-lazy logits changed");
+    ensure!(
+        restored_stats.restored_loads > 0,
+        "restore source was not exercised"
+    );
+    ensure!(
+        restored_stats.checkpoint_loads == 0,
+        "restore fell back to checkpoint"
+    );
+    ensure!(
+        checkpoint_stats.peak_live_expert_bytes <= budget
+            && restored_stats.peak_live_expert_bytes <= budget,
+        "expert GPU budget exceeded"
+    );
+    let avg_ms = |total_ns: u64, loads: u64| total_ns as f64 / loads.max(1) as f64 / 1e6;
+    eprintln!(
+        "real Nemotron expert restore: snapshots={snapshot_count}, disk_bytes={snapshot_bytes}, export_s={export_seconds:.3}, checkpoint_max_abs={checkpoint_max_abs}, restored_max_abs={restored_max_abs}, eager_expert_bytes={eager_expert_bytes}, checkpoint_peak={}, restored_peak={}, checkpoint_loads={}, restored_loads={}, checkpoint_load_avg_ms={:.3}, restored_load_avg_ms={:.3}, eager_p50_ms={:.3}, eager_p95_ms={:.3}, checkpoint_p50_ms={:.3}, checkpoint_p95_ms={:.3}, restored_p50_ms={:.3}, restored_p95_ms={:.3}, eager_cuda_load_delta={}, checkpoint_cuda_load_delta={}, restored_cuda_load_delta={}",
+        checkpoint_stats.peak_live_expert_bytes,
+        restored_stats.peak_live_expert_bytes,
+        checkpoint_stats.checkpoint_loads,
+        restored_stats.restored_loads,
+        avg_ms(checkpoint_stats.checkpoint_load_ns, checkpoint_stats.checkpoint_loads),
+        avg_ms(restored_stats.restored_load_ns, restored_stats.restored_loads),
+        eager_times[8], eager_times[15],
+        checkpoint_times[8], checkpoint_times[15],
+        restored_times[8], restored_times[15],
+        free_before_eager.saturating_sub(free_after_eager),
+        free_before_checkpoint.saturating_sub(free_after_checkpoint),
+        free_before_restored.saturating_sub(free_after_restored),
+    );
+    drop(restored);
+
+    let free_before_host = free()?;
+    let (host, host_config) = load(&directory, &device, Some(budget))?;
+    let import_started = Instant::now();
+    for (layer, kind) in pattern.bytes().enumerate() {
+        if kind != b'E' {
+            continue;
+        }
+        for expert in 0..count {
+            let bytes = std::fs::read(scratch.path(layer, expert))?;
+            host.import_expert_snapshot_bytes(fingerprint, &bytes)?;
+        }
+    }
+    let import_seconds = import_started.elapsed().as_secs_f64();
+    let free_after_host = free()?;
+    let (host_outputs, host_times) = run(&host, &host_config)?;
+    let host_max_abs = compare(&expected, &host_outputs)?;
+    let host_stats = host.expert_cache_stats().context("missing host cache")?;
+    ensure!(host_max_abs == 0.0, "host-restored logits changed");
+    ensure!(host_stats.checkpoint_loads == 0 && host_stats.restored_loads > 0);
+    ensure!(host_stats.peak_live_expert_bytes <= budget);
+    eprintln!(
+        "real Nemotron host restore: host_snapshot_bytes={}, import_s={import_seconds:.3}, max_abs={host_max_abs}, restored_loads={}, restored_load_avg_ms={:.3}, token_p50_ms={:.3}, token_p95_ms={:.3}, cuda_load_delta={}",
+        host_stats.host_snapshot_bytes,
+        host_stats.restored_loads,
+        avg_ms(host_stats.restored_load_ns, host_stats.restored_loads),
+        host_times[8], host_times[15],
+        free_before_host.saturating_sub(free_after_host),
     );
     Ok(())
 }
