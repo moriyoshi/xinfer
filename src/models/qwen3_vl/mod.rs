@@ -721,6 +721,51 @@ impl Qwen3VLForConditionalGeneration {
         }
     }
 
+    /// Export the hybrid text model's portable v1 GDN state. Restore its
+    /// attention KV from the same boundary; the fingerprint must cover the
+    /// complete vision and text model and its execution settings.
+    pub fn export_gdn_state_bytes(
+        &self,
+        seq_id: usize,
+        prefix_tokens: u64,
+        model_fingerprint: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => {
+                m.export_gdn_state_bytes(seq_id, prefix_tokens, model_fingerprint)
+            }
+            Qwen3TextModel::MoE35(m) => {
+                m.export_gdn_state_bytes(seq_id, prefix_tokens, model_fingerprint)
+            }
+            _ => candle_core::bail!("Qwen3-VL text model has no GDN layers"),
+        }
+    }
+
+    /// Import a validated v1 GDN envelope into an unused hybrid text slot.
+    pub fn import_gdn_state_bytes(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        match &self.text_model {
+            Qwen3TextModel::Dense35(m) => m.import_gdn_state_bytes(
+                seq_id,
+                expected_prefix_tokens,
+                expected_model_fingerprint,
+                bytes,
+            ),
+            Qwen3TextModel::MoE35(m) => m.import_gdn_state_bytes(
+                seq_id,
+                expected_prefix_tokens,
+                expected_model_fingerprint,
+                bytes,
+            ),
+            _ => candle_core::bail!("Qwen3-VL text model has no GDN layers"),
+        }
+    }
+
     pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
         self.mtp_rollback_mamba_at(seq_id, keep_tokens, 0)
     }

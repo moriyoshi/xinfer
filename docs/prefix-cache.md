@@ -93,6 +93,11 @@ When the caller stores or transports the complete envelope, use
 `export_gdn_state_bytes` and `import_gdn_state_bytes` on the dense or MoE model.
 They preserve the v1 bytes and check the payload once on each side. The
 snapshot-object methods continue to validate their public mutable fields.
+Qwen3-VL forwards these byte APIs when its text model is a Qwen3.5 hybrid;
+its fingerprint must cover both vision and text weights. Qwen4 exposes the
+same GDN byte APIs when PLE is absent. Qwen4 with PLE rejects export and import
+because its PLE convolution and token-context state is additional recurrent
+state that this GDN envelope does not contain.
 
 The caller supplies the same 32-byte SHA-256 model fingerprint on both sides.
 It must identify weights, adapters, and numerical execution settings; xinfer

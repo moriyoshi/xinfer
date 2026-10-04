@@ -2,6 +2,9 @@
 // Qwen4-Exp MoE variant with hyper-connections, QSA attention, and GatedDeltaNet layers
 use crate::models::layers::deltanet::GatedDeltaNet;
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
+use crate::models::layers::gdn_state::{
+    export_gdn_state_bytes, import_gdn_state_bytes, GdnStateLayout,
+};
 use crate::models::layers::linear::LinearX as Linear;
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -371,6 +374,7 @@ pub struct Qwen4ForCausalLM {
     rotary_emb: Arc<ScalingRotaryEmbedding>,
     lm_head: VocabParallelLinear,
     mamba_cache: RwLock<MambaCache>,
+    gdn_state_layout: Option<GdnStateLayout>,
     device: Device,
     config: Config,
     dtype: DType,
@@ -693,6 +697,20 @@ impl Qwen4ForCausalLM {
         } else {
             MambaCache::new(0, 1, 1, 2, 1, 1, 1, DType::F32, DType::F32, device)?
         };
+        let gdn_state_layout = if num_gdn_layers > 0 {
+            Some(GdnStateLayout::from_cache(
+                &mamba_cache,
+                layer_types
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, kind)| (kind == "linear_attention").then_some(i as u32))
+                    .collect(),
+                comm.rank() as u32,
+                comm.world_size() as u32,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             embed_tokens,
@@ -701,6 +719,7 @@ impl Qwen4ForCausalLM {
             rotary_emb,
             lm_head,
             mamba_cache: RwLock::new(mamba_cache),
+            gdn_state_layout,
             device: device.clone(),
             config: model_config,
             dtype,
@@ -1146,6 +1165,52 @@ impl Qwen4ForCausalLM {
 
     pub fn restore_mamba_prefix_state(&self, seq_id: usize, hash: u64) -> Result<bool> {
         self.mamba_cache.write().restore_prefix_state(seq_id, hash)
+    }
+
+    fn portable_gdn_layout(&self) -> Result<&GdnStateLayout> {
+        if self.layers.iter().any(|layer| layer.ple.is_some()) {
+            candle_core::bail!(
+                "Qwen4 PLE has additional recurrent state; a GDN-only snapshot is incomplete"
+            )
+        }
+        self.gdn_state_layout
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Qwen4 model has no GDN layers".into()))
+    }
+
+    /// Export portable v1 GDN state for Qwen4 models without PLE. Attention
+    /// KV must be exported at the same boundary.
+    pub fn export_gdn_state_bytes(
+        &self,
+        seq_id: usize,
+        prefix_tokens: u64,
+        model_fingerprint: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        export_gdn_state_bytes(
+            &self.mamba_cache.read(),
+            self.portable_gdn_layout()?,
+            seq_id,
+            prefix_tokens,
+            model_fingerprint,
+        )
+    }
+
+    /// Import a validated v1 GDN envelope into an unused sequence slot.
+    pub fn import_gdn_state_bytes(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        import_gdn_state_bytes(
+            &mut self.mamba_cache.write(),
+            self.portable_gdn_layout()?,
+            seq_id,
+            expected_prefix_tokens,
+            expected_model_fingerprint,
+            bytes,
+        )
     }
 
     pub fn mtp_rollback_mamba(&self, seq_id: usize, keep_tokens: usize) -> Result<bool> {
