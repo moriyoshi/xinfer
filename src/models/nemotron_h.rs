@@ -2,10 +2,16 @@
 //! The recurrent path is deliberately expressed in Candle operations so the
 //! checkpoint can run without the optional mamba-ssm CUDA extension.
 mod expert_cache;
+mod expert_snapshot;
 mod state;
 
 pub use expert_cache::NemotronExpertCacheStats;
+pub use expert_cache::NemotronExpertRestoreSource;
 use expert_cache::{ExpertCache, ExpertSource};
+pub use expert_snapshot::{
+    NemotronExpertLayout, NemotronExpertSnapshot, NemotronExpertTensorDType,
+    NemotronExpertTensorSpec, NEMOTRON_EXPERT_SNAPSHOT_VERSION,
+};
 
 pub use state::{
     NemotronMambaSnapshot, NemotronMambaStateLayout, NemotronStateDType,
@@ -676,6 +682,77 @@ impl NemotronHForCausalLM {
 
     pub fn expert_cache_stats(&self) -> Option<NemotronExpertCacheStats> {
         self.expert_cache.as_ref().map(|cache| cache.lock().stats())
+    }
+
+    /// Export one routed expert as portable checkpoint-format bytes. This
+    /// reads the owned host safetensors mapping and does not populate the GPU
+    /// cache. The fingerprint must identify the exact weights, adapters, and
+    /// numerical settings for both exporting and restoring instances.
+    pub fn export_expert_snapshot(
+        &self,
+        layer: usize,
+        expert: usize,
+        model_fingerprint: [u8; 32],
+    ) -> Result<NemotronExpertSnapshot> {
+        self.expert_cache
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Nemotron expert cache is disabled".into()))?
+            .lock()
+            .export(layer, expert, model_fingerprint)
+    }
+
+    pub fn export_expert_snapshot_bytes(
+        &self,
+        layer: usize,
+        expert: usize,
+        model_fingerprint: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        self.export_expert_snapshot(layer, expert, model_fingerprint)?
+            .to_bytes_after_export()
+    }
+
+    /// Install a validated host snapshot for one expert. Its GPU allocation
+    /// occurs only if native routing selects it, under the existing byte cap.
+    /// Duplicate imports and incompatible model layouts are rejected.
+    pub fn import_expert_snapshot(
+        &self,
+        expected_model_fingerprint: [u8; 32],
+        snapshot: NemotronExpertSnapshot,
+    ) -> Result<()> {
+        self.expert_cache
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Nemotron expert cache is disabled".into()))?
+            .lock()
+            .import(expected_model_fingerprint, snapshot)
+    }
+
+    pub fn import_expert_snapshot_bytes(
+        &self,
+        expected_model_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.expert_cache
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Nemotron expert cache is disabled".into()))?
+            .lock()
+            .import_bytes(expected_model_fingerprint, bytes)
+    }
+
+    /// Register application-owned storage for routed expert snapshots.
+    /// On a GPU miss, xinfer requests only the selected expert. `None` from
+    /// the store falls back to safetensors; a corrupt blob fails closed.
+    /// The store can read persisted files or a host cache without making
+    /// xinfer depend on the application's persistence layer.
+    pub fn set_expert_restore_source(
+        &self,
+        expected_model_fingerprint: [u8; 32],
+        source: Arc<dyn NemotronExpertRestoreSource>,
+    ) -> Result<()> {
+        self.expert_cache
+            .as_ref()
+            .ok_or_else(|| candle_core::Error::Msg("Nemotron expert cache is disabled".into()))?
+            .lock()
+            .set_restore_source(expected_model_fingerprint, source)
     }
 
     /// Logical device bytes held by routed expert tensors. Gate, shared

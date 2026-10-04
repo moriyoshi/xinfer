@@ -137,6 +137,34 @@ and exhausted state capacity. The pinned Japanese 9B model has 27 Mamba
 layers and exports 145,539,072 payload bytes per sequence. The model API does
 not assemble or persist the combined Mamba and attention bundle.
 
+## Persistent Nemotron-H routed experts
+
+Lazy Nemotron-H MoE models can export one routed expert at a time with
+`NemotronHForCausalLM::export_expert_snapshot_bytes(layer, expert, fingerprint)`.
+The versioned envelope contains the original checkpoint tensor bytes, including
+native packed NVFP4 weights and FP8 block scales, a model layout digest, and a
+payload SHA-256. The caller supplies a nonzero 32-byte fingerprint of the
+actual weights, adapters, and numerical settings. Derive it identically on
+every instance; the layout digest alone cannot detect changed weight values.
+
+`import_expert_snapshot_bytes(fingerprint, bytes)` keeps a validated expert in
+host memory for later routing. For a persistent store, implement
+`NemotronExpertRestoreSource::load_expert(layer, expert)` and register it with
+`set_expert_restore_source(fingerprint, source)`. The callback is invoked only
+after native routing selects an expert that misses the GPU cache. Return
+`Ok(None)` for a checkpoint fallback. A corrupt or incompatible returned blob
+fails the request. This interface lets an application such as shifou read its
+own files without an xinfer dependency on its storage library.
+
+Restored experts use the same GPU admission plan, evictions, and byte limit as
+checkpoint-loaded experts. The snapshots themselves consume application host
+memory or persistent storage; the full 30B model's routed experts produced
+about 16.5 GB of snapshot payload in the real-checkpoint test (versus 18.4 GB
+of eager GPU expert tensors, including derived scales). `expert_cache_stats()`
+separates GPU hits, checkpoint loads, and restored loads and accumulates each
+load path's wall time. Explicit `new_with_expert_cache(Some(bytes))` callers
+must reserve that GPU budget outside KV and activation memory.
+
 ## Inspecting cache hits
 
 Chat completion responses include the prefix-cache hit count under

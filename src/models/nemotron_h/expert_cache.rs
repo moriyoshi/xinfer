@@ -1,16 +1,32 @@
 //! Exact, byte-bounded resident cache for Nemotron-H routed experts.
+use super::expert_snapshot::{
+    NemotronExpertLayout, NemotronExpertSnapshot, NemotronExpertTensorDType,
+    NemotronExpertTensorSpec, NEMOTRON_EXPERT_SNAPSHOT_VERSION,
+};
 use super::{NemotronConfig, NemotronMlp};
+use crate::models::layers::distributed::ReplicatedLinear;
+use crate::models::layers::linear::{LinearX, LnNvfp4};
+use crate::models::layers::state_bytes;
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
-use candle_core::{safetensors::MmapedSafetensors, DType, Device, Result};
+use candle_core::{safetensors::MmapedSafetensors, DType, Device, Result, Tensor};
 use candle_nn::var_builder::ShardedSafeTensors;
 use either::Either;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Optional application-owned persistent source for expert snapshots. Return
+/// `None` to fall back to the original safetensors checkpoint. A returned
+/// snapshot is always validated before any GPU upload; invalid data is an
+/// error, not a silent checkpoint fallback.
+pub trait NemotronExpertRestoreSource: Send + Sync {
+    fn load_expert(&self, layer: usize, expert: usize) -> Result<Option<Vec<u8>>>;
+}
 
 #[derive(Clone)]
 struct TensorMeta {
@@ -205,12 +221,96 @@ fn expert_plan(
     })
 }
 
+fn model_layout_digest(
+    metadata: &HashMap<String, TensorMeta>,
+    config: &Config,
+    nemotron: &NemotronConfig,
+    dtype: DType,
+) -> [u8; 32] {
+    fn field(bytes: &mut Vec<u8>, value: &[u8]) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value);
+    }
+    let mut canonical = Vec::with_capacity(metadata.len() * 96);
+    field(&mut canonical, b"xinfer-nemotron-expert-layout-v1");
+    field(&mut canonical, nemotron.hybrid_override_pattern.as_bytes());
+    field(&mut canonical, format!("{dtype:?}").as_bytes());
+    field(&mut canonical, &config.hidden_size.to_le_bytes());
+    field(&mut canonical, &config.num_hidden_layers.to_le_bytes());
+    field(
+        &mut canonical,
+        config
+            .quantization_config
+            .as_ref()
+            .map(|quant| quant.quant_method.as_bytes())
+            .unwrap_or(b"dense"),
+    );
+    let mut names = metadata.keys().collect::<Vec<_>>();
+    names.sort_unstable();
+    for name in names {
+        let tensor = &metadata[name];
+        field(&mut canonical, name.as_bytes());
+        field(&mut canonical, tensor.dtype.as_bytes());
+        field(&mut canonical, &(tensor.shape.len() as u64).to_le_bytes());
+        for &dim in &tensor.shape {
+            field(&mut canonical, &(dim as u64).to_le_bytes());
+        }
+        field(&mut canonical, &(tensor.bytes as u64).to_le_bytes());
+    }
+    state_bytes::sha256(&canonical)
+}
+
+fn expert_layout(
+    metadata: &HashMap<String, TensorMeta>,
+    model_layout_sha256: [u8; 32],
+    layer: usize,
+    expert: usize,
+    dtype: DType,
+    format: &str,
+) -> Result<NemotronExpertLayout> {
+    let prefix = format!("backbone.layers.{layer}.mixer.experts.{expert}.");
+    let mut tensors = metadata
+        .iter()
+        .filter_map(|(name, meta)| name.strip_prefix(&prefix).map(|suffix| (suffix, meta)))
+        .map(|(name, meta)| {
+            Ok(NemotronExpertTensorSpec {
+                name: name.to_owned(),
+                dtype: NemotronExpertTensorDType::from_safetensors(&meta.dtype)?,
+                shape: meta
+                    .shape
+                    .iter()
+                    .map(|&dim| {
+                        u32::try_from(dim).map_err(|_| {
+                            candle_core::Error::Msg("Nemotron expert dimension exceeds u32".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                byte_len: meta.bytes as u64,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    tensors.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(NemotronExpertLayout {
+        model_layout_sha256,
+        layer: u32::try_from(layer)
+            .map_err(|_| candle_core::Error::Msg("Nemotron layer exceeds u32".into()))?,
+        expert: u32::try_from(expert)
+            .map_err(|_| candle_core::Error::Msg("Nemotron expert exceeds u32".into()))?,
+        activation_dtype: format!("{dtype:?}"),
+        quant_format: format.to_owned(),
+        tensors,
+    })
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NemotronExpertCacheStats {
     pub capacity_bytes: usize,
     /// Resident expert tensor bytes, excluding the eager gate/shared expert.
     pub resident_bytes: usize,
     pub peak_resident_bytes: usize,
+    /// Host payload bytes retained by explicit snapshot imports. Excludes
+    /// application-owned restore sources and GPU cache entries.
+    pub host_snapshot_bytes: usize,
     /// Largest preflight estimate of live expert weight tensors during a miss.
     /// This excludes allocator metadata and CUDA workspaces.
     pub peak_live_expert_bytes: usize,
@@ -220,6 +320,13 @@ pub struct NemotronExpertCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    /// GPU misses served by safetensors and by validated host snapshots.
+    pub checkpoint_loads: u64,
+    pub restored_loads: u64,
+    /// Total wall time spent loading one expert, including the restore-source
+    /// callback where applicable. Divide by the corresponding load count.
+    pub checkpoint_load_ns: u64,
+    pub restored_load_ns: u64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -237,13 +344,17 @@ struct ExpertKey {
 /// VarBuilder lifetime.
 pub(super) struct ExpertSource {
     vb: VarBuilderX<'static>,
+    checkpoint: MmapedSafetensors,
     config: Config,
     intermediate: usize,
     dtype: DType,
     plans: HashMap<(usize, usize), WeightPlan>,
+    layouts: HashMap<(usize, usize), NemotronExpertLayout>,
     model: u64,
     format: String,
     device: String,
+    device_handle: Device,
+    sm_version: usize,
 }
 
 impl ExpertSource {
@@ -300,7 +411,14 @@ impl ExpertSource {
         };
         let intermediate = nemotron.moe_intermediate_size.unwrap();
         let count = nemotron.n_routed_experts.unwrap();
+        let format = config
+            .quantization_config
+            .as_ref()
+            .map(|q| q.quant_method.clone())
+            .unwrap_or_else(|| "dense".into());
+        let model_layout_sha256 = model_layout_digest(&metadata, config, nemotron, dtype);
         let mut plans = HashMap::new();
+        let mut layouts = HashMap::new();
         for (layer, kind) in nemotron.hybrid_override_pattern.bytes().enumerate() {
             if kind == b'E' {
                 for expert in 0..count {
@@ -316,16 +434,22 @@ impl ExpertSource {
                             sm_version,
                         )?,
                     );
+                    layouts.insert(
+                        (layer, expert),
+                        expert_layout(
+                            &metadata,
+                            model_layout_sha256,
+                            layer,
+                            expert,
+                            dtype,
+                            &format,
+                        )?,
+                    );
                 }
             }
         }
-        drop((metadata, checkpoint));
+        drop(metadata);
         let backend = unsafe { ShardedSafeTensors::var_builder(&paths, dtype, device)? };
-        let format = config
-            .quantization_config
-            .as_ref()
-            .map(|q| q.quant_method.clone())
-            .unwrap_or_else(|| "dense".into());
         Ok(Self {
             vb: VarBuilderX(
                 Either::Left(backend),
@@ -334,13 +458,17 @@ impl ExpertSource {
                 None,
                 Some(paths),
             ),
+            checkpoint,
             config: config.clone(),
             intermediate,
             dtype,
             plans,
+            layouts,
             model: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             format: format!("{format}:{dtype:?}"),
             device: format!("{device:?}"),
+            device_handle: device.clone(),
+            sm_version,
         })
     }
 
@@ -371,6 +499,207 @@ impl ExpertSource {
             ))
         })
     }
+
+    fn layout(&self, layer: usize, expert: usize) -> Result<&NemotronExpertLayout> {
+        self.layouts.get(&(layer, expert)).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "missing Nemotron expert layout for {layer}/{expert}"
+            ))
+        })
+    }
+
+    fn export(
+        &self,
+        layer: usize,
+        expert: usize,
+        model_fingerprint: [u8; 32],
+    ) -> Result<NemotronExpertSnapshot> {
+        if model_fingerprint == [0; 32] {
+            candle_core::bail!("Nemotron expert snapshot requires a nonzero model fingerprint")
+        }
+        let layout = self.layout(layer, expert)?.clone();
+        let prefix = format!("backbone.layers.{layer}.mixer.experts.{expert}.");
+        let capacity = layout.tensors.iter().try_fold(0usize, |total, spec| {
+            total.checked_add(spec.byte_len as usize).ok_or_else(|| {
+                candle_core::Error::Msg("Nemotron expert payload byte overflow".into())
+            })
+        })?;
+        let mut payload = Vec::with_capacity(capacity);
+        for spec in &layout.tensors {
+            let view = self.checkpoint.get(&format!("{prefix}{}", spec.name))?;
+            if view.data().len() != spec.byte_len as usize {
+                candle_core::bail!("Nemotron expert checkpoint tensor changed during export")
+            }
+            payload.extend_from_slice(view.data());
+        }
+        let snapshot = NemotronExpertSnapshot {
+            version: NEMOTRON_EXPERT_SNAPSHOT_VERSION,
+            model_fingerprint,
+            layout,
+            payload_sha256: state_bytes::sha256(&payload),
+            payload,
+        };
+        Ok(snapshot)
+    }
+
+    fn validate_snapshot(
+        &self,
+        snapshot: &NemotronExpertSnapshot,
+        model_fingerprint: [u8; 32],
+    ) -> Result<(usize, usize)> {
+        snapshot.validate()?;
+        self.validate_snapshot_identity(snapshot, model_fingerprint)
+    }
+
+    /// `from_bytes` already checked the payload checksum.
+    fn validate_snapshot_identity(
+        &self,
+        snapshot: &NemotronExpertSnapshot,
+        model_fingerprint: [u8; 32],
+    ) -> Result<(usize, usize)> {
+        if model_fingerprint == [0; 32] || snapshot.model_fingerprint != model_fingerprint {
+            candle_core::bail!("Nemotron expert model fingerprint mismatch")
+        }
+        let layer = snapshot.layout.layer as usize;
+        let expert = snapshot.layout.expert as usize;
+        if self.layout(layer, expert)? != &snapshot.layout {
+            candle_core::bail!("Nemotron expert model, shape, or format layout mismatch")
+        }
+        Ok((layer, expert))
+    }
+
+    fn load_restored(&self, snapshot: &NemotronExpertSnapshot) -> Result<NemotronMlp> {
+        let layer = snapshot.layout.layer as usize;
+        let expert = snapshot.layout.expert as usize;
+        let prefix = format!("backbone.layers.{layer}.mixer.experts.{expert}");
+        let up = self.restore_projection(
+            snapshot,
+            &prefix,
+            "up_proj",
+            self.config.hidden_size,
+            self.intermediate,
+        )?;
+        let down = self.restore_projection(
+            snapshot,
+            &prefix,
+            "down_proj",
+            self.intermediate,
+            self.config.hidden_size,
+        )?;
+        Ok(NemotronMlp { up, down })
+    }
+
+    fn restore_projection(
+        &self,
+        snapshot: &NemotronExpertSnapshot,
+        prefix: &str,
+        name: &str,
+        input: usize,
+        output: usize,
+    ) -> Result<ReplicatedLinear> {
+        let module = format!("{prefix}.{name}");
+        let tensor = |suffix: &str| snapshot.tensor(&format!("{name}.{suffix}"));
+        let upload = |suffix: &str| -> Result<Tensor> {
+            let (spec, bytes) = tensor(suffix)?;
+            let shape = spec
+                .shape
+                .iter()
+                .map(|&dim| dim as usize)
+                .collect::<Vec<_>>();
+            Tensor::from_raw_buffer(bytes, spec.dtype.candle(), &shape, &self.device_handle)
+        };
+        let native_nvfp4 = self
+            .config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|quant| {
+                quant.quant_method == "nvfp4"
+                    && !quant.should_skip_module(&module)
+                    && [
+                        "weight_packed",
+                        "blocks",
+                        "weight_scale_2",
+                        "weight_global_scale",
+                    ]
+                    .iter()
+                    .any(|suffix| snapshot.has_tensor(&format!("{name}.{suffix}")))
+            });
+        if !native_nvfp4 {
+            let weight = upload("weight")?.to_dtype(self.dtype)?;
+            if weight.dims() != [output, input] {
+                candle_core::bail!("restored dense Nemotron expert shape mismatch")
+            }
+            return ReplicatedLinear::from_weight_bias(weight, None);
+        }
+        let packed_name = ["weight_packed", "weight", "blocks"]
+            .into_iter()
+            .find(|suffix| snapshot.has_tensor(&format!("{name}.{suffix}")))
+            .ok_or_else(|| candle_core::Error::Msg("missing restored NVFP4 blocks".into()))?;
+        let scale_name = ["weight_scale", "scales"]
+            .into_iter()
+            .find(|suffix| snapshot.has_tensor(&format!("{name}.{suffix}")))
+            .ok_or_else(|| candle_core::Error::Msg("missing restored NVFP4 scales".into()))?;
+        let blocks = upload(packed_name)?;
+        let scales = upload(scale_name)?;
+        if blocks.dtype() != DType::U8
+            || blocks.dims() != [output, input / 2]
+            || scales.dims() != [output, input / 16]
+            || !matches!(scales.dtype(), DType::F8E4M3 | DType::U8)
+        {
+            candle_core::bail!("restored NVFP4 Nemotron expert shape or dtype mismatch")
+        }
+        let scalar = |suffix: &str| -> Result<f32> {
+            let (_, bytes) = tensor(suffix)?;
+            if bytes.len() != 4 {
+                candle_core::bail!("restored NVFP4 scalar {suffix} has invalid length")
+            }
+            Ok(f32::from_bits(u32::from_le_bytes(
+                bytes.try_into().unwrap(),
+            )))
+        };
+        let global_scale = if snapshot.has_tensor(&format!("{name}.weight_global_scale")) {
+            let value = scalar("weight_global_scale")?;
+            if value == 0.0 {
+                1.0
+            } else {
+                1.0 / value
+            }
+        } else if snapshot.has_tensor(&format!("{name}.weight_scale_2")) {
+            scalar("weight_scale_2")?
+        } else {
+            1.0
+        };
+        let input_scale = if snapshot.has_tensor(&format!("{name}.input_scale")) {
+            scalar("input_scale")?
+        } else if snapshot.has_tensor(&format!("{name}.input_global_scale")) {
+            let value = scalar("input_global_scale")?;
+            if value == 0.0 {
+                1.0
+            } else {
+                1.0 / value
+            }
+        } else {
+            1.0
+        };
+        #[cfg(feature = "cuda")]
+        let weight_scale_swizzled = if self.sm_version >= 100 {
+            Some(attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(
+                &scales,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let weight_scale_swizzled = None;
+        ReplicatedLinear::from(LinearX::LnNvfp4(LnNvfp4 {
+            blocks,
+            scales,
+            global_scale,
+            input_scale,
+            bias: None,
+            weight_scale_swizzled,
+        }))
+    }
 }
 
 struct CacheEntry {
@@ -382,6 +711,9 @@ struct CacheEntry {
 pub(super) struct ExpertCache {
     source: ExpertSource,
     entries: HashMap<ExpertKey, CacheEntry>,
+    restored: HashMap<(usize, usize), Arc<NemotronExpertSnapshot>>,
+    restore_source: Option<Arc<dyn NemotronExpertRestoreSource>>,
+    restore_model_fingerprint: Option<[u8; 32]>,
     clock: u64,
     stats: NemotronExpertCacheStats,
 }
@@ -401,6 +733,9 @@ impl ExpertCache {
         Ok(Self {
             source,
             entries: HashMap::new(),
+            restored: HashMap::new(),
+            restore_source: None,
+            restore_model_fingerprint: None,
             clock: 0,
             stats: NemotronExpertCacheStats {
                 capacity_bytes,
@@ -411,6 +746,91 @@ impl ExpertCache {
 
     pub(super) fn stats(&self) -> NemotronExpertCacheStats {
         self.stats.clone()
+    }
+
+    pub(super) fn export(
+        &self,
+        layer: usize,
+        expert: usize,
+        model_fingerprint: [u8; 32],
+    ) -> Result<NemotronExpertSnapshot> {
+        self.source.export(layer, expert, model_fingerprint)
+    }
+
+    fn bind_fingerprint(&mut self, fingerprint: [u8; 32]) -> Result<()> {
+        if fingerprint == [0; 32] {
+            candle_core::bail!("Nemotron expert restore requires a nonzero model fingerprint")
+        }
+        if self
+            .restore_model_fingerprint
+            .is_some_and(|bound| bound != fingerprint)
+        {
+            candle_core::bail!("Nemotron expert restore model fingerprint changed")
+        }
+        self.restore_model_fingerprint = Some(fingerprint);
+        Ok(())
+    }
+
+    pub(super) fn import(
+        &mut self,
+        expected_fingerprint: [u8; 32],
+        snapshot: NemotronExpertSnapshot,
+    ) -> Result<()> {
+        let key = self
+            .source
+            .validate_snapshot(&snapshot, expected_fingerprint)?;
+        self.install_validated(key, expected_fingerprint, snapshot)
+    }
+
+    pub(super) fn import_bytes(
+        &mut self,
+        expected_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let snapshot = NemotronExpertSnapshot::from_bytes(bytes)?;
+        let key = self
+            .source
+            .validate_snapshot_identity(&snapshot, expected_fingerprint)?;
+        self.install_validated(key, expected_fingerprint, snapshot)
+    }
+
+    fn install_validated(
+        &mut self,
+        key: (usize, usize),
+        expected_fingerprint: [u8; 32],
+        snapshot: NemotronExpertSnapshot,
+    ) -> Result<()> {
+        if self.restored.contains_key(&key) {
+            candle_core::bail!(
+                "Nemotron expert snapshot already imported for {}/{}",
+                key.0,
+                key.1
+            )
+        }
+        let host_snapshot_bytes = self
+            .stats
+            .host_snapshot_bytes
+            .checked_add(snapshot.payload.len())
+            .ok_or_else(|| {
+                candle_core::Error::Msg("Nemotron host snapshot byte overflow".into())
+            })?;
+        self.bind_fingerprint(expected_fingerprint)?;
+        self.stats.host_snapshot_bytes = host_snapshot_bytes;
+        self.restored.insert(key, Arc::new(snapshot));
+        Ok(())
+    }
+
+    pub(super) fn set_restore_source(
+        &mut self,
+        expected_fingerprint: [u8; 32],
+        source: Arc<dyn NemotronExpertRestoreSource>,
+    ) -> Result<()> {
+        if self.restore_source.is_some() {
+            candle_core::bail!("Nemotron expert restore source already installed")
+        }
+        self.bind_fingerprint(expected_fingerprint)?;
+        self.restore_source = Some(source);
+        Ok(())
     }
 
     fn make_room(&mut self, bytes: usize) -> Result<()> {
@@ -443,13 +863,42 @@ impl ExpertCache {
 
         self.stats.misses += 1;
         let plan = self.source.plan(layer, id)?;
+        let started = Instant::now();
+        let restored = if let Some(snapshot) = self.restored.get(&(layer, id)) {
+            Some(snapshot.clone())
+        } else if let Some(store) = &self.restore_source {
+            match store.load_expert(layer, id)? {
+                Some(bytes) => {
+                    let snapshot = NemotronExpertSnapshot::from_bytes(&bytes)?;
+                    self.source.validate_snapshot_identity(
+                        &snapshot,
+                        self.restore_model_fingerprint.unwrap(),
+                    )?;
+                    if snapshot.layout.layer as usize != layer
+                        || snapshot.layout.expert as usize != id
+                    {
+                        candle_core::bail!(
+                            "Nemotron expert restore source returned the wrong expert"
+                        )
+                    }
+                    Some(Arc::new(snapshot))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         self.make_room(plan.admission_bytes)?;
         self.stats.peak_live_expert_bytes = self.stats.peak_live_expert_bytes.max(
             self.stats
                 .resident_bytes
                 .saturating_add(plan.admission_bytes),
         );
-        let expert = Arc::new(self.source.load(layer, id)?);
+        let expert = Arc::new(if let Some(snapshot) = &restored {
+            self.source.load_restored(snapshot)?
+        } else {
+            self.source.load(layer, id)?
+        });
         let bytes = expert.resident_bytes()?;
         if bytes != plan.resident_bytes {
             candle_core::bail!(
@@ -463,6 +912,15 @@ impl ExpertCache {
             .peak_resident_bytes
             .max(self.stats.resident_bytes);
         self.stats.transferred_bytes += bytes as u64;
+        let elapsed_ns = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        if restored.is_some() {
+            self.stats.restored_loads += 1;
+            self.stats.restored_load_ns = self.stats.restored_load_ns.saturating_add(elapsed_ns);
+        } else {
+            self.stats.checkpoint_loads += 1;
+            self.stats.checkpoint_load_ns =
+                self.stats.checkpoint_load_ns.saturating_add(elapsed_ns);
+        }
         self.entries.insert(
             key,
             CacheEntry {
@@ -486,7 +944,13 @@ mod tests {
     fn fixture(
         device: &Device,
         capacity_bytes: usize,
-    ) -> Result<(NemotronMoe, NemotronMoe, Arc<Mutex<ExpertCache>>, PathBuf)> {
+    ) -> Result<(
+        NemotronMoe,
+        NemotronMoe,
+        Arc<Mutex<ExpertCache>>,
+        PathBuf,
+        Config,
+    )> {
         let mut raw: Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/nemotron_3_nano_config.json"
         ))
@@ -562,7 +1026,7 @@ mod tests {
         let prefix_vb = vb.pp(prefix);
         let eager = NemotronMoe::new(prefix_vb.clone(), &config, &c, DType::F32, 0, None)?;
         let lazy = NemotronMoe::new(prefix_vb, &config, &c, DType::F32, 0, Some(&cache))?;
-        Ok((eager, lazy, cache, path))
+        Ok((eager, lazy, cache, path, config))
     }
 
     fn input(ids: &[usize], device: &Device) -> Result<Tensor> {
@@ -597,7 +1061,7 @@ mod tests {
     #[test]
     fn exact_routing_cache_cold_warm_eviction_and_batch() -> Result<()> {
         let device = Device::Cpu;
-        let (eager, lazy, cache, path) = fixture(&device, 2 * 1024)?;
+        let (eager, lazy, cache, path, _) = fixture(&device, 2 * 1024)?;
         compare(&eager, &lazy, &[0, 1], &device)?;
         let stats = cache.lock().stats();
         assert_eq!((stats.hits, stats.misses), (0, 2));
@@ -628,13 +1092,96 @@ mod tests {
         assert!(format!("{error}").contains("needs 1024 bytes during loading"));
     }
 
+    #[test]
+    fn cross_instance_snapshot_restore_validates_identity_and_keeps_budget() -> Result<()> {
+        let device = Device::Cpu;
+        let (eager, _, source_cache, path, config) = fixture(&device, 1024)?;
+        let fingerprint = [7; 32];
+        let snapshot = source_cache.lock().export(0, 0, fingerprint)?;
+        let bytes = snapshot.to_bytes()?;
+        let decoded = NemotronExpertSnapshot::from_bytes(&bytes)?;
+        assert_eq!(decoded.payload, snapshot.payload);
+
+        let c = NemotronConfig::from_config(&config)?;
+        let backend = unsafe { ShardedSafeTensors::var_builder(&[&path], DType::F32, &device)? };
+        let vb = VarBuilderX(
+            Either::Left(backend),
+            String::new(),
+            None,
+            None,
+            Some(vec![path.clone()]),
+        );
+        let source = ExpertSource::new(&vb, &config, &c, DType::F32, &device)?;
+        let mut target_cache = ExpertCache::new(source, 1024)?;
+        assert!(target_cache.import([8; 32], decoded.clone()).is_err());
+        let mut wrong = decoded.clone();
+        wrong.layout.model_layout_sha256[0] ^= 1;
+        assert!(target_cache.import(fingerprint, wrong).is_err());
+        let mut wrong = decoded.clone();
+        wrong.layout.quant_format = "nvfp4".into();
+        assert!(target_cache.import(fingerprint, wrong).is_err());
+        let mut wrong = decoded.clone();
+        wrong.layout.tensors[0].shape = vec![1, 1];
+        assert!(target_cache.import(fingerprint, wrong).is_err());
+        let mut wrong = decoded.clone();
+        wrong.payload[0] ^= 1;
+        assert!(target_cache.import(fingerprint, wrong).is_err());
+        assert!(NemotronExpertSnapshot::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        target_cache.import(fingerprint, decoded.clone())?;
+        assert!(target_cache.import(fingerprint, decoded).is_err());
+        let target_cache = Arc::new(Mutex::new(target_cache));
+        let restored = NemotronMoe::new(
+            vb.pp("backbone.layers.0.mixer"),
+            &config,
+            &c,
+            DType::F32,
+            0,
+            Some(&target_cache),
+        )?;
+        compare(&eager, &restored, &[0, 1, 2, 3], &device)?;
+        compare(&eager, &restored, &[0], &device)?;
+        let stats = target_cache.lock().stats();
+        assert!(stats.restored_loads >= 2);
+        assert!(stats.checkpoint_loads >= 3);
+        assert!(stats.peak_live_expert_bytes <= 1024);
+        drop((restored, target_cache, source_cache, eager, vb));
+        std::fs::remove_file(path).map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
+
+    #[test]
+    fn restore_source_serves_selected_expert_and_falls_back_exactly() -> Result<()> {
+        struct HostStore(Vec<u8>);
+        impl NemotronExpertRestoreSource for HostStore {
+            fn load_expert(&self, layer: usize, expert: usize) -> Result<Option<Vec<u8>>> {
+                Ok((layer == 0 && expert == 0).then(|| self.0.clone()))
+            }
+        }
+        let device = Device::Cpu;
+        let (eager, lazy, cache, path, _) = fixture(&device, 1024)?;
+        let fingerprint = [9; 32];
+        let bytes = cache.lock().export(0, 0, fingerprint)?.to_bytes()?;
+        cache
+            .lock()
+            .set_restore_source(fingerprint, Arc::new(HostStore(bytes)))?;
+        compare(&eager, &lazy, &[0, 1], &device)?;
+        let stats = cache.lock().stats();
+        assert_eq!(stats.restored_loads, 1);
+        assert_eq!(stats.checkpoint_loads, 1);
+        assert_eq!(stats.misses, 2);
+        assert!(stats.peak_live_expert_bytes <= 1024);
+        drop((eager, lazy, cache));
+        std::fs::remove_file(path).map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn exact_routing_on_cuda_and_token_latency() -> Result<()> {
         let Ok(device) = Device::new_cuda(0) else {
             return Ok(());
         };
-        let (eager, lazy, cache, path) = fixture(&device, 2 * 1024)?;
+        let (eager, lazy, cache, path, _) = fixture(&device, 2 * 1024)?;
         compare(&eager, &lazy, &[0, 1, 2, 3], &device)?;
         let mut samples = Vec::new();
         for _ in 0..32 {
@@ -741,7 +1288,27 @@ mod tests {
             .flatten_all()?
             .to_vec1::<half::bf16>()?;
         assert_eq!(expected, actual);
-        drop((selected, eager, cache, vb));
+        let snapshot = cache.source.export(0, 0, [11; 32])?;
+        assert!(snapshot
+            .layout
+            .tensors
+            .iter()
+            .any(|tensor| tensor.dtype == NemotronExpertTensorDType::U8));
+        let encoded = snapshot.to_bytes()?;
+        let source = ExpertSource::new(&vb, &config, &c, DType::BF16, &device)?;
+        let mut restored_cache = ExpertCache::new(source, 64 * 1024)?;
+        restored_cache.import([11; 32], NemotronExpertSnapshot::from_bytes(&encoded)?)?;
+        let restored = restored_cache.resolve(0, 0)?;
+        assert_eq!(restored.resident_bytes()?, selected.resident_bytes()?);
+        let restored_output = restored
+            .forward(&input)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?;
+        assert_eq!(expected, restored_output);
+        assert_eq!(restored_cache.stats().restored_loads, 1);
+        assert_eq!(restored_cache.stats().checkpoint_loads, 0);
+        drop((restored, restored_cache, selected, eager, cache, vb));
         std::fs::remove_file(path).map_err(candle_core::Error::wrap)?;
         Ok(())
     }
