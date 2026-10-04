@@ -12,6 +12,7 @@ use crate::utils::config::Config;
 use candle_core::{safetensors::MmapedSafetensors, DType, Device, Result, Tensor};
 use candle_nn::var_builder::ShardedSafeTensors;
 use either::Either;
+use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +24,9 @@ static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
 /// Optional application-owned persistent source for expert snapshots. Return
 /// `None` to fall back to the original safetensors checkpoint. A returned
 /// snapshot is always validated before any GPU upload; invalid data is an
-/// error, not a silent checkpoint fallback.
+/// error, not a silent checkpoint fallback. Calls for different experts may
+/// run concurrently; calls for the same expert are coalesced while in flight.
+/// The callback runs without the shared GPU expert cache mutex held.
 pub trait NemotronExpertRestoreSource: Send + Sync {
     fn load_expert(&self, layer: usize, expert: usize) -> Result<Option<Vec<u8>>>;
 }
@@ -708,9 +711,77 @@ struct CacheEntry {
     last_use: u64,
 }
 
+/// Waiters own this record after dropping the cache mutex. The leader publishes
+/// the same loaded expert (or failure) to every waiter before removing it.
+struct InFlight {
+    outcome: Mutex<Option<std::result::Result<Arc<NemotronMlp>, String>>>,
+    ready: Condvar,
+}
+
+impl InFlight {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<Arc<NemotronMlp>> {
+        let mut outcome = self.outcome.lock();
+        while outcome.is_none() {
+            self.ready.wait(&mut outcome);
+        }
+        match outcome.as_ref().unwrap() {
+            Ok(expert) => Ok(expert.clone()),
+            Err(message) => Err(candle_core::Error::Msg(message.clone())),
+        }
+    }
+
+    fn complete(&self, result: &Result<Arc<NemotronMlp>>) {
+        *self.outcome.lock() = Some(match result {
+            Ok(expert) => Ok(expert.clone()),
+            Err(error) => Err(error.to_string()),
+        });
+        self.ready.notify_all();
+    }
+}
+
+/// A panicking application callback must not strand other callers on its key.
+struct FlightLeader<'a> {
+    cache: &'a Arc<Mutex<ExpertCache>>,
+    key: (usize, usize),
+    flight: Arc<InFlight>,
+    finished: bool,
+}
+
+impl FlightLeader<'_> {
+    fn finish(mut self, result: Result<Arc<NemotronMlp>>) -> Result<Arc<NemotronMlp>> {
+        {
+            let mut cache = self.cache.lock();
+            self.flight.complete(&result);
+            cache.in_flight.remove(&self.key);
+        }
+        self.finished = true;
+        result
+    }
+}
+
+impl Drop for FlightLeader<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut cache = self.cache.lock();
+            self.flight.complete(&Err(candle_core::Error::Msg(
+                "Nemotron expert load panicked".into(),
+            )));
+            cache.in_flight.remove(&self.key);
+        }
+    }
+}
+
 pub(super) struct ExpertCache {
     source: ExpertSource,
     entries: HashMap<ExpertKey, CacheEntry>,
+    in_flight: HashMap<(usize, usize), Arc<InFlight>>,
     restored: HashMap<(usize, usize), Arc<NemotronExpertSnapshot>>,
     restore_source: Option<Arc<dyn NemotronExpertRestoreSource>>,
     restore_model_fingerprint: Option<[u8; 32]>,
@@ -733,6 +804,7 @@ impl ExpertCache {
         Ok(Self {
             source,
             entries: HashMap::new(),
+            in_flight: HashMap::new(),
             restored: HashMap::new(),
             restore_source: None,
             restore_model_fingerprint: None,
@@ -852,42 +924,109 @@ impl ExpertCache {
     }
 
     /// The returned Arc pins this expert while its assigned tokens execute.
-    pub(super) fn resolve(&mut self, layer: usize, id: usize) -> Result<Arc<NemotronMlp>> {
-        let key = self.source.key(layer, id);
-        self.clock = self.clock.wrapping_add(1);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_use = self.clock;
-            self.stats.hits += 1;
-            return Ok(entry.expert.clone());
+    /// The application callback and checksum validation never hold the cache
+    /// mutex. A per-key flight shares the result with concurrent callers.
+    pub(super) fn resolve_shared(
+        shared: &Arc<Mutex<Self>>,
+        layer: usize,
+        id: usize,
+    ) -> Result<Arc<NemotronMlp>> {
+        enum Fetch {
+            Imported(Arc<NemotronExpertSnapshot>),
+            Store {
+                source: Arc<dyn NemotronExpertRestoreSource>,
+                fingerprint: [u8; 32],
+                layout: NemotronExpertLayout,
+            },
+            Checkpoint,
+        }
+        enum Action {
+            Wait(Arc<InFlight>),
+            Load(Arc<InFlight>, WeightPlan, Fetch, Instant),
         }
 
-        self.stats.misses += 1;
-        let plan = self.source.plan(layer, id)?;
-        let started = Instant::now();
-        let restored = if let Some(snapshot) = self.restored.get(&(layer, id)) {
-            Some(snapshot.clone())
-        } else if let Some(store) = &self.restore_source {
-            match store.load_expert(layer, id)? {
-                Some(bytes) => {
-                    let snapshot = NemotronExpertSnapshot::from_bytes(&bytes)?;
-                    self.source.validate_snapshot_identity(
-                        &snapshot,
-                        self.restore_model_fingerprint.unwrap(),
-                    )?;
-                    if snapshot.layout.layer as usize != layer
-                        || snapshot.layout.expert as usize != id
-                    {
-                        candle_core::bail!(
-                            "Nemotron expert restore source returned the wrong expert"
-                        )
-                    }
-                    Some(Arc::new(snapshot))
-                }
-                None => None,
+        let action = {
+            let mut cache = shared.lock();
+            let key = cache.source.key(layer, id);
+            cache.clock = cache.clock.wrapping_add(1);
+            let clock = cache.clock;
+            if let Some(entry) = cache.entries.get_mut(&key) {
+                entry.last_use = clock;
+                let expert = entry.expert.clone();
+                cache.stats.hits += 1;
+                return Ok(expert);
             }
-        } else {
-            None
+            cache.stats.misses += 1;
+            let plan = cache.source.plan(layer, id)?;
+            if let Some(flight) = cache.in_flight.get(&(layer, id)) {
+                Action::Wait(flight.clone())
+            } else {
+                let fetch = if let Some(snapshot) = cache.restored.get(&(layer, id)) {
+                    Fetch::Imported(snapshot.clone())
+                } else if let Some(source) = &cache.restore_source {
+                    Fetch::Store {
+                        source: source.clone(),
+                        fingerprint: cache.restore_model_fingerprint.unwrap(),
+                        layout: cache.source.layout(layer, id)?.clone(),
+                    }
+                } else {
+                    Fetch::Checkpoint
+                };
+                let flight = Arc::new(InFlight::new());
+                cache.in_flight.insert((layer, id), flight.clone());
+                Action::Load(flight, plan, fetch, Instant::now())
+            }
         };
+        let (flight, plan, fetch, started) = match action {
+            Action::Wait(flight) => return flight.wait(),
+            Action::Load(flight, plan, fetch, started) => (flight, plan, fetch, started),
+        };
+        let leader = FlightLeader {
+            cache: shared,
+            key: (layer, id),
+            flight,
+            finished: false,
+        };
+        let restored = match fetch {
+            Fetch::Imported(snapshot) => Ok(Some(snapshot)),
+            Fetch::Checkpoint => Ok(None),
+            Fetch::Store {
+                source,
+                fingerprint,
+                layout,
+            } => source.load_expert(layer, id).and_then(|bytes| {
+                bytes
+                    .map(|bytes| {
+                        let snapshot = NemotronExpertSnapshot::from_bytes(&bytes)?;
+                        if fingerprint == [0; 32] || snapshot.model_fingerprint != fingerprint {
+                            candle_core::bail!("Nemotron expert model fingerprint mismatch")
+                        }
+                        if snapshot.layout != layout {
+                            candle_core::bail!(
+                                "Nemotron expert model, shape, or format layout mismatch"
+                            )
+                        }
+                        Ok(Arc::new(snapshot))
+                    })
+                    .transpose()
+            }),
+        };
+        let result = restored
+            .and_then(|snapshot| shared.lock().load_miss(layer, id, plan, started, snapshot));
+        leader.finish(result)
+    }
+
+    /// Called only after the shared-lock coordinator has fetched and validated
+    /// the host snapshot. GPU admission and upload remain serialized here.
+    fn load_miss(
+        &mut self,
+        layer: usize,
+        id: usize,
+        plan: WeightPlan,
+        started: Instant,
+        restored: Option<Arc<NemotronExpertSnapshot>>,
+    ) -> Result<Arc<NemotronMlp>> {
+        let key = self.source.key(layer, id);
         self.make_room(plan.admission_bytes)?;
         self.stats.peak_live_expert_bytes = self.stats.peak_live_expert_bytes.max(
             self.stats
@@ -940,6 +1079,10 @@ mod tests {
     use candle_core::Tensor;
     use parking_lot::Mutex;
     use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Weak;
+    use std::time::Duration;
 
     fn fixture(
         device: &Device,
@@ -1175,6 +1318,150 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn independent_miss_progresses_while_same_key_waiters_share_one_fetch() -> Result<()> {
+        struct BlockingStore {
+            snapshots: [Vec<u8>; 2],
+            cache: Weak<Mutex<ExpertCache>>,
+            calls: Arc<[AtomicUsize; 2]>,
+            entered: mpsc::Sender<()>,
+            gate: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl NemotronExpertRestoreSource for BlockingStore {
+            fn load_expert(&self, layer: usize, expert: usize) -> Result<Option<Vec<u8>>> {
+                assert_eq!(layer, 0);
+                assert!(self.cache.upgrade().unwrap().try_lock().is_some());
+                self.calls[expert].fetch_add(1, Ordering::SeqCst);
+                if expert == 0 {
+                    self.entered.send(()).unwrap();
+                    let (open, ready) = &*self.gate;
+                    let mut open = open.lock();
+                    while !*open {
+                        ready.wait(&mut open);
+                    }
+                }
+                Ok(Some(self.snapshots[expert].clone()))
+            }
+        }
+
+        let (eager, lazy, cache, path, _) = fixture(&Device::Cpu, 2 * 1024)?;
+        let fingerprint = [13; 32];
+        let first_snapshot = cache.lock().export(0, 0, fingerprint)?.to_bytes()?;
+        let second_snapshot = cache.lock().export(0, 1, fingerprint)?.to_bytes()?;
+        let snapshots = [first_snapshot, second_snapshot];
+        let calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        cache.lock().set_restore_source(
+            fingerprint,
+            Arc::new(BlockingStore {
+                snapshots,
+                cache: Arc::downgrade(&cache),
+                calls: calls.clone(),
+                entered: entered_tx,
+                gate: gate.clone(),
+            }),
+        )?;
+
+        let first_cache = cache.clone();
+        let first = std::thread::spawn(move || ExpertCache::resolve_shared(&first_cache, 0, 0));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let same_cache = cache.clone();
+        let same = std::thread::spawn(move || ExpertCache::resolve_shared(&same_cache, 0, 0));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cache.lock().stats().misses < 2 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let same_joined_flight = cache.lock().stats().misses >= 2;
+        let (other_tx, other_rx) = mpsc::channel();
+        let other_cache = cache.clone();
+        let started = Instant::now();
+        let other = std::thread::spawn(move || {
+            let result = ExpertCache::resolve_shared(&other_cache, 0, 1);
+            other_tx
+                .send(result.as_ref().map(|_| ()).map_err(|e| e.to_string()))
+                .unwrap();
+            result
+        });
+        let other_before_release = other_rx.recv_timeout(Duration::from_secs(2));
+        let independent_ms = started.elapsed().as_secs_f64() * 1000.0;
+        {
+            let (open, ready) = &*gate;
+            *open.lock() = true;
+            ready.notify_all();
+        }
+        assert!(
+            other_before_release.is_ok(),
+            "independent key blocked on restore callback"
+        );
+        other_before_release.unwrap().unwrap();
+        let first = first.join().unwrap()?;
+        let same = same.join().unwrap()?;
+        let other = other.join().unwrap()?;
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(
+            same_joined_flight,
+            "same-key caller never joined the in-flight load"
+        );
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(calls[0].load(Ordering::SeqCst), 1);
+        assert_eq!(calls[1].load(Ordering::SeqCst), 1);
+        let stats = cache.lock().stats();
+        assert_eq!(stats.restored_loads, 2);
+        assert_eq!(stats.checkpoint_loads, 0);
+        assert!(stats.peak_live_expert_bytes <= 2 * 1024);
+        eprintln!("independent Nemotron expert miss completed in {independent_ms:.3} ms while another restore callback remained blocked");
+        drop((first, same, other, eager, lazy, cache));
+        std::fs::remove_file(path).map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_restore_source_fails_closed_and_allows_retry() -> Result<()> {
+        struct CorruptThenValid {
+            valid: Vec<u8>,
+            corrupt: Vec<u8>,
+            calls: AtomicUsize,
+        }
+        impl NemotronExpertRestoreSource for CorruptThenValid {
+            fn load_expert(&self, _: usize, _: usize) -> Result<Option<Vec<u8>>> {
+                let bytes = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    &self.corrupt
+                } else {
+                    &self.valid
+                };
+                Ok(Some(bytes.clone()))
+            }
+        }
+        let (eager, lazy, cache, path, _) = fixture(&Device::Cpu, 1024)?;
+        let fingerprint = [14; 32];
+        let valid = cache.lock().export(0, 0, fingerprint)?.to_bytes()?;
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        cache.lock().set_restore_source(
+            fingerprint,
+            Arc::new(CorruptThenValid {
+                valid,
+                corrupt,
+                calls: AtomicUsize::new(0),
+            }),
+        )?;
+        let error = ExpertCache::resolve_shared(&cache, 0, 0)
+            .err()
+            .expect("corrupt restore must fail");
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+        let stats = cache.lock().stats();
+        assert_eq!(stats.checkpoint_loads, 0);
+        assert_eq!(stats.restored_loads, 0);
+        assert_eq!(stats.resident_bytes, 0);
+        assert!(cache.lock().in_flight.is_empty());
+        ExpertCache::resolve_shared(&cache, 0, 0)?;
+        assert_eq!(cache.lock().stats().restored_loads, 1);
+        drop((eager, lazy, cache));
+        std::fs::remove_file(path).map_err(candle_core::Error::wrap)?;
+        Ok(())
+    }
+
     #[cfg(feature = "cuda")]
     #[test]
     fn exact_routing_on_cuda_and_token_latency() -> Result<()> {
@@ -1270,10 +1557,10 @@ mod tests {
         let expected = source.plan(0, 0)?;
         assert!(ExpertCache::new(source, expected.admission_bytes - 1).is_err());
         let source = ExpertSource::new(&vb, &config, &c, DType::BF16, &device)?;
-        let mut cache = ExpertCache::new(source, 64 * 1024)?;
-        let selected = cache.resolve(0, 0)?;
+        let cache = Arc::new(Mutex::new(ExpertCache::new(source, 64 * 1024)?));
+        let selected = ExpertCache::resolve_shared(&cache, 0, 0)?;
         assert_eq!(selected.resident_bytes()?, expected.resident_bytes);
-        assert!(cache.stats().peak_live_expert_bytes <= 64 * 1024);
+        assert!(cache.lock().stats().peak_live_expert_bytes <= 64 * 1024);
         assert_eq!(selected.resident_bytes()?, eager.resident_bytes()?);
         assert!(selected.resident_bytes()? < 2 * 128 * 128 * DType::BF16.size_in_bytes());
         let input = Tensor::ones((1, 128), DType::BF16, &device)?;
@@ -1288,7 +1575,7 @@ mod tests {
             .flatten_all()?
             .to_vec1::<half::bf16>()?;
         assert_eq!(expected, actual);
-        let snapshot = cache.source.export(0, 0, [11; 32])?;
+        let snapshot = cache.lock().source.export(0, 0, [11; 32])?;
         assert!(snapshot
             .layout
             .tensors
@@ -1296,9 +1583,11 @@ mod tests {
             .any(|tensor| tensor.dtype == NemotronExpertTensorDType::U8));
         let encoded = snapshot.to_bytes()?;
         let source = ExpertSource::new(&vb, &config, &c, DType::BF16, &device)?;
-        let mut restored_cache = ExpertCache::new(source, 64 * 1024)?;
-        restored_cache.import([11; 32], NemotronExpertSnapshot::from_bytes(&encoded)?)?;
-        let restored = restored_cache.resolve(0, 0)?;
+        let restored_cache = Arc::new(Mutex::new(ExpertCache::new(source, 64 * 1024)?));
+        restored_cache
+            .lock()
+            .import([11; 32], NemotronExpertSnapshot::from_bytes(&encoded)?)?;
+        let restored = ExpertCache::resolve_shared(&restored_cache, 0, 0)?;
         assert_eq!(restored.resident_bytes()?, selected.resident_bytes()?);
         let restored_output = restored
             .forward(&input)?
@@ -1306,8 +1595,8 @@ mod tests {
             .flatten_all()?
             .to_vec1::<half::bf16>()?;
         assert_eq!(expected, restored_output);
-        assert_eq!(restored_cache.stats().restored_loads, 1);
-        assert_eq!(restored_cache.stats().checkpoint_loads, 0);
+        assert_eq!(restored_cache.lock().stats().restored_loads, 1);
+        assert_eq!(restored_cache.lock().stats().checkpoint_loads, 0);
         drop((restored, restored_cache, selected, eager, cache, vb));
         std::fs::remove_file(path).map_err(candle_core::Error::wrap)?;
         Ok(())
