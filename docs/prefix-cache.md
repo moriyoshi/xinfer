@@ -97,6 +97,31 @@ imported sequence an unused ID with enough Mamba cache capacity. An existing
 slot is rejected so an active sequence cannot be overwritten. The model API
 does not itself store, transport, or publish a combined KV and GDN bundle.
 
+## Portable Nemotron-H Mamba state
+
+`NemotronHForCausalLM::export_mamba_state` exports the FP32 convolution and
+SSM state for every Mamba layer at a completed token boundary. The returned
+`NemotronMambaSnapshot` carries a version, absolute layer order, tensor shapes
+and dtypes, tensor parallel layout, token boundary, caller supplied model
+fingerprint, and payload SHA-256. `to_bytes` and `from_bytes` use a portable
+binary envelope with little-endian FP32 payload bits.
+
+```rust
+let snapshot = prefill_model.export_mamba_state(seq_id, prefix_tokens, fingerprint)?;
+let bytes = snapshot.to_bytes()?;
+let snapshot = NemotronMambaSnapshot::from_bytes(&bytes)?;
+decode_model.import_mamba_state(new_seq_id, prefix_tokens, fingerprint, &snapshot)?;
+```
+
+The 32-byte fingerprint must identify compatible weights, adapters, and
+numerical execution settings. xinfer cannot derive it from loaded weights.
+Restore attention KV from the same exact token boundary before continuation;
+the Mamba snapshot contains no attention KV. Imports reject incompatible
+layouts, boundaries, fingerprints, corrupt payloads, occupied sequence IDs,
+and exhausted state capacity. The pinned Japanese 9B model has 27 Mamba
+layers and exports 145,539,072 payload bytes per sequence. The model API does
+not assemble or persist the combined Mamba and attention bundle.
+
 ## Inspecting cache hits
 
 Chat completion responses include the prefix-cache hit count under

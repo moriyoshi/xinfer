@@ -1,6 +1,13 @@
 //! Nemotron-H: a sequence of Mamba2, MLP, and unrotated attention blocks.
 //! The recurrent path is deliberately expressed in Candle operations so the
 //! checkpoint can run without the optional mamba-ssm CUDA extension.
+mod state;
+
+pub use state::{
+    NemotronMambaSnapshot, NemotronMambaStateLayout, NemotronStateDType,
+    NEMOTRON_MAMBA_STATE_VERSION,
+};
+
 use crate::models::layers::attention::Attention;
 use crate::models::layers::distributed::{Comm, ReplicatedLinear, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
@@ -747,6 +754,51 @@ impl NemotronHForCausalLM {
             Ok(false)
         }
     }
+
+    /// Export exact FP32 Mamba state after `prefix_tokens` have been processed.
+    /// The caller must export attention KV at the same token boundary and pass
+    /// a SHA-256 identity for compatible weights and execution settings.
+    pub fn export_mamba_state(
+        &self,
+        seq_id: usize,
+        prefix_tokens: u64,
+        model_fingerprint: [u8; 32],
+    ) -> Result<NemotronMambaSnapshot> {
+        let layout = state::layout_from_layers(&self.layers)?;
+        let states = self.states.read();
+        let sequence = states.get(&seq_id).ok_or_else(|| {
+            candle_core::Error::Msg(format!("Nemotron-H sequence {seq_id} has no Mamba state"))
+        })?;
+        state::capture(sequence, layout, prefix_tokens, model_fingerprint)
+    }
+
+    /// Import into an unused sequence ID. Restore attention KV from the same
+    /// boundary before decoding. An existing ID is never overwritten.
+    pub fn import_mamba_state(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        snapshot: &NemotronMambaSnapshot,
+    ) -> Result<()> {
+        if self.states.read().contains_key(&seq_id) {
+            candle_core::bail!("Nemotron-H sequence {seq_id} already has Mamba state")
+        }
+        let layout = state::layout_from_layers(&self.layers)?;
+        let restored = snapshot.restore(
+            &layout,
+            expected_prefix_tokens,
+            expected_model_fingerprint,
+            &self.device,
+        )?;
+        state::install(
+            &mut self.states.write(),
+            seq_id,
+            restored,
+            self.state_capacity.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn has_mamba_prefix_state(&self, hash: u64) -> bool {
         self.prefixes.read().contains_key(&hash)
     }
