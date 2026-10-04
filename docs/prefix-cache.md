@@ -154,7 +154,11 @@ host memory for later routing. For a persistent store, implement
 after native routing selects an expert that misses the GPU cache. Return
 `Ok(None)` for a checkpoint fallback. A corrupt or incompatible returned blob
 fails the request. This interface lets an application such as shifou read its
-own files without an xinfer dependency on its storage library.
+own files without an xinfer dependency on its storage library. The callback
+runs outside the GPU expert cache lock; the store must support concurrent
+calls for different experts. Simultaneous requests for the same expert share
+one fetch and GPU load. A store can use a memory cache or mapped files to
+avoid the per-expert small-file read cost.
 
 Restored experts use the same GPU admission plan, evictions, and byte limit as
 checkpoint-loaded experts. The snapshots themselves consume application host

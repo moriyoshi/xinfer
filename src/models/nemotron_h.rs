@@ -465,7 +465,7 @@ impl NemotronMoe {
             let selected = match &self.experts {
                 ExpertStore::Eager(_) => None,
                 ExpertStore::Lazy { layer, cache, .. } => {
-                    Some(cache.lock().resolve(*layer, index)?)
+                    Some(ExpertCache::resolve_shared(cache, *layer, index)?)
                 }
             };
             let expert: &NemotronMlp = match &self.experts {
