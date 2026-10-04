@@ -9,7 +9,6 @@ use crate::models::layers::state_bytes;
 use bincode::Options;
 use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 const MAGIC: &[u8; 8] = b"XNMH\0\0\0\x01";
@@ -176,7 +175,7 @@ impl NemotronMambaSnapshot {
                 expected
             )
         }
-        if Sha256::digest(&self.payload).as_slice() != self.payload_sha256 {
+        if state_bytes::sha256(&self.payload) != self.payload_sha256 {
             candle_core::bail!("Nemotron-H state payload SHA-256 mismatch")
         }
         Ok(())
@@ -263,7 +262,7 @@ pub(super) fn capture(
         prefix_tokens,
         model_fingerprint,
         layout,
-        payload_sha256: Sha256::digest(&payload).into(),
+        payload_sha256: state_bytes::sha256(&payload),
         payload,
     };
     Ok(snapshot)

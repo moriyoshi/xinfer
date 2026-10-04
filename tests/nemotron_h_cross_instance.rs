@@ -223,6 +223,20 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
         snapshot.payload.len() == 145_539_072,
         "wrong Mamba payload size"
     );
+    let hash_start = Instant::now();
+    let computed_hash = Sha256::digest(&snapshot.payload);
+    let hash_s = hash_start.elapsed().as_secs_f64();
+    ensure!(
+        computed_hash.as_slice() == snapshot.payload_sha256,
+        "payload checksum changed"
+    );
+    let ring_start = Instant::now();
+    let ring_hash = ring::digest::digest(&ring::digest::SHA256, &snapshot.payload);
+    let ring_s = ring_start.elapsed().as_secs_f64();
+    ensure!(
+        ring_hash.as_ref() == snapshot.payload_sha256,
+        "ring SHA-256 mismatch"
+    );
     let encode_start = Instant::now();
     let encoded = snapshot.to_bytes()?;
     let encode_s = encode_start.elapsed().as_secs_f64();
@@ -289,7 +303,7 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     }
     target.device.synchronize()?;
     eprintln!(
-        "Nemotron-H snapshot export_s={export_s:.6} encode_s={encode_s:.6} decode_s={decode_s:.6} export_bytes_s={export_bytes_s:.6} import_bytes_s={import_s:.6}"
+        "Nemotron-H snapshot hash_s={hash_s:.6} ring_hash_s={ring_s:.6} export_s={export_s:.6} encode_s={encode_s:.6} decode_s={decode_s:.6} export_bytes_s={export_bytes_s:.6} import_bytes_s={import_s:.6}"
     );
     eprintln!("Nemotron-H cross-instance continuation max_abs_logit_diff={max_abs}");
     ensure!(

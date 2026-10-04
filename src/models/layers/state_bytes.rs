@@ -8,6 +8,13 @@ use serde::de::{self, Deserializer, Visitor};
 use serde::Serializer;
 use std::fmt;
 
+pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut result = [0u8; 32];
+    result.copy_from_slice(digest.as_ref());
+    result
+}
+
 pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_bytes(bytes)
 }
@@ -82,5 +89,15 @@ mod tests {
         let values = f32_from_le_bytes(&bytes).unwrap();
         assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
         assert!(f32_from_le_bytes(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn accelerated_sha256_matches_existing_digest() {
+        use sha2::Digest;
+        let bytes = (0..8193).map(|v| (v % 251) as u8).collect::<Vec<_>>();
+        assert_eq!(
+            sha256(&bytes).as_slice(),
+            sha2::Sha256::digest(&bytes).as_slice()
+        );
     }
 }

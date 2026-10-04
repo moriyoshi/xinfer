@@ -10,7 +10,6 @@ use attention_rs::mamba_cache::MambaCache;
 use bincode::Options;
 use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 8] = b"XGDN\0\0\0\x01";
 pub const GDN_STATE_VERSION: u32 = 1;
@@ -192,7 +191,7 @@ impl GdnStateSnapshot {
                 expected
             )
         }
-        if Sha256::digest(&self.payload).as_slice() != self.payload_sha256 {
+        if state_bytes::sha256(&self.payload) != self.payload_sha256 {
             candle_core::bail!("GDN state payload SHA-256 mismatch")
         }
         Ok(())
@@ -244,7 +243,7 @@ pub fn export_gdn_state(
         prefix_tokens,
         model_fingerprint,
         layout: layout.clone(),
-        payload_sha256: Sha256::digest(&payload).into(),
+        payload_sha256: state_bytes::sha256(&payload),
         payload,
     };
     Ok(snapshot)
