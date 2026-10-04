@@ -130,6 +130,12 @@ pub struct NemotronMambaSnapshot {
 impl NemotronMambaSnapshot {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate_payload()?;
+        self.to_bytes_after_capture()
+    }
+
+    /// Only call on a snapshot constructed by `capture`, before exposing its
+    /// public, mutable fields to a caller.
+    pub(super) fn to_bytes_after_capture(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::with_capacity(
             MAGIC.len() + self.payload.len() + self.layout.model_layer_indices.len() * 4 + 256,
         );
@@ -184,6 +190,18 @@ impl NemotronMambaSnapshot {
         device: &Device,
     ) -> Result<Vec<Option<MambaState>>> {
         self.validate_payload()?;
+        self.restore_validated(expected_layout, prefix_tokens, model_fingerprint, device)
+    }
+
+    /// `from_bytes` already checked the payload; this snapshot must remain
+    /// private to the bytes-first import call until installation completes.
+    pub(super) fn restore_validated(
+        &self,
+        expected_layout: &NemotronMambaStateLayout,
+        prefix_tokens: u64,
+        model_fingerprint: [u8; 32],
+        device: &Device,
+    ) -> Result<Vec<Option<MambaState>>> {
         if &self.layout != expected_layout {
             candle_core::bail!("Nemotron-H state layout does not match target model")
         }

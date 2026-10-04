@@ -774,6 +774,18 @@ impl NemotronHForCausalLM {
         state::capture(&sequence, layout, prefix_tokens, model_fingerprint)
     }
 
+    /// Export the same v1 snapshot envelope directly to bytes. This avoids a
+    /// second checksum pass over a snapshot just constructed by this model.
+    pub fn export_mamba_state_bytes(
+        &self,
+        seq_id: usize,
+        prefix_tokens: u64,
+        model_fingerprint: [u8; 32],
+    ) -> Result<Vec<u8>> {
+        self.export_mamba_state(seq_id, prefix_tokens, model_fingerprint)?
+            .to_bytes_after_capture()
+    }
+
     /// Import into an unused sequence ID. Restore attention KV from the same
     /// boundary before decoding. An existing ID is never overwritten.
     pub fn import_mamba_state(
@@ -788,6 +800,34 @@ impl NemotronHForCausalLM {
         }
         let layout = state::layout_from_layers(&self.layers)?;
         let restored = snapshot.restore(
+            &layout,
+            expected_prefix_tokens,
+            expected_model_fingerprint,
+            &self.device,
+        )?;
+        state::install(
+            &mut self.states.write(),
+            seq_id,
+            restored,
+            self.state_capacity.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Parse, validate, and import a v1 snapshot without rehashing the bytes
+    /// after parsing. The validated snapshot stays private throughout import.
+    pub fn import_mamba_state_bytes(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        if self.states.read().contains_key(&seq_id) {
+            candle_core::bail!("Nemotron-H sequence {seq_id} already has Mamba state")
+        }
+        let snapshot = NemotronMambaSnapshot::from_bytes(bytes)?;
+        let layout = state::layout_from_layers(&self.layers)?;
+        let restored = snapshot.restore_validated(
             &layout,
             expected_prefix_tokens,
             expected_model_fingerprint,

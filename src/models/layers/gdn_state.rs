@@ -127,6 +127,12 @@ pub struct GdnStateSnapshot {
 impl GdnStateSnapshot {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate_payload()?;
+        self.to_bytes_after_export()
+    }
+
+    // Safe only for the locally constructed snapshot before its public fields
+    // can be mutated by a caller.
+    fn to_bytes_after_export(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::with_capacity(
             MAGIC.len() + self.payload.len() + self.layout.model_layer_indices.len() * 4 + 256,
         );
@@ -244,6 +250,19 @@ pub fn export_gdn_state(
     Ok(snapshot)
 }
 
+/// Export the existing v1 envelope directly, without rehashing a snapshot
+/// just constructed from the cache.
+pub fn export_gdn_state_bytes(
+    cache: &MambaCache,
+    layout: &GdnStateLayout,
+    seq_id: usize,
+    prefix_tokens: u64,
+    model_fingerprint: [u8; 32],
+) -> Result<Vec<u8>> {
+    export_gdn_state(cache, layout, seq_id, prefix_tokens, model_fingerprint)?
+        .to_bytes_after_export()
+}
+
 pub fn import_gdn_state(
     cache: &mut MambaCache,
     layout: &GdnStateLayout,
@@ -252,8 +271,50 @@ pub fn import_gdn_state(
     expected_model_fingerprint: [u8; 32],
     snapshot: &GdnStateSnapshot,
 ) -> Result<()> {
-    layout.validate_cache(cache)?;
     snapshot.validate_payload()?;
+    import_gdn_state_validated(
+        cache,
+        layout,
+        seq_id,
+        expected_prefix_tokens,
+        expected_model_fingerprint,
+        snapshot,
+    )
+}
+
+/// Parse and validate a v1 envelope once, then import it while the parsed
+/// snapshot remains private and immutable.
+pub fn import_gdn_state_bytes(
+    cache: &mut MambaCache,
+    layout: &GdnStateLayout,
+    seq_id: usize,
+    expected_prefix_tokens: u64,
+    expected_model_fingerprint: [u8; 32],
+    bytes: &[u8],
+) -> Result<()> {
+    if cache.get_slot(seq_id).is_some() {
+        candle_core::bail!("GDN sequence {seq_id} already has a slot; release it before import")
+    }
+    let snapshot = GdnStateSnapshot::from_bytes(bytes)?;
+    import_gdn_state_validated(
+        cache,
+        layout,
+        seq_id,
+        expected_prefix_tokens,
+        expected_model_fingerprint,
+        &snapshot,
+    )
+}
+
+fn import_gdn_state_validated(
+    cache: &mut MambaCache,
+    layout: &GdnStateLayout,
+    seq_id: usize,
+    expected_prefix_tokens: u64,
+    expected_model_fingerprint: [u8; 32],
+    snapshot: &GdnStateSnapshot,
+) -> Result<()> {
+    layout.validate_cache(cache)?;
     if &snapshot.layout != layout {
         candle_core::bail!("GDN state layer order, shape, dtype, or TP layout mismatch")
     }
@@ -385,6 +446,35 @@ mod tests {
             GdnStateSnapshot::from_bytes(&bytes).unwrap().payload,
             snapshot.payload
         );
+    }
+
+    #[test]
+    fn bytes_first_roundtrip_and_rejections() {
+        let source = filled_cache();
+        let source_layout = layout(&source);
+        let wire = export_gdn_state_bytes(&source, &source_layout, 7, 41, [3; 32]).unwrap();
+        let ordinary = export_gdn_state(&source, &source_layout, 7, 41, [3; 32]).unwrap();
+        assert_eq!(wire, ordinary.to_bytes().unwrap());
+        let mut target = cache();
+        let target_layout = layout(&target);
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 42, [3; 32], &wire).is_err()
+        );
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [4; 32], &wire).is_err()
+        );
+        let mut corrupt = wire.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [3; 32], &corrupt).is_err()
+        );
+        assert_eq!(target.get_slot(99), None);
+        import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [3; 32], &wire).unwrap();
+        assert!(
+            import_gdn_state_bytes(&mut target, &target_layout, 99, 41, [3; 32], &wire).is_err()
+        );
+        let actual = export_gdn_state(&target, &target_layout, 99, 41, [3; 32]).unwrap();
+        assert_eq!(actual.payload, ordinary.payload);
     }
 
     #[test]

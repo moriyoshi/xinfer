@@ -89,6 +89,11 @@ let snapshot = GdnStateSnapshot::from_bytes(&bytes)?;
 decode_model.import_gdn_state(new_seq_id, prefix_tokens, fingerprint, &snapshot)?;
 ```
 
+When the caller stores or transports the complete envelope, use
+`export_gdn_state_bytes` and `import_gdn_state_bytes` on the dense or MoE model.
+They preserve the v1 bytes and check the payload once on each side. The
+snapshot-object methods continue to validate their public mutable fields.
+
 The caller supplies the same 32-byte SHA-256 model fingerprint on both sides.
 It must identify weights, adapters, and numerical execution settings; xinfer
 does not derive it from loaded weights. The caller must also restore attention
@@ -112,6 +117,11 @@ let bytes = snapshot.to_bytes()?;
 let snapshot = NemotronMambaSnapshot::from_bytes(&bytes)?;
 decode_model.import_mamba_state(new_seq_id, prefix_tokens, fingerprint, &snapshot)?;
 ```
+
+For a persisted envelope, `export_mamba_state_bytes` and
+`import_mamba_state_bytes` avoid repeated payload checksum passes while keeping
+the same v1 format. The bytes-first import keeps its validated snapshot private
+until state installation; the snapshot-object API still validates on import.
 
 The 32-byte fingerprint must identify compatible weights, adapters, and
 numerical execution settings. xinfer cannot derive it from loaded weights.

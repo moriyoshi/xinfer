@@ -226,6 +226,16 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     let encode_start = Instant::now();
     let encoded = snapshot.to_bytes()?;
     let encode_s = encode_start.elapsed().as_secs_f64();
+    let export_bytes_start = Instant::now();
+    let direct = source
+        .inner
+        .export_mamba_state_bytes(0, prefix_len as u64, fingerprint)?;
+    source.device.synchronize()?;
+    let export_bytes_s = export_bytes_start.elapsed().as_secs_f64();
+    ensure!(
+        direct == encoded,
+        "bytes-first export changed the v1 envelope"
+    );
     let attention = source_cache
         .iter()
         .map(|(key, value)| Ok((export_attention(key)?, export_attention(value)?)))
@@ -236,6 +246,10 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     let decode_start = Instant::now();
     let restored = NemotronMambaSnapshot::from_bytes(&encoded)?;
     let decode_s = decode_start.elapsed().as_secs_f64();
+    ensure!(
+        restored.payload == snapshot.payload,
+        "parsed payload changed"
+    );
     let target_cache = attention
         .iter()
         .map(|(key, value)| {
@@ -248,13 +262,13 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     let import_start = Instant::now();
     target
         .inner
-        .import_mamba_state(0, prefix_len as u64, fingerprint, &restored)?;
+        .import_mamba_state_bytes(0, prefix_len as u64, fingerprint, &encoded)?;
     target.device.synchronize()?;
     let import_s = import_start.elapsed().as_secs_f64();
     ensure!(
         target
             .inner
-            .import_mamba_state(0, prefix_len as u64, fingerprint, &restored)
+            .import_mamba_state_bytes(0, prefix_len as u64, fingerprint, &encoded)
             .is_err(),
         "duplicate import was accepted"
     );
@@ -275,7 +289,7 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     }
     target.device.synchronize()?;
     eprintln!(
-        "Nemotron-H snapshot export_s={export_s:.6} encode_s={encode_s:.6} decode_s={decode_s:.6} import_s={import_s:.6}"
+        "Nemotron-H snapshot export_s={export_s:.6} encode_s={encode_s:.6} decode_s={decode_s:.6} export_bytes_s={export_bytes_s:.6} import_bytes_s={import_s:.6}"
     );
     eprintln!("Nemotron-H cross-instance continuation max_abs_logit_diff={max_abs}");
     ensure!(
