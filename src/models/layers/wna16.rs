@@ -21,6 +21,21 @@ pub struct WNA16 {
     is_awq: bool,
 }
 
+fn validate_packing_config(cfg: &QuantConfig) -> Result<()> {
+    if cfg.bits == 0 || cfg.bits > 32 || 32 % cfg.bits != 0 {
+        candle_core::bail!(
+            "WNA16 requires a valid packed weight bit width, got {}; normalize quantization_config before model construction",
+            cfg.bits
+        );
+    }
+    if cfg.group_size == 0 {
+        candle_core::bail!(
+            "WNA16 requires a nonzero group_size; normalize quantization_config before model construction"
+        );
+    }
+    Ok(())
+}
+
 impl WNA16 {
     pub fn new(
         in_dim: usize,
@@ -40,6 +55,7 @@ impl WNA16 {
         };
 
         let ln = if let Some(cfg) = quant_config {
+            validate_packing_config(cfg)?;
             let mut marlin_compatible = if (cfg.quant_method != "gptq" && cfg.quant_method != "awq")
                 || (cfg.bits != 4 && cfg.bits != 8)
             {
@@ -305,5 +321,31 @@ impl WNA16 {
                 candle_core::bail!("Invalid arguments for gptq/awq matmul")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_packing_returns_error_before_dividing() {
+        let root: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/qwen3_0_6b_nvfp4_config.json"
+        ))
+        .unwrap();
+        let mut config: QuantConfig =
+            serde_json::from_value(root["quantization_config"].clone()).unwrap();
+        assert!(validate_packing_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("bit width"));
+        config.bits = 4;
+        assert!(validate_packing_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("group_size"));
+        config.group_size = 16;
+        validate_packing_config(&config).unwrap();
     }
 }
