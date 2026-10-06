@@ -134,6 +134,24 @@ pub(super) fn encode(
     Ok(output)
 }
 
+pub(super) fn encode_bytes(
+    requests: &[DensePackedKvEncode<'_>],
+    tokens: usize,
+    bits: u8,
+) -> Result<Vec<Vec<Vec<u8>>>> {
+    let pages = encode(requests, tokens, bits)?;
+    page_pool()?.install(|| {
+        pages
+            .into_par_iter()
+            .map(|tile| {
+                tile.into_iter()
+                    .map(DensePackedKvPage::into_fresh_bytes)
+                    .collect()
+            })
+            .collect()
+    })
+}
+
 fn encode_chunk(
     requests: &[DensePackedKvEncode<'_>],
     tokens: usize,
