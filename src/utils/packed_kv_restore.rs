@@ -284,6 +284,132 @@ impl DensePackedKvPage {
     }
 }
 
+/// Encode token-major BF16 little-endian K or V bytes into individually
+/// addressable 16-token dense pages. The most recent `exact_tail_tokens` stay
+/// exact, including a partial final page. No peer or persistence type is used.
+pub fn encode_dense_packed_kv_tile(
+    bf16_le: &[u8],
+    tokens: usize,
+    heads: usize,
+    channels: usize,
+    axis: PackedKvAxis,
+    bits: u8,
+    exact_tail_tokens: usize,
+) -> Result<Vec<DensePackedKvPage>> {
+    const BLOCK: usize = 16;
+    if !matches!(bits, 2 | 4) || tokens == 0 || heads == 0 || channels == 0 {
+        candle_core::bail!("invalid dense packed KV tile geometry")
+    }
+    let width = heads
+        .checked_mul(channels)
+        .ok_or_else(|| candle_core::Error::Msg("KV width overflow".into()))?;
+    let bytes = tokens
+        .checked_mul(width)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| candle_core::Error::Msg("KV byte length overflow".into()))?;
+    if bf16_le.len() != bytes {
+        candle_core::bail!("BF16 KV tile byte length mismatch")
+    }
+    let exact_from = tokens.saturating_sub(exact_tail_tokens);
+    let mut pages = Vec::with_capacity(tokens.div_ceil(BLOCK));
+    for block in 0..tokens.div_ceil(BLOCK) {
+        let first = block * BLOCK;
+        let count = (tokens - first).min(BLOCK);
+        let tail_tokens = (first + count).saturating_sub(exact_from.max(first));
+        let old = count - tail_tokens;
+        let page_bytes = &bf16_le[first * width * 2..(first + count) * width * 2];
+        let word = |token: usize, head: usize, channel: usize| {
+            let offset = (token * width + head * channels + channel) * 2;
+            u16::from_le_bytes([page_bytes[offset], page_bytes[offset + 1]])
+        };
+        if !page_bytes.chunks_exact(2).all(|pair| {
+            half::bf16::from_bits(u16::from_le_bytes([pair[0], pair[1]]))
+                .to_f32()
+                .is_finite()
+        }) {
+            candle_core::bail!("non-finite BF16 KV value")
+        }
+        let code_len = old
+            .checked_mul(width)
+            .and_then(|n| n.checked_mul(bits as usize))
+            .ok_or_else(|| candle_core::Error::Msg("KV code size overflow".into()))?
+            .div_ceil(8);
+        let mut codes = vec![0u8; code_len];
+        let mut params = Vec::new();
+        let mut tail = Vec::with_capacity(tail_tokens * width);
+        let mut rank = 0usize;
+        let mut encode_group = |values: &[f32]| {
+            let minimum = values.iter().copied().fold(f32::INFINITY, f32::min);
+            let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let step = ((maximum as f64 - minimum as f64) / ((1u32 << bits) - 1) as f64) as f32;
+            params.extend_from_slice(&[minimum, step]);
+            for &value in values {
+                let code = if step == 0.0 {
+                    0
+                } else {
+                    (((value as f64 - minimum as f64) / step as f64).round() as i64)
+                        .clamp(0, ((1u32 << bits) - 1) as i64) as u8
+                };
+                let bit = rank * bits as usize;
+                codes[bit / 8] |= code << (bit % 8);
+                rank += 1;
+            }
+        };
+        match axis {
+            PackedKvAxis::Key => {
+                for head in 0..heads {
+                    for channel in 0..channels {
+                        if old > 0 {
+                            let mut values = [0f32; BLOCK];
+                            for (token, value) in values.iter_mut().enumerate().take(old) {
+                                *value = half::bf16::from_bits(word(token, head, channel)).to_f32();
+                            }
+                            encode_group(&values[..old]);
+                        }
+                        for token in old..count {
+                            tail.push(word(token, head, channel));
+                        }
+                    }
+                }
+            }
+            PackedKvAxis::Value => {
+                let mut values = vec![0f32; channels];
+                for token in 0..count {
+                    for head in 0..heads {
+                        if token < old {
+                            for (channel, value) in values.iter_mut().enumerate() {
+                                *value = half::bf16::from_bits(word(token, head, channel)).to_f32();
+                            }
+                            encode_group(&values);
+                        } else {
+                            for channel in 0..channels {
+                                tail.push(word(token, head, channel));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        pages.push(DensePackedKvPage::new(
+            axis,
+            bits,
+            count as u32,
+            heads as u32,
+            channels as u32,
+            match axis {
+                PackedKvAxis::Key => BLOCK as u32,
+                PackedKvAxis::Value => channels as u32,
+            },
+            tail_tokens as u32,
+            codes,
+            params,
+            tail,
+            Vec::new(),
+        )?);
+    }
+    Ok(pages)
+}
+
 pub struct DensePackedKvRestore<'a> {
     pub layer: usize,
     pub block: usize,
@@ -394,6 +520,55 @@ mod cuda;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_encoder_preserves_tail_and_rejects_bad_input() -> Result<()> {
+        let words: Vec<u16> = (0..18 * 2 * 3)
+            .map(|n| half::bf16::from_f32((n % 13) as f32 / 4.0).to_bits())
+            .collect();
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        for axis in [PackedKvAxis::Key, PackedKvAxis::Value] {
+            for bits in [2, 4] {
+                let pages = encode_dense_packed_kv_tile(&bytes, 18, 2, 3, axis, bits, 18)?;
+                assert_eq!(pages.len(), 2);
+                assert_eq!(pages[0].tokens, 16);
+                assert_eq!(pages[1].tokens, 2);
+                assert_eq!(
+                    pages
+                        .iter()
+                        .flat_map(|page| page.decode_cpu_bf16().unwrap())
+                        .collect::<Vec<_>>(),
+                    words
+                );
+                let pages = encode_dense_packed_kv_tile(&bytes, 18, 2, 3, axis, bits, 17)?;
+                assert_eq!(pages[0].tail_tokens, 15);
+                assert_eq!(pages[1].tail_tokens, 2);
+                assert_eq!(pages[1].decode_cpu_bf16()?, words[16 * 2 * 3..]);
+                for page in pages {
+                    assert_eq!(
+                        DensePackedKvPage::from_bytes(&page.to_bytes()?)?.sha256,
+                        page.sha256
+                    );
+                }
+            }
+        }
+        assert!(encode_dense_packed_kv_tile(
+            &bytes[..bytes.len() - 1],
+            18,
+            2,
+            3,
+            PackedKvAxis::Key,
+            2,
+            0
+        )
+        .is_err());
+        let mut nonfinite = bytes;
+        nonfinite[..2].copy_from_slice(&0x7f80u16.to_le_bytes());
+        assert!(
+            encode_dense_packed_kv_tile(&nonfinite, 18, 2, 3, PackedKvAxis::Value, 4, 0).is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn envelope_rejects_corruption_shape_and_duplicate_exceptions() -> Result<()> {

@@ -3,9 +3,68 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use xinfer::utils::packed_kv_restore::{
-    restore_dense_packed_kv_pages, DensePackedKvPage, DensePackedKvRestore, PackedKvAxis,
-    PackedKvException,
+    encode_dense_packed_kv_tile, restore_dense_packed_kv_pages, DensePackedKvPage,
+    DensePackedKvRestore, PackedKvAxis, PackedKvException,
 };
+
+#[cfg(feature = "cuda")]
+#[test]
+fn direct_encoder_pages_restore_into_gpu_slots() -> Result<()> {
+    let Ok(device) = Device::new_cuda(0) else {
+        return Ok(());
+    };
+    let words: Vec<u16> = (0..18 * 2 * 3)
+        .map(|n| half::bf16::from_f32((n % 11) as f32 / 3.0).to_bits())
+        .collect();
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let keys = encode_dense_packed_kv_tile(&bytes, 18, 2, 3, PackedKvAxis::Key, 2, 17)?;
+    let values = encode_dense_packed_kv_tile(&bytes, 18, 2, 3, PackedKvAxis::Value, 4, 17)?;
+    let cache = GpuKvCache::Flash(vec![(
+        Tensor::zeros((2, 16, 2, 3), DType::BF16, &device)?,
+        Tensor::zeros((2, 16, 2, 3), DType::BF16, &device)?,
+    )]);
+    let requests: Vec<_> = keys
+        .iter()
+        .enumerate()
+        .map(|(block, page)| DensePackedKvRestore {
+            layer: 0,
+            block,
+            token_offset: 0,
+            page,
+        })
+        .chain(
+            values
+                .iter()
+                .enumerate()
+                .map(|(block, page)| DensePackedKvRestore {
+                    layer: 0,
+                    block,
+                    token_offset: 0,
+                    page,
+                }),
+        )
+        .collect();
+    assert_eq!(restore_dense_packed_kv_pages(&cache, &requests)?.pages, 4);
+    let pairs = cache.as_pairs().unwrap();
+    for (tile, pages) in [(&pairs[0].0, &keys), (&pairs[0].1, &values)] {
+        let actual: Vec<u16> = tile
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .iter()
+            .map(|word| word.to_bits())
+            .collect();
+        let first = pages[0].decode_cpu_bf16()?;
+        let second = pages[1].decode_cpu_bf16()?;
+        assert_eq!(&actual[..first.len()], first.as_slice());
+        assert_eq!(
+            &actual[16 * 2 * 3..16 * 2 * 3 + second.len()],
+            second.as_slice()
+        );
+        assert!(actual[18 * 2 * 3..].iter().all(|word| *word == 0));
+    }
+    Ok(())
+}
 use xinfer::utils::GpuKvCache;
 
 fn fixture(axis: PackedKvAxis, bits: u8) -> Result<(DensePackedKvPage, Vec<u16>)> {
