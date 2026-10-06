@@ -2,18 +2,37 @@
 //! Tiles are returned in layer K, V order. The caller owns model identity and
 //! persistence metadata; this module never depends on a peer or snapshot type.
 
+use std::sync::OnceLock;
+
 use candle_core::{DType, Result, Storage, Tensor};
 use half::bf16;
+use rayon::prelude::*;
 
 const HOST_BATCH_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BATCH_TILES: usize = 8;
+static CONVERSION_POOL: OnceLock<std::result::Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+fn conversion_pool() -> Result<&'static rayon::ThreadPool> {
+    CONVERSION_POOL
+        .get_or_init(|| {
+            let workers = std::thread::available_parallelism()
+                .map_or(1, |available| available.get().min(MAX_BATCH_TILES));
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .thread_name(|index| format!("bf16-kv-export-{index}"))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| candle_core::Error::Msg(format!("BF16 KV export workers: {error}")))
+}
 
 fn geometry(cache: &[(Tensor, Tensor)], tokens: usize) -> Result<(usize, usize, usize)> {
     if cache.is_empty() || tokens == 0 {
         candle_core::bail!("empty BF16 KV cache or prefix")
     }
     let shape = cache[0].0.dims();
-    if shape.len() != 4 || shape.iter().any(|&x| x == 0) {
+    if shape.len() != 4 || shape.contains(&0) {
         candle_core::bail!("expected nonempty rank-four Flash KV tiles")
     }
     let slots = shape[0]
@@ -87,18 +106,18 @@ pub fn export_bf16_kv_prefix_tilewise(
 
 /// Export Flash BF16 tiles using a bounded CUDA readback buffer. At most 32 MiB
 /// and eight tiles are staged at once. Oversized single tiles use the tilewise
-/// path, which remains the byte-parity oracle. Returned bytes are caller-owned.
+/// path, which remains the byte-parity oracle. Host byte conversion uses one
+/// process-wide pool with at most eight workers. Returned bytes are caller-owned.
 pub fn export_bf16_kv_prefix(cache: &[(Tensor, Tensor)], tokens: usize) -> Result<Vec<Vec<u8>>> {
     let (slots, words_per_tile, bytes_per_tile) = geometry(cache, tokens)?;
     if !cache[0].0.device().is_cuda() || bytes_per_tile > HOST_BATCH_BYTES {
         return export_bf16_kv_prefix_tilewise(cache, tokens);
     }
-    let batch_tiles = (HOST_BATCH_BYTES / bytes_per_tile)
-        .min(MAX_BATCH_TILES)
-        .max(1);
+    let batch_tiles = (HOST_BATCH_BYTES / bytes_per_tile).clamp(1, MAX_BATCH_TILES);
     let tiles: Vec<_> = cache.iter().flat_map(|(key, value)| [key, value]).collect();
     let mut staging = vec![bf16::from_bits(0); batch_tiles * words_per_tile];
     let mut output = Vec::with_capacity(tiles.len());
+    let pool = conversion_pool()?;
     for batch in tiles.chunks(batch_tiles) {
         for (index, tile) in batch.iter().enumerate() {
             let prefix = tile
@@ -126,11 +145,12 @@ pub fn export_bf16_kv_prefix(cache: &[(Tensor, Tensor)], tokens: usize) -> Resul
                     candle_core::Error::Msg(format!("BF16 KV CUDA readback: {error}"))
                 })?;
         }
-        output.extend(
+        output.extend(pool.install(|| {
             staging[..batch.len() * words_per_tile]
-                .chunks_exact(words_per_tile)
-                .map(little_endian_bytes),
-        );
+                .par_chunks_exact(words_per_tile)
+                .map(little_endian_bytes)
+                .collect::<Vec<_>>()
+        }));
     }
     Ok(output)
 }
