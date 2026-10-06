@@ -18,6 +18,7 @@ pub mod kvcache_allocator;
 pub use kv_backend::{CpuKvCache, GpuKvCache, KvCacheBackend};
 pub mod logits_processor;
 pub mod multi_node;
+pub mod packed_kv_restore;
 pub mod progress;
 pub mod special_tokens;
 use crate::core::GenerationOutput;
