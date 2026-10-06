@@ -410,6 +410,20 @@ pub fn encode_dense_packed_kv_tile(
     Ok(pages)
 }
 
+/// Encode a live CUDA Flash KV tile without reading its quantized BF16 prefix
+/// back to the host. The returned pages use the same versioned wire format as
+/// [`encode_dense_packed_kv_tile`]. The exact tail is read back separately.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tile_gpu(
+    tile: &candle_core::Tensor,
+    tokens: usize,
+    axis: PackedKvAxis,
+    bits: u8,
+    exact_tail_tokens: usize,
+) -> Result<Vec<DensePackedKvPage>> {
+    encode::encode(tile, tokens, axis, bits, exact_tail_tokens)
+}
+
 pub struct DensePackedKvRestore<'a> {
     pub layer: usize,
     pub block: usize,
@@ -517,6 +531,9 @@ pub fn restore_dense_packed_kv_pages(
 #[cfg(feature = "cuda")]
 mod cuda;
 
+#[cfg(feature = "cuda")]
+mod encode;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +584,47 @@ mod tests {
         assert!(
             encode_dense_packed_kv_tile(&nonfinite, 18, 2, 3, PackedKvAxis::Value, 4, 0).is_err()
         );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_encoder_matches_cpu_page_bytes() -> Result<()> {
+        use candle_core::{Device, Tensor};
+
+        let device = Device::new_cuda(0)?;
+        let heads = 3;
+        let channels = 13;
+        let tokens = 37;
+        let words: Vec<half::bf16> = (0..3 * 16 * heads * channels)
+            .map(|n| {
+                let value = ((n * 37 % 503) as f32 - 251.0) / 29.0;
+                half::bf16::from_f32(value)
+            })
+            .collect();
+        let tile = Tensor::from_vec(words.clone(), (3, 16, heads, channels), &device)?;
+        let bytes: Vec<u8> = words[..tokens * heads * channels]
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        for axis in [PackedKvAxis::Key, PackedKvAxis::Value] {
+            for bits in [2, 4] {
+                for tail in [0, 1, 5, 16, 19, 37] {
+                    let cpu = encode_dense_packed_kv_tile(
+                        &bytes, tokens, heads, channels, axis, bits, tail,
+                    )?;
+                    let gpu = encode_dense_packed_kv_tile_gpu(&tile, tokens, axis, bits, tail)?;
+                    assert_eq!(cpu.len(), gpu.len());
+                    for (index, (expected, actual)) in cpu.iter().zip(&gpu).enumerate() {
+                        assert_eq!(
+                            expected.to_bytes()?,
+                            actual.to_bytes()?,
+                            "GPU page differs at axis {axis:?}, {bits} bits, tail {tail}, page {index}"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
