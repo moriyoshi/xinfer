@@ -134,7 +134,8 @@ extern "C" __global__ void dense_kv_params_batch(
 extern "C" __global__ void dense_kv_codes_batch(
     const GpuEncodeTile* tiles, const float* params, uint8_t* codes,
     uint32_t tokens, uint32_t heads, uint32_t channels,
-    uint32_t bits, uint32_t pages, uint32_t code_stride) {
+    uint32_t bits, uint32_t pages, uint32_t code_stride,
+    uint32_t fast_round) {
   const uint32_t tile = blockIdx.z;
   const GpuEncodeTile desc = tiles[tile];
   const uint16_t* input = reinterpret_cast<const uint16_t*>(desc.source);
@@ -163,8 +164,21 @@ extern "C" __global__ void dense_kv_codes_batch(
     const float minimum = params[param];
     const float step = params[param + 1];
     const float value = __uint_as_float((uint32_t)input[source] << 16);
-    const int code = step == 0.0f ? 0 :
-        (int)round(((double)value - (double)minimum) / (double)step);
+    int code = 0;
+    if (step != 0.0f) {
+      if (fast_round) {
+        // Experimental: recompute near rounding thresholds in f64.
+        const float ratio = (value - minimum) / step;
+        const float half = floorf(ratio) + 0.5f;
+        if (isfinite(ratio) && fabsf(ratio - half) > 0.03125f) {
+          code = (int)roundf(ratio);
+        } else {
+          code = (int)round(((double)value - (double)minimum) / (double)step);
+        }
+      } else {
+        code = (int)round(((double)value - (double)minimum) / (double)step);
+      }
+    }
     packed |= (uint8_t)(max(0, min(code, (int)((1u << bits) - 1u)))
                         << (lane * bits));
   }

@@ -6,7 +6,7 @@ use candle_core::{DType, Result, Storage};
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex, OnceLock};
 
-const MODULE: &str = "xinfer_dense_packed_kv_encode_batch_v1";
+const MODULE: &str = "xinfer_dense_packed_kv_encode_batch_v2";
 const PARAM_KERNEL: &str = "dense_kv_params_batch";
 const CODE_KERNEL: &str = "dense_kv_codes_batch";
 const TAIL_KERNEL: &str = "dense_kv_tail_batch";
@@ -324,6 +324,7 @@ fn encode_chunk(
                 bits as u32,
                 as_u32(pages)?,
                 as_u32(code_stride)?,
+                u32::from(std::env::var("XINFER_GPU_PACK_FAST_ROUND").as_deref() == Ok("1")),
             ),
         )
     }
