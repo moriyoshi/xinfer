@@ -14,6 +14,7 @@ pub mod guided_decoding;
 pub mod heartbeat;
 pub mod image;
 pub mod kv_backend;
+pub mod kv_prefix_export;
 pub mod kvcache_allocator;
 pub use kv_backend::{CpuKvCache, GpuKvCache, KvCacheBackend};
 pub mod logits_processor;
