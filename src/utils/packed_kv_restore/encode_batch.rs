@@ -87,6 +87,16 @@ pub(super) fn encode(
     tokens: usize,
     bits: u8,
 ) -> Result<Vec<Vec<DensePackedKvPage>>> {
+    let fast_round = std::env::var("XINFER_GPU_PACK_FAST_ROUND").as_deref() == Ok("1");
+    encode_with_rounding(requests, tokens, bits, fast_round)
+}
+
+pub(super) fn encode_with_rounding(
+    requests: &[DensePackedKvEncode<'_>],
+    tokens: usize,
+    bits: u8,
+    fast_round: bool,
+) -> Result<Vec<Vec<DensePackedKvPage>>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
@@ -129,7 +139,13 @@ pub(super) fn encode(
     let mut scratch = ScratchLease::acquire();
     let mut output = Vec::with_capacity(requests.len());
     for batch in requests.chunks(batch_tiles) {
-        output.extend(encode_chunk(batch, tokens, bits, &mut scratch.0)?);
+        output.extend(encode_chunk(
+            batch,
+            tokens,
+            bits,
+            fast_round,
+            &mut scratch.0,
+        )?);
     }
     Ok(output)
 }
@@ -138,6 +154,7 @@ fn encode_chunk(
     requests: &[DensePackedKvEncode<'_>],
     tokens: usize,
     bits: u8,
+    fast_round: bool,
     scratch: &mut HostScratch,
 ) -> Result<Vec<Vec<DensePackedKvPage>>> {
     const BLOCK: usize = 16;
@@ -324,7 +341,7 @@ fn encode_chunk(
                 bits as u32,
                 as_u32(pages)?,
                 as_u32(code_stride)?,
-                u32::from(std::env::var("XINFER_GPU_PACK_FAST_ROUND").as_deref() == Ok("1")),
+                u32::from(fast_round),
             ),
         )
     }

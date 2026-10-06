@@ -707,8 +707,100 @@ mod tests {
             axis: PackedKvAxis::Value,
             exact_tail_tokens: 0,
         }];
-        let edge_gpu = encode_dense_packed_kv_tiles_gpu(&edge_request, 16, 2)?;
-        assert_eq!(edge_cpu[0].to_bytes()?, edge_gpu[0][0].to_bytes()?);
+        for edge_gpu in [
+            encode_dense_packed_kv_tiles_gpu(&edge_request, 16, 2)?,
+            encode_batch::encode_with_rounding(&edge_request, 16, 2, true)?,
+        ] {
+            assert_eq!(edge_cpu[0].to_bytes()?, edge_gpu[0][0].to_bytes()?);
+        }
+
+        // Mixed BF16 exponents exercise subtraction, division and clamping.
+        let mut state = 0x1234_5678u32;
+        let diverse_words: Vec<half::bf16> = (0..32 * 16 * 4 * 32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let exponent = 1 + ((state >> 8) % 230) as u16;
+                half::bf16::from_bits(
+                    (((state >> 31) as u16) << 15) | (exponent << 7) | (state as u16 & 127),
+                )
+            })
+            .collect();
+        let diverse_tile = Tensor::from_vec(diverse_words.clone(), (32, 16, 4, 32), &device)?;
+        let diverse_bytes: Vec<u8> = diverse_words
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        let diverse_requests = [
+            DensePackedKvEncode {
+                tile: &diverse_tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 0,
+            },
+            DensePackedKvEncode {
+                tile: &diverse_tile,
+                axis: PackedKvAxis::Value,
+                exact_tail_tokens: 7,
+            },
+            DensePackedKvEncode {
+                tile: &diverse_tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 32,
+            },
+        ];
+        for width in [2, 4] {
+            for gpu in [
+                encode_dense_packed_kv_tiles_gpu(&diverse_requests, 512, width)?,
+                encode_batch::encode_with_rounding(&diverse_requests, 512, width, true)?,
+            ] {
+                for (request, actual) in diverse_requests.iter().zip(gpu) {
+                    let expected = encode_dense_packed_kv_tile(
+                        &diverse_bytes,
+                        512,
+                        4,
+                        32,
+                        request.axis,
+                        width,
+                        request.exact_tail_tokens,
+                    )?;
+                    assert_eq!(
+                        expected
+                            .iter()
+                            .map(DensePackedKvPage::to_bytes)
+                            .collect::<Result<Vec<_>>>()?,
+                        actual
+                            .iter()
+                            .map(DensePackedKvPage::to_bytes)
+                            .collect::<Result<Vec<_>>>()?
+                    );
+                }
+            }
+        }
+        let tiny_words: Vec<half::bf16> = [0x0001u16, 0x0002, 0x0003]
+            .into_iter()
+            .cycle()
+            .take(16 * 3)
+            .map(half::bf16::from_bits)
+            .collect();
+        let tiny_tile = Tensor::from_vec(tiny_words.clone(), (1, 16, 1, 3), &device)?;
+        let tiny_bytes: Vec<u8> = tiny_words
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        let tiny_cpu =
+            encode_dense_packed_kv_tile(&tiny_bytes, 16, 1, 3, PackedKvAxis::Value, 4, 0)?;
+        let tiny_request = [DensePackedKvEncode {
+            tile: &tiny_tile,
+            axis: PackedKvAxis::Value,
+            exact_tail_tokens: 0,
+        }];
+        for tiny_gpu in [
+            encode_dense_packed_kv_tiles_gpu(&tiny_request, 16, 4)?,
+            encode_batch::encode_with_rounding(&tiny_request, 16, 4, true)?,
+        ] {
+            assert_eq!(tiny_cpu[0].to_bytes()?, tiny_gpu[0][0].to_bytes()?);
+        }
         Ok(())
     }
 
