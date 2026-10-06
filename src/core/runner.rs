@@ -934,6 +934,21 @@ impl ModelRunner {
         }
     }
 
+    /// Expand validated dense packed K/V pages into already allocated BF16
+    /// Flash slots. The caller owns block allocation and page-table mapping.
+    pub fn restore_dense_packed_kv_pages(
+        &self,
+        requests: &[crate::utils::packed_kv_restore::DensePackedKvRestore<'_>],
+    ) -> Result<crate::utils::packed_kv_restore::DensePackedKvRestoreStats> {
+        if self.config.kvcache_dtype.is_turboquant() {
+            candle_core::bail!("dense packed KV restore cannot target TurboQuant cache mode")
+        }
+        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages(
+            &self.get_kv_cache(),
+            requests,
+        )
+    }
+
     pub fn get_cpu_kv_cache(&self) -> MutexGuard<'_, CpuKvCache> {
         loop {
             if let Ok(v) = self.cpu_kv_cache.try_lock() {
