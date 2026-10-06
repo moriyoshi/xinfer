@@ -94,12 +94,14 @@ struct GpuEncodeTile {
   unsigned long long source;
   uint32_t exact_from;
   uint32_t key;
+  uint32_t param_offset;
+  uint32_t param_stride;
 };
 
 extern "C" __global__ void dense_kv_params_batch(
     const GpuEncodeTile* tiles, float* params, uint32_t* invalid,
     uint32_t tokens, uint32_t heads, uint32_t channels,
-    uint32_t bits, uint32_t pages, uint32_t param_stride) {
+    uint32_t bits, uint32_t pages) {
   const uint32_t tile = blockIdx.z;
   const GpuEncodeTile desc = tiles[tile];
   const uint16_t* input = reinterpret_cast<const uint16_t*>(desc.source);
@@ -124,7 +126,7 @@ extern "C" __global__ void dense_kv_params_batch(
   }
   const float step = (float)(((double)maximum - (double)minimum)
       / (double)((1u << bits) - 1u));
-  const uint32_t offset = (tile * pages + page) * param_stride + group * 2;
+  const uint32_t offset = desc.param_offset + page * desc.param_stride + group * 2;
   params[offset] = minimum;
   params[offset + 1] = step;
 }
@@ -132,8 +134,7 @@ extern "C" __global__ void dense_kv_params_batch(
 extern "C" __global__ void dense_kv_codes_batch(
     const GpuEncodeTile* tiles, const float* params, uint8_t* codes,
     uint32_t tokens, uint32_t heads, uint32_t channels,
-    uint32_t bits, uint32_t pages, uint32_t param_stride,
-    uint32_t code_stride) {
+    uint32_t bits, uint32_t pages, uint32_t code_stride) {
   const uint32_t tile = blockIdx.z;
   const GpuEncodeTile desc = tiles[tile];
   const uint16_t* input = reinterpret_cast<const uint16_t*>(desc.source);
@@ -158,7 +159,7 @@ extern "C" __global__ void dense_kv_codes_batch(
       group = rank / channels;
       source = page * 16 * width + rank;
     }
-    const uint32_t param = (tile * pages + page) * param_stride + group * 2;
+    const uint32_t param = desc.param_offset + page * desc.param_stride + group * 2;
     const float minimum = params[param];
     const float step = params[param + 1];
     const float value = __uint_as_float((uint32_t)input[source] << 16);

@@ -70,6 +70,8 @@ struct GpuEncodeTile {
     source: u64,
     exact_from: u32,
     key: u32,
+    param_offset: u32,
+    param_stride: u32,
 }
 
 // The CUDA declaration has the same C layout and contains only integers.
@@ -157,14 +159,13 @@ fn encode_chunk(
         .checked_mul(width)
         .ok_or_else(|| candle_core::Error::Msg("KV tile size overflow".into()))?;
     let pages = tokens.div_ceil(BLOCK);
-    let param_stride = width
-        .max(
-            BLOCK
-                .checked_mul(heads)
-                .ok_or_else(|| candle_core::Error::Msg("KV parameter count overflow".into()))?,
-        )
+    let key_param_stride = width
         .checked_mul(2)
-        .ok_or_else(|| candle_core::Error::Msg("KV parameter count overflow".into()))?;
+        .ok_or_else(|| candle_core::Error::Msg("KV key parameter count overflow".into()))?;
+    let value_param_stride = BLOCK
+        .checked_mul(heads)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| candle_core::Error::Msg("KV value parameter count overflow".into()))?;
     let code_stride = BLOCK
         .checked_mul(width)
         .and_then(|n| n.checked_mul(bits as usize))
@@ -178,10 +179,7 @@ fn encode_chunk(
         .checked_mul(width)
         .ok_or_else(|| candle_core::Error::Msg("KV exact-tail size overflow".into()))?;
     let tile_count = requests.len();
-    let param_words = tile_count
-        .checked_mul(pages)
-        .and_then(|n| n.checked_mul(param_stride))
-        .ok_or_else(|| candle_core::Error::Msg("KV parameter batch overflow".into()))?;
+    let mut param_words = 0usize;
     let code_bytes = tile_count
         .checked_mul(pages)
         .and_then(|n| n.checked_mul(code_stride))
@@ -226,11 +224,25 @@ fn encode_chunk(
             candle_core::bail!("invalid GPU KV batch tile extent")
         }
         let source = storage.as_cuda_slice::<half::bf16>()?.slice(start..end);
+        let param_stride = if request.axis == PackedKvAxis::Key {
+            key_param_stride
+        } else {
+            value_param_stride
+        };
         descriptors.push(GpuEncodeTile {
             source: *source.device_ptr(),
             exact_from: as_u32(tokens.saturating_sub(request.exact_tail_tokens))?,
             key: u32::from(request.axis == PackedKvAxis::Key),
+            param_offset: as_u32(param_words)?,
+            param_stride: as_u32(param_stride)?,
         });
+        param_words = param_words
+            .checked_add(
+                pages
+                    .checked_mul(param_stride)
+                    .ok_or_else(|| candle_core::Error::Msg("KV parameter batch overflow".into()))?,
+            )
+            .ok_or_else(|| candle_core::Error::Msg("KV parameter batch overflow".into()))?;
     }
     {
         let _guard = COMPILE_LOCK.lock().unwrap();
@@ -242,6 +254,7 @@ fn encode_chunk(
                 .map_err(|e| candle_core::Error::Msg(format!("load GPU KV batch: {e}")))?;
         }
     }
+    as_u32(param_words)?;
     let d_descriptors = device
         .htod_copy(descriptors.clone())
         .map_err(|e| candle_core::Error::Msg(format!("upload GPU KV batch descriptors: {e}")))?;
@@ -282,7 +295,6 @@ fn encode_chunk(
                 as_u32(channels)?,
                 bits as u32,
                 as_u32(pages)?,
-                as_u32(param_stride)?,
             ),
         )
     }
@@ -311,7 +323,6 @@ fn encode_chunk(
                 as_u32(channels)?,
                 bits as u32,
                 as_u32(pages)?,
-                as_u32(param_stride)?,
                 as_u32(code_stride)?,
             ),
         )
@@ -404,7 +415,8 @@ fn encode_chunk(
                         }
                     }
                     let offset = (tile * pages + page) * code_stride;
-                    let param_offset = (tile * pages + page) * param_stride;
+                    let param_offset = descriptors[tile].param_offset as usize
+                        + page * descriptors[tile].param_stride as usize;
                     tile_pages.push(DensePackedKvPage::new(
                         request.axis,
                         bits,
