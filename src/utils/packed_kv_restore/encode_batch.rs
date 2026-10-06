@@ -3,7 +3,8 @@ use candle_core::cuda_backend::cudarc::driver::{capture_status, sys::CUstreamCap
 use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr, LaunchAsync, LaunchConfig};
 use candle_core::cuda_backend::cudarc::nvrtc::compile_ptx;
 use candle_core::{DType, Result, Storage};
-use std::sync::{Arc, Mutex};
+use rayon::prelude::*;
+use std::sync::{Arc, Mutex, OnceLock};
 
 const MODULE: &str = "xinfer_dense_packed_kv_encode_batch_v1";
 const PARAM_KERNEL: &str = "dense_kv_params_batch";
@@ -12,6 +13,22 @@ const TAIL_KERNEL: &str = "dense_kv_tail_batch";
 const MAX_BATCH_TILES: usize = 16;
 const MAX_BATCH_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
+static PAGE_POOL: OnceLock<std::result::Result<rayon::ThreadPool, String>> = OnceLock::new();
+
+fn page_pool() -> Result<&'static rayon::ThreadPool> {
+    PAGE_POOL
+        .get_or_init(|| {
+            let workers =
+                std::thread::available_parallelism().map_or(1, |available| available.get().min(8));
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .thread_name(|index| format!("gpu-kv-page-{index}"))
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map_err(|error| candle_core::Error::Msg(format!("GPU KV page pool: {error}")))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -312,60 +329,64 @@ fn encode_chunk(
     {
         candle_core::bail!("non-finite BF16 KV value")
     }
-    let mut output = Vec::with_capacity(tile_count);
-    for (tile, request) in requests.iter().enumerate() {
-        let exact_from = descriptors[tile].exact_from as usize;
-        let mut tile_pages = Vec::with_capacity(pages);
-        for page in 0..pages {
-            let first = page * BLOCK;
-            let count = (tokens - first).min(BLOCK);
-            let old = count.min(exact_from.saturating_sub(first));
-            let tail_count = count - old;
-            let code_len = (old * width * bits as usize).div_ceil(8);
-            let groups = if request.axis == PackedKvAxis::Key {
-                if old > 0 {
-                    width
-                } else {
-                    0
-                }
-            } else {
-                old * heads
-            };
-            let mut exact = Vec::with_capacity(tail_count * width);
-            if request.axis == PackedKvAxis::Key {
-                for hd in 0..width {
-                    for token in old..count {
-                        let rank = (first + token - exact_from) * width + hd;
-                        exact.push(tails[tile * tail_stride + rank]);
+    page_pool()?.install(|| {
+        requests
+            .par_iter()
+            .enumerate()
+            .map(|(tile, request)| {
+                let exact_from = descriptors[tile].exact_from as usize;
+                let mut tile_pages = Vec::with_capacity(pages);
+                for page in 0..pages {
+                    let first = page * BLOCK;
+                    let count = (tokens - first).min(BLOCK);
+                    let old = count.min(exact_from.saturating_sub(first));
+                    let tail_count = count - old;
+                    let code_len = (old * width * bits as usize).div_ceil(8);
+                    let groups = if request.axis == PackedKvAxis::Key {
+                        if old > 0 {
+                            width
+                        } else {
+                            0
+                        }
+                    } else {
+                        old * heads
+                    };
+                    let mut exact = Vec::with_capacity(tail_count * width);
+                    if request.axis == PackedKvAxis::Key {
+                        for hd in 0..width {
+                            for token in old..count {
+                                let rank = (first + token - exact_from) * width + hd;
+                                exact.push(tails[tile * tail_stride + rank]);
+                            }
+                        }
+                    } else {
+                        for token in old..count {
+                            let rank = tile * tail_stride + (first + token - exact_from) * width;
+                            exact.extend_from_slice(&tails[rank..rank + width]);
+                        }
                     }
+                    let offset = (tile * pages + page) * code_stride;
+                    let param_offset = (tile * pages + page) * param_stride;
+                    tile_pages.push(DensePackedKvPage::new(
+                        request.axis,
+                        bits,
+                        as_u32(count)?,
+                        as_u32(heads)?,
+                        as_u32(channels)?,
+                        if request.axis == PackedKvAxis::Key {
+                            16
+                        } else {
+                            as_u32(channels)?
+                        },
+                        as_u32(tail_count)?,
+                        codes[offset..offset + code_len].to_vec(),
+                        params[param_offset..param_offset + groups * 2].to_vec(),
+                        exact,
+                        Vec::new(),
+                    )?);
                 }
-            } else {
-                for token in old..count {
-                    let rank = tile * tail_stride + (first + token - exact_from) * width;
-                    exact.extend_from_slice(&tails[rank..rank + width]);
-                }
-            }
-            let offset = (tile * pages + page) * code_stride;
-            let param_offset = (tile * pages + page) * param_stride;
-            tile_pages.push(DensePackedKvPage::new(
-                request.axis,
-                bits,
-                as_u32(count)?,
-                as_u32(heads)?,
-                as_u32(channels)?,
-                if request.axis == PackedKvAxis::Key {
-                    16
-                } else {
-                    as_u32(channels)?
-                },
-                as_u32(tail_count)?,
-                codes[offset..offset + code_len].to_vec(),
-                params[param_offset..param_offset + groups * 2].to_vec(),
-                exact,
-                Vec::new(),
-            )?);
-        }
-        output.push(tile_pages);
-    }
-    Ok(output)
+                Ok(tile_pages)
+            })
+            .collect::<Result<Vec<_>>>()
+    })
 }
