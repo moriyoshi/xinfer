@@ -12,8 +12,42 @@ const CODE_KERNEL: &str = "dense_kv_codes_batch";
 const TAIL_KERNEL: &str = "dense_kv_tail_batch";
 const MAX_BATCH_TILES: usize = 16;
 const MAX_BATCH_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+const MAX_RETAINED_HOST_BUFFERS: usize = 2;
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 static PAGE_POOL: OnceLock<std::result::Result<rayon::ThreadPool, String>> = OnceLock::new();
+static HOST_POOL: OnceLock<Mutex<Vec<HostScratch>>> = OnceLock::new();
+
+#[derive(Default)]
+struct HostScratch {
+    params: Vec<f32>,
+    codes: Vec<u8>,
+    tails: Vec<u16>,
+}
+
+struct ScratchLease(HostScratch);
+
+impl ScratchLease {
+    fn acquire() -> Self {
+        let pool = HOST_POOL.get_or_init(|| Mutex::new(Vec::new()));
+        Self(pool.lock().unwrap().pop().unwrap_or_default())
+    }
+}
+
+impl Drop for ScratchLease {
+    fn drop(&mut self) {
+        let retained_bytes = self.0.params.capacity() * size_of::<f32>()
+            + self.0.codes.capacity()
+            + self.0.tails.capacity() * size_of::<u16>();
+        if retained_bytes > MAX_BATCH_PAYLOAD_BYTES {
+            return;
+        }
+        let pool = HOST_POOL.get_or_init(|| Mutex::new(Vec::new()));
+        let mut pool = pool.lock().unwrap();
+        if pool.len() < MAX_RETAINED_HOST_BUFFERS {
+            pool.push(std::mem::take(&mut self.0));
+        }
+    }
+}
 
 fn page_pool() -> Result<&'static rayon::ThreadPool> {
     PAGE_POOL
@@ -90,9 +124,10 @@ pub(super) fn encode(
         .and_then(|n| n.checked_add(tail_bytes))
         .ok_or_else(|| candle_core::Error::Msg("KV GPU batch size overflow".into()))?;
     let batch_tiles = (MAX_BATCH_PAYLOAD_BYTES / per_tile_bytes.max(1)).clamp(1, MAX_BATCH_TILES);
+    let mut scratch = ScratchLease::acquire();
     let mut output = Vec::with_capacity(requests.len());
     for batch in requests.chunks(batch_tiles) {
-        output.extend(encode_chunk(batch, tokens, bits)?);
+        output.extend(encode_chunk(batch, tokens, bits, &mut scratch.0)?);
     }
     Ok(output)
 }
@@ -101,6 +136,7 @@ fn encode_chunk(
     requests: &[DensePackedKvEncode<'_>],
     tokens: usize,
     bits: u8,
+    scratch: &mut HostScratch,
 ) -> Result<Vec<Vec<DensePackedKvPage>>> {
     const BLOCK: usize = 16;
     let first = requests[0].tile;
@@ -310,20 +346,22 @@ fn encode_chunk(
     if invalid[0] != 0 {
         candle_core::bail!("non-finite BF16 KV value")
     }
-    let params = device
-        .dtoh_sync_copy(&d_params)
+    scratch.params.resize(param_words, 0.0);
+    device
+        .dtoh_sync_copy_into(&d_params, &mut scratch.params)
         .map_err(|e| candle_core::Error::Msg(format!("read GPU KV batch parameters: {e}")))?;
-    let codes = device
-        .dtoh_sync_copy(&d_codes)
+    scratch.codes.resize(code_bytes, 0);
+    device
+        .dtoh_sync_copy_into(&d_codes, &mut scratch.codes)
         .map_err(|e| candle_core::Error::Msg(format!("read GPU KV batch codes: {e}")))?;
-    let tails = if tail_stride == 0 {
-        Vec::new()
-    } else {
+    scratch.tails.resize(tail_words, 0);
+    if tail_stride > 0 {
         device
-            .dtoh_sync_copy(&d_tails)
-            .map_err(|e| candle_core::Error::Msg(format!("read GPU KV batch tails: {e}")))?
-    };
-    if tails
+            .dtoh_sync_copy_into(&d_tails, &mut scratch.tails)
+            .map_err(|e| candle_core::Error::Msg(format!("read GPU KV batch tails: {e}")))?;
+    }
+    if scratch
+        .tails
         .iter()
         .any(|word| !half::bf16::from_bits(*word).to_f32().is_finite())
     {
@@ -356,13 +394,13 @@ fn encode_chunk(
                         for hd in 0..width {
                             for token in old..count {
                                 let rank = (first + token - exact_from) * width + hd;
-                                exact.push(tails[tile * tail_stride + rank]);
+                                exact.push(scratch.tails[tile * tail_stride + rank]);
                             }
                         }
                     } else {
                         for token in old..count {
                             let rank = tile * tail_stride + (first + token - exact_from) * width;
-                            exact.extend_from_slice(&tails[rank..rank + width]);
+                            exact.extend_from_slice(&scratch.tails[rank..rank + width]);
                         }
                     }
                     let offset = (tile * pages + page) * code_stride;
@@ -379,8 +417,8 @@ fn encode_chunk(
                             as_u32(channels)?
                         },
                         as_u32(tail_count)?,
-                        codes[offset..offset + code_len].to_vec(),
-                        params[param_offset..param_offset + groups * 2].to_vec(),
+                        scratch.codes[offset..offset + code_len].to_vec(),
+                        scratch.params[param_offset..param_offset + groups * 2].to_vec(),
                         exact,
                         Vec::new(),
                     )?);
