@@ -216,18 +216,6 @@ impl DensePackedKvPage {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
-        self.serialize()
-    }
-
-    // Called only on pages returned directly by the GPU encoder. Their
-    // constructor has already checked the shape and computed the checksum;
-    // no caller can mutate a page between that constructor and this call.
-    #[cfg(feature = "cuda")]
-    fn into_fresh_bytes(self) -> Result<Vec<u8>> {
-        self.serialize()
-    }
-
-    fn serialize(&self) -> Result<Vec<u8>> {
         let mut bytes = MAGIC.to_vec();
         bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -453,17 +441,6 @@ pub fn encode_dense_packed_kv_tiles_gpu(
     bits: u8,
 ) -> Result<Vec<Vec<DensePackedKvPage>>> {
     encode_batch::encode(requests, tokens, bits)
-}
-
-/// Encode live CUDA tiles into validated page envelopes. This path serializes
-/// pages immediately after construction, so it does not hash them twice.
-#[cfg(feature = "cuda")]
-pub fn encode_dense_packed_kv_tiles_gpu_bytes(
-    requests: &[DensePackedKvEncode<'_>],
-    tokens: usize,
-    bits: u8,
-) -> Result<Vec<Vec<Vec<u8>>>> {
-    encode_batch::encode_bytes(requests, tokens, bits)
 }
 
 pub struct DensePackedKvRestore<'a> {
@@ -709,25 +686,6 @@ mod tests {
                     .collect::<Result<Vec<_>>>()?
             );
         }
-        let serialized = encode_dense_packed_kv_tiles_gpu_bytes(&requests, tokens, 4)?;
-        for (request, actual) in requests.iter().zip(serialized) {
-            let expected = encode_dense_packed_kv_tile(
-                &bytes,
-                tokens,
-                heads,
-                channels,
-                request.axis,
-                4,
-                request.exact_tail_tokens,
-            )?;
-            assert_eq!(
-                expected
-                    .iter()
-                    .map(DensePackedKvPage::to_bytes)
-                    .collect::<Result<Vec<_>>>()?,
-                actual
-            );
-        }
         // A BF16 midpoint can round to a different 2-bit code if the
         // subtraction and division are narrowed to f32 before rounding.
         let midpoint = [-0.0159912109375, -0.0120849609375, -0.0081787109375];
@@ -751,8 +709,6 @@ mod tests {
         }];
         let edge_gpu = encode_dense_packed_kv_tiles_gpu(&edge_request, 16, 2)?;
         assert_eq!(edge_cpu[0].to_bytes()?, edge_gpu[0][0].to_bytes()?);
-        let edge_serialized = encode_dense_packed_kv_tiles_gpu_bytes(&edge_request, 16, 2)?;
-        assert_eq!(edge_cpu[0].to_bytes()?, edge_serialized[0][0]);
         Ok(())
     }
 
