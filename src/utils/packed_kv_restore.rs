@@ -424,6 +424,25 @@ pub fn encode_dense_packed_kv_tile_gpu(
     encode::encode(tile, tokens, axis, bits, exact_tail_tokens)
 }
 
+/// One live Flash K/V tile for a bounded batched GPU encode. Requests must
+/// share geometry and a CUDA device. Each tile may choose its own exact tail.
+#[cfg(feature = "cuda")]
+pub struct DensePackedKvEncode<'a> {
+    pub tile: &'a candle_core::Tensor,
+    pub axis: PackedKvAxis,
+    pub exact_tail_tokens: usize,
+}
+
+/// Encode live CUDA tiles with at most 16 tiles staged per GPU batch.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tiles_gpu(
+    requests: &[DensePackedKvEncode<'_>],
+    tokens: usize,
+    bits: u8,
+) -> Result<Vec<Vec<DensePackedKvPage>>> {
+    encode_batch::encode(requests, tokens, bits)
+}
+
 pub struct DensePackedKvRestore<'a> {
     pub layer: usize,
     pub block: usize,
@@ -534,6 +553,9 @@ mod cuda;
 #[cfg(feature = "cuda")]
 mod encode;
 
+#[cfg(feature = "cuda")]
+mod encode_batch;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +646,45 @@ mod tests {
                     }
                 }
             }
+        }
+        let requests = [
+            DensePackedKvEncode {
+                tile: &tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 19,
+            },
+            DensePackedKvEncode {
+                tile: &tile,
+                axis: PackedKvAxis::Value,
+                exact_tail_tokens: 5,
+            },
+            DensePackedKvEncode {
+                tile: &tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 37,
+            },
+        ];
+        let batch = encode_dense_packed_kv_tiles_gpu(&requests, tokens, 4)?;
+        for (request, actual) in requests.iter().zip(batch) {
+            let expected = encode_dense_packed_kv_tile(
+                &bytes,
+                tokens,
+                heads,
+                channels,
+                request.axis,
+                4,
+                request.exact_tail_tokens,
+            )?;
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(DensePackedKvPage::to_bytes)
+                    .collect::<Result<Vec<_>>>()?,
+                actual
+                    .iter()
+                    .map(DensePackedKvPage::to_bytes)
+                    .collect::<Result<Vec<_>>>()?
+            );
         }
         Ok(())
     }
