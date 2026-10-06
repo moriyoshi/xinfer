@@ -139,17 +139,27 @@ pub(super) fn encode_bytes(
     tokens: usize,
     bits: u8,
 ) -> Result<Vec<Vec<Vec<u8>>>> {
+    let started = std::time::Instant::now();
     let pages = encode(requests, tokens, bits)?;
-    page_pool()?.install(|| {
+    let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let started = std::time::Instant::now();
+    let serialized: Vec<Vec<Vec<u8>>> = page_pool()?.install(|| {
         pages
             .into_par_iter()
             .map(|tile| {
                 tile.into_iter()
                     .map(DensePackedKvPage::into_fresh_bytes)
-                    .collect()
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect()
-    })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    if std::env::var("SHIFOU_PROFILE_GPU_BATCH").as_deref() == Ok("1") {
+        eprintln!(
+            "xinfer GPU byte phases: encode_ms={encode_ms:.3} serialize_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    Ok(serialized)
 }
 
 fn encode_chunk(
