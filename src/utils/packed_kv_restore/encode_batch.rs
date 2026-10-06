@@ -10,8 +10,7 @@ const MODULE: &str = "xinfer_dense_packed_kv_encode_batch_v2";
 const PARAM_KERNEL: &str = "dense_kv_params_batch";
 const CODE_KERNEL: &str = "dense_kv_codes_batch";
 const TAIL_KERNEL: &str = "dense_kv_tail_batch";
-const DEFAULT_BATCH_TILES: usize = 16;
-const MAX_BATCH_TILES: usize = 32;
+const MAX_BATCH_TILES: usize = 16;
 const MAX_BATCH_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_RETAINED_HOST_BUFFERS: usize = 2;
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
@@ -136,19 +135,7 @@ pub(super) fn encode_with_rounding(
         .checked_add(code_bytes)
         .and_then(|n| n.checked_add(tail_bytes))
         .ok_or_else(|| candle_core::Error::Msg("KV GPU batch size overflow".into()))?;
-    let requested_tiles = std::env::var("XINFER_GPU_PACK_BATCH_TILES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(DEFAULT_BATCH_TILES)
-        .min(MAX_BATCH_TILES);
-    let batch_tiles = (MAX_BATCH_PAYLOAD_BYTES / per_tile_bytes.max(1)).clamp(1, requested_tiles);
-    if std::env::var("XINFER_PROFILE_GPU_BATCH").as_deref() == Ok("1") {
-        eprintln!(
-            "xinfer GPU batch: tile_limit={batch_tiles} chunks={}",
-            requests.len().div_ceil(batch_tiles)
-        );
-    }
+    let batch_tiles = (MAX_BATCH_PAYLOAD_BYTES / per_tile_bytes.max(1)).clamp(1, MAX_BATCH_TILES);
     let mut scratch = ScratchLease::acquire();
     let mut output = Vec::with_capacity(requests.len());
     for batch in requests.chunks(batch_tiles) {
