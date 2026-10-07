@@ -1,6 +1,7 @@
 //! Nemotron-H: a sequence of Mamba2, MLP, and unrotated attention blocks.
 //! The recurrent path is deliberately expressed in Candle operations so the
 //! checkpoint can run without the optional mamba-ssm CUDA extension.
+mod compact_state;
 mod expert_cache;
 mod expert_snapshot;
 mod state;
@@ -1045,6 +1046,41 @@ impl NemotronHForCausalLM {
             expected_model_fingerprint,
             &self.device,
         )?;
+        state::install(
+            &mut self.states.write(),
+            seq_id,
+            restored,
+            self.state_capacity.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Import a verified `SHMS` v1 compact recurrent snapshot. The frame is
+    /// checked against this model before any GPU state is allocated. Active
+    /// recurrent state is expanded to FP32; attention KV belongs to the same
+    /// prefix boundary and must be restored separately by the caller.
+    pub fn import_compact_mamba_state_bytes(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let states = self.states.read();
+        if states.contains_key(&seq_id) {
+            candle_core::bail!("Nemotron-H sequence {seq_id} already has Mamba state")
+        }
+        if states.len() >= self.state_capacity.load(Ordering::Relaxed) {
+            candle_core::bail!("Nemotron-H recurrent state capacity exceeded")
+        }
+        drop(states);
+        let layout = state::layout_from_layers(&self.layers)?;
+        let frame = compact_state::CompactMambaFrame::parse(
+            bytes,
+            &layout,
+            expected_prefix_tokens,
+            expected_model_fingerprint,
+        )?;
+        let restored = frame.expand(&self.device)?;
         state::install(
             &mut self.states.write(),
             seq_id,
