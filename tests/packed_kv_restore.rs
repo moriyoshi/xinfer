@@ -3,8 +3,9 @@
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use xinfer::utils::packed_kv_restore::{
-    encode_dense_packed_kv_tile, restore_dense_packed_kv_pages, DensePackedKvPage,
-    DensePackedKvRestore, PackedKvAxis, PackedKvException,
+    encode_dense_packed_kv_tile, restore_dense_packed_kv_pages,
+    restore_dense_packed_kv_pages_sealed, DensePackedKvPage, DensePackedKvRestore, PackedKvAxis,
+    PackedKvException, SealedDensePackedKvRestore,
 };
 
 #[cfg(feature = "cuda")]
@@ -119,6 +120,12 @@ fn shifou_compact_fixtures_match_cpu_oracle() -> Result<()> {
                 DensePackedKvPage::from_bytes(&bytes)?.decode_cpu_bf16()?,
                 expected
             );
+            assert_eq!(
+                DensePackedKvPage::from_bytes_sealed(&bytes)?
+                    .page()
+                    .decode_cpu_bf16()?,
+                expected
+            );
         }
     }
     Ok(())
@@ -225,6 +232,73 @@ fn batched_gpu_restore_matches_independent_bf16_and_exact_exceptions() -> Result
     let stats = restore_dense_packed_kv_pages(&cache, &requests)?;
     assert_eq!(stats.pages, 6);
     assert_eq!(stats.kernel_launches, 1);
+    let sealed_pages = pages
+        .iter()
+        .map(|page| DensePackedKvPage::from_bytes_sealed(&page.to_bytes()?))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let sealed_requests = requests
+        .iter()
+        .zip(&sealed_pages)
+        .map(|(request, page)| SealedDensePackedKvRestore {
+            layer: request.layer,
+            block: request.block,
+            token_offset: request.token_offset,
+            page,
+        })
+        .collect::<Vec<_>>();
+    let sealed_cache = GpuKvCache::Flash(
+        (0..3)
+            .map(|_| {
+                Ok((
+                    Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+                    Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+                ))
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?,
+    );
+    assert_eq!(
+        restore_dense_packed_kv_pages_sealed(&sealed_cache, &sealed_requests)?,
+        stats
+    );
+    for (ordinary, sealed) in cache
+        .as_pairs()
+        .unwrap()
+        .iter()
+        .zip(sealed_cache.as_pairs().unwrap())
+    {
+        for (old, new) in [(&ordinary.0, &sealed.0), (&ordinary.1, &sealed.1)] {
+            assert_eq!(
+                old.to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?,
+                new.to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?,
+            );
+        }
+    }
+    let overlap = [
+        SealedDensePackedKvRestore {
+            layer: 0,
+            block: 0,
+            token_offset: 0,
+            page: &sealed_pages[0],
+        },
+        SealedDensePackedKvRestore {
+            layer: 0,
+            block: 0,
+            token_offset: 0,
+            page: &sealed_pages[0],
+        },
+    ];
+    assert!(restore_dense_packed_kv_pages_sealed(&sealed_cache, &overlap).is_err());
+    let out_of_range = [SealedDensePackedKvRestore {
+        layer: 0,
+        block: 0,
+        token_offset: 1,
+        page: &sealed_pages[0],
+    }];
+    assert!(restore_dense_packed_kv_pages_sealed(&sealed_cache, &out_of_range).is_err());
     let pairs = cache.as_pairs().unwrap();
     for (index, words) in expected.iter().enumerate() {
         let target = if index % 2 == 0 {

@@ -48,7 +48,8 @@ pub struct DensePackedKvPage {
     pub sha256: [u8; 32],
 }
 
-/// An owned page whose shape and checksum were checked at construction.
+/// An owned page whose shape and checksum were checked at construction or
+/// while parsing an untrusted wire envelope.
 /// Its fields cannot be changed while sealed. Consuming it for wire bytes
 /// avoids repeating shape checks and SHA-256; an ordinary mutable page keeps
 /// the validating [`DensePackedKvPage::to_bytes`] path.
@@ -296,6 +297,12 @@ impl DensePackedKvPage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self::from_bytes_sealed(bytes)?.into_page())
+    }
+
+    /// Parse and validate an untrusted wire envelope once, retaining an
+    /// immutable proof for subsequent sealed-page restore or serialization.
+    pub fn from_bytes_sealed(bytes: &[u8]) -> Result<SealedDensePackedKvPage> {
         let payload = bytes.strip_prefix(MAGIC).ok_or_else(|| {
             candle_core::Error::Msg("invalid dense packed KV envelope magic/version".into())
         })?;
@@ -306,7 +313,7 @@ impl DensePackedKvPage {
             .deserialize(payload)
             .map_err(|e| candle_core::Error::Msg(format!("deserialize packed KV page: {e}")))?;
         page.validate()?;
-        Ok(page)
+        Ok(SealedDensePackedKvPage { page })
     }
 
     /// Portable byte-parity oracle. Output is token-major `[T,H,D]` BF16 bits.
@@ -584,6 +591,14 @@ pub struct DensePackedKvRestore<'a> {
     pub page: &'a DensePackedKvPage,
 }
 
+/// Restore request backed by a page validated when it was parsed or built.
+pub struct SealedDensePackedKvRestore<'a> {
+    pub layer: usize,
+    pub block: usize,
+    pub token_offset: usize,
+    pub page: &'a SealedDensePackedKvPage,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DensePackedKvRestoreStats {
     pub pages: usize,
@@ -599,6 +614,34 @@ pub fn restore_dense_packed_kv_pages(
     cache: &GpuKvCache,
     requests: &[DensePackedKvRestore<'_>],
 ) -> Result<DensePackedKvRestoreStats> {
+    restore_dense_packed_kv_pages_inner(cache, requests, true)
+}
+
+/// Restore pages that have already passed shape and checksum validation.
+/// Destination geometry and overlapping ranges are still checked before any
+/// GPU writes. Mutable pages cannot enter this path without being revalidated
+/// and sealed first.
+pub fn restore_dense_packed_kv_pages_sealed(
+    cache: &GpuKvCache,
+    requests: &[SealedDensePackedKvRestore<'_>],
+) -> Result<DensePackedKvRestoreStats> {
+    let borrowed: Vec<_> = requests
+        .iter()
+        .map(|request| DensePackedKvRestore {
+            layer: request.layer,
+            block: request.block,
+            token_offset: request.token_offset,
+            page: request.page.page(),
+        })
+        .collect();
+    restore_dense_packed_kv_pages_inner(cache, &borrowed, false)
+}
+
+fn restore_dense_packed_kv_pages_inner(
+    cache: &GpuKvCache,
+    requests: &[DensePackedKvRestore<'_>],
+    validate_pages: bool,
+) -> Result<DensePackedKvRestoreStats> {
     let GpuKvCache::Flash(pairs) = cache else {
         candle_core::bail!("dense packed KV restore requires a standard Flash cache")
     };
@@ -607,7 +650,9 @@ pub fn restore_dense_packed_kv_pages(
     let mut device = None;
     for request in requests {
         let page = request.page;
-        page.validate()?;
+        if validate_pages {
+            page.validate()?;
+        }
         let (key, value) = pairs
             .get(request.layer)
             .ok_or_else(|| candle_core::Error::Msg("dense packed KV layer out of range".into()))?;
@@ -693,6 +738,61 @@ mod encode_batch;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Qwen3-4B-shaped 12,960-page CPU validation phase timing"]
+    fn qwen3_4b_shaped_validation_split() -> Result<()> {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mut pages = Vec::with_capacity(12_960);
+        for axis in [PackedKvAxis::Key, PackedKvAxis::Value] {
+            let groups = if axis == PackedKvAxis::Key {
+                8 * 128
+            } else {
+                16 * 8
+            };
+            let prototype = DensePackedKvPage::new(
+                axis,
+                4,
+                16,
+                8,
+                128,
+                if axis == PackedKvAxis::Key { 16 } else { 128 },
+                0,
+                vec![0x39; 16 * 8 * 128 * 4 / 8],
+                [0.0f32, 0.125].repeat(groups),
+                vec![],
+                vec![],
+            )?;
+            for index in 0..6_480 {
+                let mut page = prototype.clone();
+                page.codes[0] = index as u8;
+                page.sha256 = page.digest();
+                pages.push(page);
+            }
+        }
+        let timed = |name: &str, check: &dyn Fn(&DensePackedKvPage) -> Result<()>| -> Result<()> {
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let start = Instant::now();
+                for page in &pages {
+                    check(black_box(page))?;
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!("{name}: p50={:.2} ms, samples={samples:?}", samples[1]);
+            Ok(())
+        };
+        timed("shape", &|page| page.validate_shape())?;
+        timed("digest", &|page| {
+            black_box(page.digest());
+            Ok(())
+        })?;
+        timed("validate", &|page| page.validate())?;
+        Ok(())
+    }
 
     #[test]
     fn sealed_pages_keep_wire_bytes_and_mutation_boundary() -> Result<()> {
@@ -1005,6 +1105,9 @@ mod tests {
             }],
         )?;
         let bytes = page.to_bytes()?;
+        let sealed = DensePackedKvPage::from_bytes_sealed(&bytes)?;
+        assert_eq!(sealed.page().sha256, page.sha256);
+        assert_eq!(sealed.into_bytes()?, bytes);
         assert_eq!(
             DensePackedKvPage::from_bytes(&bytes)?.decode_cpu_bf16()?,
             page.decode_cpu_bf16()?
@@ -1012,6 +1115,9 @@ mod tests {
         let mut corrupt = bytes.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(DensePackedKvPage::from_bytes(&corrupt).is_err());
+        assert!(DensePackedKvPage::from_bytes_sealed(&corrupt).is_err());
+        assert!(DensePackedKvPage::from_bytes_sealed(&bytes[1..]).is_err());
+        assert!(DensePackedKvPage::from_bytes_sealed(&bytes[..bytes.len() - 1]).is_err());
         let mut wrong = page.clone();
         wrong.channels = 8;
         assert!(wrong.validate().is_err());
