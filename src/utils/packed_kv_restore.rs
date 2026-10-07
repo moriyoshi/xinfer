@@ -48,6 +48,33 @@ pub struct DensePackedKvPage {
     pub sha256: [u8; 32],
 }
 
+/// An owned page whose shape and checksum were checked at construction.
+/// Its fields cannot be changed while sealed. Consuming it for wire bytes
+/// avoids repeating shape checks and SHA-256; an ordinary mutable page keeps
+/// the validating [`DensePackedKvPage::to_bytes`] path.
+#[derive(Debug)]
+pub struct SealedDensePackedKvPage {
+    page: DensePackedKvPage,
+}
+
+impl SealedDensePackedKvPage {
+    /// Inspect a sealed page without exposing mutable access to its payload.
+    pub fn page(&self) -> &DensePackedKvPage {
+        &self.page
+    }
+
+    /// Give up the seal and return the mutable page. Subsequent serialization
+    /// through `to_bytes` validates the page again.
+    pub fn into_page(self) -> DensePackedKvPage {
+        self.page
+    }
+
+    /// Consume a freshly validated page and serialize its existing checksum.
+    pub fn into_bytes(self) -> Result<Vec<u8>> {
+        self.page.serialize_wire()
+    }
+}
+
 impl DensePackedKvPage {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -81,6 +108,46 @@ impl DensePackedKvPage {
         page.validate_shape()?;
         page.sha256 = page.digest();
         Ok(page)
+    }
+
+    /// Construct an immutable, owned page for one-pass wire serialization.
+    /// Unlike sealing an existing mutable page, this does not revalidate the
+    /// shape or recompute the checksum after construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_sealed(
+        axis: PackedKvAxis,
+        bits: u8,
+        tokens: u32,
+        heads: u32,
+        channels: u32,
+        group_size: u32,
+        tail_tokens: u32,
+        codes: Vec<u8>,
+        params: Vec<f32>,
+        tail_bf16: Vec<u16>,
+        exceptions: Vec<PackedKvException>,
+    ) -> Result<SealedDensePackedKvPage> {
+        Ok(SealedDensePackedKvPage {
+            page: Self::new(
+                axis,
+                bits,
+                tokens,
+                heads,
+                channels,
+                group_size,
+                tail_tokens,
+                codes,
+                params,
+                tail_bf16,
+                exceptions,
+            )?,
+        })
+    }
+
+    /// Validate and seal a page that may have been mutated after construction.
+    pub fn seal(self) -> Result<SealedDensePackedKvPage> {
+        self.validate()?;
+        Ok(SealedDensePackedKvPage { page: self })
     }
 
     fn digest(&self) -> [u8; 32] {
@@ -216,6 +283,10 @@ impl DensePackedKvPage {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
+        self.serialize_wire()
+    }
+
+    fn serialize_wire(&self) -> Result<Vec<u8>> {
         let mut bytes = MAGIC.to_vec();
         bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -296,6 +367,31 @@ pub fn encode_dense_packed_kv_tile(
     bits: u8,
     exact_tail_tokens: usize,
 ) -> Result<Vec<DensePackedKvPage>> {
+    Ok(encode_dense_packed_kv_tile_sealed(
+        bf16_le,
+        tokens,
+        heads,
+        channels,
+        axis,
+        bits,
+        exact_tail_tokens,
+    )?
+    .into_iter()
+    .map(SealedDensePackedKvPage::into_page)
+    .collect())
+}
+
+/// Encode an exact BF16 tile and keep each newly constructed page sealed for
+/// one-pass serialization with [`SealedDensePackedKvPage::into_bytes`].
+pub fn encode_dense_packed_kv_tile_sealed(
+    bf16_le: &[u8],
+    tokens: usize,
+    heads: usize,
+    channels: usize,
+    axis: PackedKvAxis,
+    bits: u8,
+    exact_tail_tokens: usize,
+) -> Result<Vec<SealedDensePackedKvPage>> {
     const BLOCK: usize = 16;
     if !matches!(bits, 2 | 4) || tokens == 0 || heads == 0 || channels == 0 {
         candle_core::bail!("invalid dense packed KV tile geometry")
@@ -390,7 +486,7 @@ pub fn encode_dense_packed_kv_tile(
                 }
             }
         }
-        pages.push(DensePackedKvPage::new(
+        pages.push(DensePackedKvPage::new_sealed(
             axis,
             bits,
             count as u32,
@@ -421,6 +517,23 @@ pub fn encode_dense_packed_kv_tile_gpu(
     bits: u8,
     exact_tail_tokens: usize,
 ) -> Result<Vec<DensePackedKvPage>> {
+    Ok(
+        encode_dense_packed_kv_tile_gpu_sealed(tile, tokens, axis, bits, exact_tail_tokens)?
+            .into_iter()
+            .map(SealedDensePackedKvPage::into_page)
+            .collect(),
+    )
+}
+
+/// Encode one live CUDA tile into sealed pages for one-pass wire serialization.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tile_gpu_sealed(
+    tile: &candle_core::Tensor,
+    tokens: usize,
+    axis: PackedKvAxis,
+    bits: u8,
+    exact_tail_tokens: usize,
+) -> Result<Vec<SealedDensePackedKvPage>> {
     encode::encode(tile, tokens, axis, bits, exact_tail_tokens)
 }
 
@@ -440,6 +553,27 @@ pub fn encode_dense_packed_kv_tiles_gpu(
     tokens: usize,
     bits: u8,
 ) -> Result<Vec<Vec<DensePackedKvPage>>> {
+    Ok(
+        encode_dense_packed_kv_tiles_gpu_sealed(requests, tokens, bits)?
+            .into_iter()
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(SealedDensePackedKvPage::into_page)
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// Encode a bounded batch of live CUDA tiles into sealed pages. Each page can
+/// be consumed once to produce the same versioned wire bytes as `to_bytes`.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tiles_gpu_sealed(
+    requests: &[DensePackedKvEncode<'_>],
+    tokens: usize,
+    bits: u8,
+) -> Result<Vec<Vec<SealedDensePackedKvPage>>> {
     encode_batch::encode(requests, tokens, bits)
 }
 
@@ -561,6 +695,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sealed_pages_keep_wire_bytes_and_mutation_boundary() -> Result<()> {
+        let words: Vec<u16> = (0..37 * 3 * 13)
+            .map(|n| half::bf16::from_f32(((n * 37 % 503) as f32 - 251.0) / 29.0).to_bits())
+            .collect();
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        for axis in [PackedKvAxis::Key, PackedKvAxis::Value] {
+            for bits in [2, 4] {
+                for tail in [0, 1, 5, 16, 19, 37] {
+                    let checked = encode_dense_packed_kv_tile(&bytes, 37, 3, 13, axis, bits, tail)?;
+                    let sealed =
+                        encode_dense_packed_kv_tile_sealed(&bytes, 37, 3, 13, axis, bits, tail)?;
+                    assert_eq!(checked.len(), sealed.len());
+                    for (checked, sealed) in checked.into_iter().zip(sealed) {
+                        let old_wire = checked.to_bytes()?;
+                        let new_wire = sealed.into_bytes()?;
+                        assert_eq!(old_wire, new_wire);
+                        assert_eq!(
+                            DensePackedKvPage::from_bytes(&new_wire)?.sha256,
+                            checked.sha256
+                        );
+                    }
+                }
+            }
+        }
+        let sealed =
+            encode_dense_packed_kv_tile_sealed(&bytes, 37, 3, 13, PackedKvAxis::Key, 2, 0)?;
+        let mut mutable = sealed.into_iter().next().unwrap().into_page();
+        mutable.codes[0] ^= 1;
+        assert!(mutable.to_bytes().is_err());
+        assert!(mutable.seal().is_err());
+
+        let mut corrupt =
+            encode_dense_packed_kv_tile_sealed(&bytes, 37, 3, 13, PackedKvAxis::Value, 4, 5)?[0]
+                .page()
+                .to_bytes()?;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(DensePackedKvPage::from_bytes(&corrupt).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn direct_encoder_preserves_tail_and_rejects_bad_input() -> Result<()> {
         let words: Vec<u16> = (0..18 * 2 * 3)
             .map(|n| half::bf16::from_f32((n % 13) as f32 / 4.0).to_bits())
@@ -665,6 +840,13 @@ mod tests {
             },
         ];
         let batch = encode_dense_packed_kv_tiles_gpu(&requests, tokens, 4)?;
+        let sealed_batch = encode_dense_packed_kv_tiles_gpu_sealed(&requests, tokens, 4)?;
+        for (checked, sealed) in batch.iter().zip(sealed_batch) {
+            assert_eq!(checked.len(), sealed.len());
+            for (checked, sealed) in checked.iter().zip(sealed) {
+                assert_eq!(checked.to_bytes()?, sealed.into_bytes()?);
+            }
+        }
         for (request, actual) in requests.iter().zip(batch) {
             let expected = encode_dense_packed_kv_tile(
                 &bytes,

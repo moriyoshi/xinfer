@@ -1,4 +1,4 @@
-use super::{DensePackedKvEncode, DensePackedKvPage, PackedKvAxis};
+use super::{DensePackedKvEncode, DensePackedKvPage, PackedKvAxis, SealedDensePackedKvPage};
 use candle_core::cuda_backend::cudarc::driver::{capture_status, sys::CUstreamCaptureStatus};
 use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr, LaunchAsync, LaunchConfig};
 use candle_core::cuda_backend::cudarc::nvrtc::compile_ptx;
@@ -86,17 +86,37 @@ pub(super) fn encode(
     requests: &[DensePackedKvEncode<'_>],
     tokens: usize,
     bits: u8,
-) -> Result<Vec<Vec<DensePackedKvPage>>> {
+) -> Result<Vec<Vec<SealedDensePackedKvPage>>> {
     let fast_round = std::env::var("XINFER_GPU_PACK_FAST_ROUND").as_deref() == Ok("1");
-    encode_with_rounding(requests, tokens, bits, fast_round)
+    encode_with_rounding_sealed(requests, tokens, bits, fast_round)
 }
 
+#[cfg(test)]
 pub(super) fn encode_with_rounding(
     requests: &[DensePackedKvEncode<'_>],
     tokens: usize,
     bits: u8,
     fast_round: bool,
 ) -> Result<Vec<Vec<DensePackedKvPage>>> {
+    Ok(
+        encode_with_rounding_sealed(requests, tokens, bits, fast_round)?
+            .into_iter()
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(SealedDensePackedKvPage::into_page)
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+fn encode_with_rounding_sealed(
+    requests: &[DensePackedKvEncode<'_>],
+    tokens: usize,
+    bits: u8,
+    fast_round: bool,
+) -> Result<Vec<Vec<SealedDensePackedKvPage>>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
@@ -156,7 +176,7 @@ fn encode_chunk(
     bits: u8,
     fast_round: bool,
     scratch: &mut HostScratch,
-) -> Result<Vec<Vec<DensePackedKvPage>>> {
+) -> Result<Vec<Vec<SealedDensePackedKvPage>>> {
     const BLOCK: usize = 16;
     let first = requests[0].tile;
     if first.dtype() != DType::BF16 || first.rank() != 4 {
@@ -435,7 +455,7 @@ fn encode_chunk(
                     let offset = (tile * pages + page) * code_stride;
                     let param_offset = descriptors[tile].param_offset as usize
                         + page * descriptors[tile].param_stride as usize;
-                    tile_pages.push(DensePackedKvPage::new(
+                    tile_pages.push(DensePackedKvPage::new_sealed(
                         request.axis,
                         bits,
                         as_u32(count)?,

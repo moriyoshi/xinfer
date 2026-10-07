@@ -1,4 +1,4 @@
-use super::{DensePackedKvPage, PackedKvAxis};
+use super::{DensePackedKvPage, PackedKvAxis, SealedDensePackedKvPage};
 use candle_core::cuda_backend::cudarc::driver::{capture_status, sys::CUstreamCaptureStatus};
 use candle_core::cuda_backend::cudarc::driver::{LaunchAsync, LaunchConfig};
 use candle_core::cuda_backend::cudarc::nvrtc::compile_ptx;
@@ -21,7 +21,7 @@ pub(super) fn encode(
     axis: PackedKvAxis,
     bits: u8,
     exact_tail_tokens: usize,
-) -> Result<Vec<DensePackedKvPage>> {
+) -> Result<Vec<SealedDensePackedKvPage>> {
     const BLOCK: usize = 16;
     if !matches!(bits, 2 | 4) || tile.dtype() != DType::BF16 || tile.rank() != 4 {
         candle_core::bail!("GPU packed KV encoding requires rank-four BF16 Flash slots")
@@ -209,7 +209,7 @@ pub(super) fn encode(
                 );
             }
         }
-        output.push(DensePackedKvPage::new(
+        output.push(DensePackedKvPage::new_sealed(
             axis,
             bits,
             count as u32,
