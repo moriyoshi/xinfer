@@ -22,6 +22,29 @@ enum QkvProjection {
     Packed(MergedParallelColumnLinear),
 }
 
+/// Opt-in observation of the exact query sent to paged attention and its
+/// per-head result, before the output gate and output projection. The query,
+/// context, and positions remain on their original device; an observer that
+/// needs host bytes must copy them explicitly. Rows are in the input's packed
+/// token order, with `seqlens` delimiting sequences during batched prefill.
+/// Retaining these tensors also retains their GPU storage.
+pub struct AttentionProbe {
+    pub layer_index: usize,
+    pub positions: Tensor,
+    pub sequence_ids: Option<Vec<usize>>,
+    pub seqlens: Option<Vec<u32>>,
+    pub is_prefill: bool,
+    pub query: Tensor,   // [tokens, local query heads, head width]
+    pub context: Tensor, // [tokens, local query heads, head width]
+    pub query_heads: usize,
+    pub kv_heads: usize,
+    pub head_width: usize,
+    pub dtype: DType,
+    pub score_scale: f32,
+}
+
+pub type AttentionProbeObserver = Arc<dyn Fn(AttentionProbe) -> Result<()> + Send + Sync>;
+
 pub struct Attention {
     qkv_proj: QkvProjection,
     o_proj: TensorParallelRowLinear,
@@ -32,6 +55,7 @@ pub struct Attention {
     head_dim: usize,
     attn_output_gate: bool,
     attn: PagedAttention,
+    score_scale: f32,
     softcapping: Option<f64>,
     dtype: DType,
     full_dim_qk_norm: bool,
@@ -592,6 +616,7 @@ impl Attention {
             None
         };
 
+        let score_scale = attention_scale.unwrap_or(1. / (head_dim as f32).sqrt());
         Ok(Self {
             qkv_proj,
             o_proj,
@@ -604,13 +629,14 @@ impl Attention {
             attn: PagedAttention::new(
                 attention_heads,
                 head_dim,
-                attention_scale.unwrap_or(1. / (head_dim as f32).sqrt()),
+                score_scale,
                 Some(kv_heads),
                 sliding_window,
                 vb.device().clone(),
                 None,
                 config.kvcache_dtype.is_fp8_keys(),
             )?,
+            score_scale,
             softcapping: config.attn_logit_softcapping,
             dtype,
             full_dim_qk_norm,
@@ -692,6 +718,55 @@ impl Attention {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
         q_scale: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        self.forward_ext_with_probe(
+            xs,
+            rotary_emb,
+            attention_mask,
+            positions,
+            cache,
+            input_metadata,
+            q_scale,
+            None,
+        )
+    }
+
+    /// Qwen3 experiment hook. The observer runs only when explicitly supplied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_probe(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+        layer_index: usize,
+        observer: &AttentionProbeObserver,
+    ) -> Result<Tensor> {
+        self.forward_ext_with_probe(
+            xs,
+            rotary_emb,
+            attention_mask,
+            positions,
+            cache,
+            input_metadata,
+            None,
+            Some((layer_index, observer)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_ext_with_probe(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+        q_scale: Option<&Tensor>,
+        probe: Option<(usize, &AttentionProbeObserver)>,
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
 
@@ -813,19 +888,33 @@ impl Attention {
                 .to_dtype(q.dtype())?;
         }
 
-        let y = self
-            .attn
-            .forward(
-                &q,
-                &k,
-                &v,
-                attention_mask,
-                cache.map(|(k_, _)| k_.clone()),
-                cache.map(|(_, v_)| v_.clone()),
-                input_metadata,
-                self.softcapping,
-            )?
-            .reshape((seq_len, ()))?;
+        let context = self.attn.forward(
+            &q,
+            &k,
+            &v,
+            attention_mask,
+            cache.map(|(k_, _)| k_.clone()),
+            cache.map(|(_, v_)| v_.clone()),
+            input_metadata,
+            self.softcapping,
+        )?;
+        if let Some((layer_index, observer)) = probe {
+            observer(AttentionProbe {
+                layer_index,
+                positions: positions.clone(),
+                sequence_ids: input_metadata.sequence_ids.clone(),
+                seqlens: input_metadata.seqlens.clone(),
+                is_prefill: input_metadata.is_prefill,
+                query: q.clone(),
+                context: context.reshape((seq_len, self.num_heads, self.head_dim))?,
+                query_heads: self.num_heads,
+                kv_heads: self.num_kv_heads,
+                head_width: self.head_dim,
+                dtype: q.dtype(),
+                score_scale: self.score_scale,
+            })?;
+        }
+        let y = context.reshape((seq_len, ()))?;
 
         let y = if let Some(gate) = gate {
             let gate = if gate.dtype() != y.dtype() {

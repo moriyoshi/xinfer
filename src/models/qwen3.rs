@@ -1,5 +1,5 @@
 // src/models/qwen3.rs
-use crate::models::layers::attention::Attention;
+use crate::models::layers::attention::{Attention, AttentionProbeObserver};
 use crate::models::layers::distributed::{Comm, VocabParallelLinear};
 use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
@@ -113,17 +113,52 @@ impl Qwen3DecoderLayer {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
     ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let rope: Arc<dyn ApplyRotaryEmbedding> = self.rotary_emb.clone();
-        let attn_output = self.self_attn.forward(
-            &xs,
-            &Some(rope),
+        self.forward_observed(
+            xs,
             attention_mask,
             positions,
             cache,
             input_metadata,
-        )?;
+            0,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_observed(
+        &self,
+        xs: &Tensor,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+        layer_index: usize,
+        observer: Option<&AttentionProbeObserver>,
+    ) -> Result<Tensor> {
+        let residual = xs;
+        let xs = self.input_layernorm.forward(xs)?;
+        let rope: Arc<dyn ApplyRotaryEmbedding> = self.rotary_emb.clone();
+        let attn_output = if let Some(observer) = observer {
+            self.self_attn.forward_with_probe(
+                &xs,
+                &Some(rope),
+                attention_mask,
+                positions,
+                cache,
+                input_metadata,
+                layer_index,
+                observer,
+            )?
+        } else {
+            self.self_attn.forward(
+                &xs,
+                &Some(rope),
+                attention_mask,
+                positions,
+                cache,
+                input_metadata,
+            )?
+        };
         let xs = (attn_output + residual)?;
         let residual = &xs;
         let xs = self.post_attention_layernorm.forward(&xs)?;
@@ -142,6 +177,7 @@ pub struct Qwen3ForCausalLM {
     dtype: DType,
     vocab_size: usize,
     is_qvar_builder: bool,
+    attention_probe_observer: RwLock<Option<AttentionProbeObserver>>,
 }
 
 impl Qwen3ForCausalLM {
@@ -298,7 +334,18 @@ impl Qwen3ForCausalLM {
             dtype,
             vocab_size,
             is_qvar_builder,
+            attention_probe_observer: RwLock::new(None),
         })
+    }
+
+    /// Enable or disable Qwen3 attention observation for subsequent forwards.
+    /// The callback sees device tensors after the attention kernel has run,
+    /// before the output gate and projection. It may copy them to the host.
+    /// Each forward uses the observer selected when that forward began; the
+    /// callback runs without holding this model's observer lock. Callback
+    /// errors abort the forward after that layer's KV cache may have changed.
+    pub fn set_attention_probe_observer(&self, observer: Option<AttentionProbeObserver>) {
+        *self.attention_probe_observer.write() = observer;
     }
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -336,16 +383,19 @@ impl Qwen3ForCausalLM {
         } else {
             self.embed_forward(input_ids)?
         };
+        let observer = self.attention_probe_observer.read().clone();
         if let Some(kv_caches) = kv_caches {
             for ((k_cache, v_cache), (i, layer)) in
                 zip(kv_caches.iter(), self.layers.iter().enumerate())
             {
-                xs = layer.forward(
+                xs = layer.forward_observed(
                     &xs,
                     attention_mask.as_ref(),
                     positions,
                     Some((k_cache, v_cache)),
                     input_metadata,
+                    i,
+                    observer.as_ref(),
                 )?;
                 if let (Some(pos_mask), Some(deepstacks)) =
                     (visual_pos_masks, deepstack_visual_embeds)
