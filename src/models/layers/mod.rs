@@ -14,6 +14,7 @@ pub mod moe_w2_delta;
 pub mod others;
 pub mod qwen4;
 pub mod rotary_emb;
+pub mod sparse_attention;
 pub(crate) mod state_bytes;
 pub mod wna16;
 use crate::utils::downloader::ModelPaths;

@@ -4,6 +4,9 @@ use crate::models::layers::distributed::{
 };
 use crate::models::layers::others::{rms_norm, rms_norm_sharded, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
+use crate::models::layers::sparse_attention::{
+    apply_sparse_attention_heads, SparseAttentionProvider,
+};
 use crate::models::layers::{isq_high_precision_quant, VarBuilderX};
 use crate::utils::config::Config;
 use attention_rs::{InputMetadata, PagedAttention};
@@ -28,6 +31,7 @@ enum QkvProjection {
 /// needs host bytes must copy them explicitly. Rows are in the input's packed
 /// token order, with `seqlens` delimiting sequences during batched prefill.
 /// Retaining these tensors also retains their GPU storage.
+#[derive(Clone)]
 pub struct AttentionProbe {
     pub layer_index: usize,
     pub positions: Tensor,
@@ -36,6 +40,9 @@ pub struct AttentionProbe {
     pub is_prefill: bool,
     pub query: Tensor,   // [tokens, local query heads, head width]
     pub context: Tensor, // [tokens, local query heads, head width]
+    /// Present only when an experimental sparse replacement was applied.
+    /// `context` always remains the native kernel result.
+    pub effective_context: Option<Tensor>,
     pub query_heads: usize,
     pub kv_heads: usize,
     pub head_width: usize,
@@ -44,6 +51,12 @@ pub struct AttentionProbe {
 }
 
 pub type AttentionProbeObserver = Arc<dyn Fn(AttentionProbe) -> Result<()> + Send + Sync>;
+
+struct AttentionHooks<'a> {
+    layer_index: usize,
+    observer: Option<&'a AttentionProbeObserver>,
+    sparse_provider: Option<&'a SparseAttentionProvider>,
+}
 
 pub struct Attention {
     qkv_proj: QkvProjection,
@@ -56,6 +69,7 @@ pub struct Attention {
     attn_output_gate: bool,
     attn: PagedAttention,
     score_scale: f32,
+    sliding_window: Option<usize>,
     softcapping: Option<f64>,
     dtype: DType,
     full_dim_qk_norm: bool,
@@ -637,6 +651,7 @@ impl Attention {
                 config.kvcache_dtype.is_fp8_keys(),
             )?,
             score_scale,
+            sliding_window,
             softcapping: config.attn_logit_softcapping,
             dtype,
             full_dim_qk_norm,
@@ -752,7 +767,42 @@ impl Attention {
             cache,
             input_metadata,
             None,
-            Some((layer_index, observer)),
+            Some(AttentionHooks {
+                layer_index,
+                observer: Some(observer),
+                sparse_provider: None,
+            }),
+        )
+    }
+
+    /// Qwen3 experiment hook for observation and optional exact-token sparse
+    /// context replacement. Native attention still populates the KV cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_hooks(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        attention_mask: Option<&Vec<Tensor>>,
+        positions: &Tensor,
+        cache: Option<(&Tensor, &Tensor)>,
+        input_metadata: &InputMetadata,
+        layer_index: usize,
+        observer: Option<&AttentionProbeObserver>,
+        sparse_provider: Option<&SparseAttentionProvider>,
+    ) -> Result<Tensor> {
+        self.forward_ext_with_probe(
+            xs,
+            rotary_emb,
+            attention_mask,
+            positions,
+            cache,
+            input_metadata,
+            None,
+            Some(AttentionHooks {
+                layer_index,
+                observer,
+                sparse_provider,
+            }),
         )
     }
 
@@ -766,7 +816,7 @@ impl Attention {
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
         q_scale: Option<&Tensor>,
-        probe: Option<(usize, &AttentionProbeObserver)>,
+        hooks: Option<AttentionHooks<'_>>,
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
 
@@ -888,7 +938,7 @@ impl Attention {
                 .to_dtype(q.dtype())?;
         }
 
-        let context = self.attn.forward(
+        let native_context = self.attn.forward(
             &q,
             &k,
             &v,
@@ -898,21 +948,38 @@ impl Attention {
             input_metadata,
             self.softcapping,
         )?;
-        if let Some((layer_index, observer)) = probe {
-            observer(AttentionProbe {
-                layer_index,
+        let mut context = native_context.clone();
+        if let Some(hooks) = hooks {
+            let mut probe = AttentionProbe {
+                layer_index: hooks.layer_index,
                 positions: positions.clone(),
                 sequence_ids: input_metadata.sequence_ids.clone(),
                 seqlens: input_metadata.seqlens.clone(),
                 is_prefill: input_metadata.is_prefill,
                 query: q.clone(),
-                context: context.reshape((seq_len, self.num_heads, self.head_dim))?,
+                context: native_context.reshape((seq_len, self.num_heads, self.head_dim))?,
+                effective_context: None,
                 query_heads: self.num_heads,
                 kv_heads: self.num_kv_heads,
                 head_width: self.head_dim,
                 dtype: q.dtype(),
                 score_scale: self.score_scale,
-            })?;
+            };
+            if let Some(provider) = hooks.sparse_provider {
+                let heads = provider(&probe)?;
+                if let Some(replaced) = apply_sparse_attention_heads(
+                    &probe,
+                    heads,
+                    self.sliding_window,
+                    self.softcapping,
+                )? {
+                    context = replaced.clone();
+                    probe.effective_context = Some(replaced);
+                }
+            }
+            if let Some(observer) = hooks.observer {
+                observer(probe)?;
+            }
         }
         let y = context.reshape((seq_len, ()))?;
 

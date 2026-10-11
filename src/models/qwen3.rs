@@ -5,6 +5,7 @@ use crate::models::layers::mask::get_attention_causal_mask;
 use crate::models::layers::mlp::MLP;
 use crate::models::layers::others::{embedding, rms_norm, NormX};
 use crate::models::layers::rotary_emb::{ApplyRotaryEmbedding, ScalingRotaryEmbedding};
+use crate::models::layers::sparse_attention::SparseAttentionProvider;
 use crate::models::layers::VarBuilderX;
 use crate::utils::config::Config;
 use crate::utils::progress::ProgressLike;
@@ -121,6 +122,7 @@ impl Qwen3DecoderLayer {
             input_metadata,
             0,
             None,
+            None,
         )
     }
 
@@ -134,12 +136,13 @@ impl Qwen3DecoderLayer {
         input_metadata: &InputMetadata,
         layer_index: usize,
         observer: Option<&AttentionProbeObserver>,
+        sparse_provider: Option<&SparseAttentionProvider>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
         let rope: Arc<dyn ApplyRotaryEmbedding> = self.rotary_emb.clone();
-        let attn_output = if let Some(observer) = observer {
-            self.self_attn.forward_with_probe(
+        let attn_output = if observer.is_some() || sparse_provider.is_some() {
+            self.self_attn.forward_with_hooks(
                 &xs,
                 &Some(rope),
                 attention_mask,
@@ -148,6 +151,7 @@ impl Qwen3DecoderLayer {
                 input_metadata,
                 layer_index,
                 observer,
+                sparse_provider,
             )?
         } else {
             self.self_attn.forward(
@@ -178,6 +182,7 @@ pub struct Qwen3ForCausalLM {
     vocab_size: usize,
     is_qvar_builder: bool,
     attention_probe_observer: RwLock<Option<AttentionProbeObserver>>,
+    sparse_attention_provider: RwLock<Option<SparseAttentionProvider>>,
 }
 
 impl Qwen3ForCausalLM {
@@ -335,6 +340,7 @@ impl Qwen3ForCausalLM {
             vocab_size,
             is_qvar_builder,
             attention_probe_observer: RwLock::new(None),
+            sparse_attention_provider: RwLock::new(None),
         })
     }
 
@@ -346,6 +352,16 @@ impl Qwen3ForCausalLM {
     /// errors abort the forward after that layer's KV cache may have changed.
     pub fn set_attention_probe_observer(&self, observer: Option<AttentionProbeObserver>) {
         *self.attention_probe_observer.write() = observer;
+    }
+
+    /// Enable an experimental one-or-more-head exact sparse context override.
+    /// The provider receives the native query and context after KV admission.
+    /// It supplies post-RoPE K/V with original logical positions; Xinfer
+    /// validates the complete exact tail/suffix and applies one softmax over
+    /// retained old keys and the exact region. This CPU path is for quality
+    /// probes, and callback errors require discarding the affected KV cache.
+    pub fn set_sparse_attention_provider(&self, provider: Option<SparseAttentionProvider>) {
+        *self.sparse_attention_provider.write() = provider;
     }
 
     pub fn embed_forward(&self, xs: &Tensor) -> Result<Tensor> {
@@ -384,6 +400,7 @@ impl Qwen3ForCausalLM {
             self.embed_forward(input_ids)?
         };
         let observer = self.attention_probe_observer.read().clone();
+        let sparse_provider = self.sparse_attention_provider.read().clone();
         if let Some(kv_caches) = kv_caches {
             for ((k_cache, v_cache), (i, layer)) in
                 zip(kv_caches.iter(), self.layers.iter().enumerate())
@@ -396,6 +413,7 @@ impl Qwen3ForCausalLM {
                     input_metadata,
                     i,
                     observer.as_ref(),
+                    sparse_provider.as_ref(),
                 )?;
                 if let (Some(pos_mask), Some(deepstacks)) =
                     (visual_pos_masks, deepstack_visual_embeds)
