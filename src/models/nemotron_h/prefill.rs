@@ -6,12 +6,13 @@
 use super::{Mamba2, MambaState};
 use candle_core::cuda_backend::cudarc::driver::{capture_status, sys::CUstreamCaptureStatus};
 use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr, LaunchAsync, LaunchConfig};
-use candle_core::cuda_backend::cudarc::nvrtc::compile_ptx;
+use candle_core::cuda_backend::cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use candle_core::{DType, Result, Storage, Tensor};
 use std::sync::Mutex;
 
 const PREPARE: &str = "nemotron_mamba_prepare";
 const SCAN: &str = "nemotron_mamba_scan";
+const STEP: &str = "nemotron_mamba_step";
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
 #[repr(C)]
@@ -26,8 +27,10 @@ struct Params {
     conv_dim: i32,
     in_dim: i32,
     projected_dtype: i32, // 0 BF16, 1 F16, 2 F32
+    output_dtype: i32,
     dt_min: f32,
     dt_max: f32,
+    eps: f32,
 }
 
 unsafe impl DeviceRepr for Params {}
@@ -40,6 +43,15 @@ fn as_i32(value: usize) -> Result<i32> {
 fn as_u32(value: usize) -> Result<u32> {
     u32::try_from(value)
         .map_err(|_| candle_core::Error::Msg("Nemotron Mamba prefill grid exceeds u32".into()))
+}
+
+fn dtype_code(dtype: DType) -> Result<i32> {
+    match dtype {
+        DType::BF16 => Ok(0),
+        DType::F16 => Ok(1),
+        DType::F32 => Ok(2),
+        _ => candle_core::bail!("unsupported Nemotron Mamba CUDA dtype {dtype:?}"),
+    }
 }
 
 fn pointer(tensor: &Tensor) -> Result<u64> {
@@ -82,6 +94,56 @@ pub(super) fn supported(mixer: &Mamba2, projected: &Tensor) -> bool {
         && matches!(projected.dtype(), DType::BF16 | DType::F16 | DType::F32)
 }
 
+pub(super) fn supported_step(mixer: &Mamba2, projected: &Tensor) -> bool {
+    let sm = mixer
+        .device
+        .as_cuda_device()
+        .ok()
+        .and_then(|device| attention_rs::cuda_utils::sm_version(&device.cuda_device()))
+        .unwrap_or(0);
+    mixer.device.is_cuda()
+        && sm >= 80
+        && mixer.state_dim == 128
+        && mixer.kernel >= 2
+        && mixer.groups > 0
+        && mixer.heads.is_multiple_of(mixer.groups)
+        && mixer.heads * mixer.head_dim / mixer.groups >= 256
+        && matches!(projected.dtype(), DType::BF16 | DType::F16 | DType::F32)
+        && matches!(mixer.dtype, DType::BF16 | DType::F16 | DType::F32)
+}
+
+fn module(mixer: &Mamba2) -> Result<String> {
+    let device = mixer.device.as_cuda_device()?.cuda_device();
+    let sm = attention_rs::cuda_utils::sm_version(mixer.device.as_cuda_device()?)
+        .ok_or_else(|| candle_core::Error::Msg("unknown Mamba CUDA compute capability".into()))?;
+    let module = format!("xinfer_nemotron_mamba_h{}_sm{}_v3", mixer.head_dim, sm);
+    let _guard = COMPILE_LOCK.lock().unwrap();
+    if !device.has_func(&module, PREPARE) {
+        let capture = capture_status(*device.cu_stream())
+            .map_err(|e| candle_core::Error::Msg(format!("check Mamba CUDA capture: {e}")))?;
+        if capture == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE {
+            candle_core::bail!("Nemotron Mamba CUDA kernels must be loaded before graph capture")
+        }
+        let source = format!(
+            "#define HEAD_DIM {}\n{}",
+            mixer.head_dim,
+            include_str!("prefill/scan.cu")
+        );
+        let ptx = compile_ptx_with_opts(
+            source,
+            CompileOptions {
+                options: vec![format!("--gpu-architecture=compute_{sm}")],
+                ..Default::default()
+            },
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("compile Mamba CUDA: {e}")))?;
+        device
+            .load_ptx(ptx, &module, &[PREPARE, SCAN, STEP])
+            .map_err(|e| candle_core::Error::Msg(format!("load Mamba CUDA PTX: {e}")))?;
+    }
+    Ok(module)
+}
+
 pub(super) fn run(mixer: &Mamba2, projected: &Tensor, state: &mut MambaState) -> Result<Tensor> {
     let tokens = projected.dim(0)?;
     let inner = mixer.heads * mixer.head_dim;
@@ -100,22 +162,7 @@ pub(super) fn run(mixer: &Mamba2, projected: &Tensor, state: &mut MambaState) ->
     if capture == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE {
         candle_core::bail!("Nemotron Mamba span prefill cannot run during CUDA graph capture")
     }
-    let module = format!("xinfer_nemotron_mamba_prefill_h{}_v1", mixer.head_dim);
-    {
-        let _guard = COMPILE_LOCK.lock().unwrap();
-        if !device.has_func(&module, PREPARE) {
-            let source = format!(
-                "#define HEAD_DIM {}\n{}",
-                mixer.head_dim,
-                include_str!("prefill/scan.cu")
-            );
-            let ptx = compile_ptx(source)
-                .map_err(|e| candle_core::Error::Msg(format!("compile Mamba prefill: {e}")))?;
-            device
-                .load_ptx(ptx, &module, &[PREPARE, SCAN])
-                .map_err(|e| candle_core::Error::Msg(format!("load Mamba prefill PTX: {e}")))?;
-        }
-    }
+    let module = module(mixer)?;
     let projected = projected.contiguous()?;
     let conv = Tensor::zeros((tokens, mixer.conv_dim), DType::F32, &mixer.device)?;
     let next_conv = Tensor::zeros(
@@ -139,14 +186,11 @@ pub(super) fn run(mixer: &Mamba2, projected: &Tensor, state: &mut MambaState) ->
         kernel: as_i32(mixer.kernel)?,
         conv_dim: as_i32(mixer.conv_dim)?,
         in_dim: as_i32(in_dim)?,
-        projected_dtype: match projected.dtype() {
-            DType::BF16 => 0,
-            DType::F16 => 1,
-            DType::F32 => 2,
-            _ => unreachable!(),
-        },
+        projected_dtype: dtype_code(projected.dtype())?,
+        output_dtype: dtype_code(mixer.dtype)?,
         dt_min: mixer.dt_limit.0 as f32,
         dt_max: mixer.dt_limit.1 as f32,
+        eps: mixer.eps as f32,
     };
     let work = tokens
         .checked_mul(mixer.conv_dim)
@@ -223,6 +267,85 @@ pub(super) fn run(mixer: &Mamba2, projected: &Tensor, state: &mut MambaState) ->
         .reshape((tokens, inner))?
         .broadcast_mul(&mixer.norm_weight)?;
     mixer.out_proj.forward(&normalized.to_dtype(mixer.dtype)?)
+}
+
+/// One launch updates the carried conv/SSM state and writes the normalized
+/// output of a single decode token. The projection remains a GEMV.
+pub(super) fn run_step(
+    mixer: &Mamba2,
+    projected: &Tensor,
+    state: &mut MambaState,
+) -> Result<Tensor> {
+    let inner = mixer.heads * mixer.head_dim;
+    let in_dim = inner + mixer.conv_dim + mixer.heads;
+    if !supported_step(mixer, projected)
+        || projected.dims() != [in_dim]
+        || state.conv.dims() != [mixer.kernel - 1, mixer.conv_dim]
+        || state.ssm.dims() != [mixer.heads, mixer.head_dim, mixer.state_dim]
+    {
+        candle_core::bail!("unsupported Nemotron Mamba decode shape")
+    }
+    let module = module(mixer)?;
+    let device = mixer.device.as_cuda_device()?.cuda_device();
+    let normalized = Tensor::zeros((1, inner), mixer.dtype, &mixer.device)?;
+    let next_conv = Tensor::zeros(
+        (mixer.kernel - 1, mixer.conv_dim),
+        DType::F32,
+        &mixer.device,
+    )?;
+    let next_ssm = Tensor::zeros(
+        (mixer.heads, mixer.head_dim, mixer.state_dim),
+        DType::F32,
+        &mixer.device,
+    )?;
+    let params = Params {
+        tokens: 1,
+        heads: as_i32(mixer.heads)?,
+        head_dim: as_i32(mixer.head_dim)?,
+        groups: as_i32(mixer.groups)?,
+        state_dim: as_i32(mixer.state_dim)?,
+        kernel: as_i32(mixer.kernel)?,
+        conv_dim: as_i32(mixer.conv_dim)?,
+        in_dim: as_i32(in_dim)?,
+        projected_dtype: dtype_code(projected.dtype())?,
+        output_dtype: dtype_code(mixer.dtype)?,
+        dt_min: mixer.dt_limit.0 as f32,
+        dt_max: mixer.dt_limit.1 as f32,
+        eps: mixer.eps as f32,
+    };
+    let group_rows = inner / mixer.groups;
+    let shared_bytes = as_u32((256 + group_rows + 256) * std::mem::size_of::<f32>())?;
+    let kernel = device
+        .get_func(&module, STEP)
+        .ok_or_else(|| candle_core::Error::Msg("missing Mamba decode kernel".into()))?;
+    unsafe {
+        kernel.launch(
+            LaunchConfig {
+                grid_dim: (as_u32(mixer.groups)?, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared_bytes,
+            },
+            (
+                pointer(projected)?,
+                pointer(&state.conv)?,
+                pointer(&next_conv)?,
+                pointer(&mixer.conv_weight)?,
+                pointer(&mixer.conv_bias)?,
+                pointer(&mixer.dt_bias)?,
+                pointer(&mixer.a)?,
+                pointer(&mixer.d)?,
+                pointer(&mixer.norm_weight)?,
+                pointer(&state.ssm)?,
+                pointer(&next_ssm)?,
+                pointer(&normalized)?,
+                params,
+            ),
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("launch Mamba decode: {e}")))?;
+    state.conv = next_conv;
+    state.ssm = next_ssm;
+    mixer.out_proj.forward(&normalized)
 }
 
 #[cfg(test)]

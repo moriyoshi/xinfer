@@ -4,6 +4,8 @@
 mod compact_state;
 mod expert_cache;
 mod expert_snapshot;
+#[cfg(all(feature = "cuda", feature = "cutlass"))]
+mod grouped_moe;
 #[cfg(feature = "cuda")]
 mod prefill;
 mod state;
@@ -36,6 +38,7 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io::Write;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -126,6 +129,13 @@ impl NemotronConfig {
 struct MambaState {
     conv: Tensor, // [kernel - 1, conv_dim], oldest first
     ssm: Tensor,  // [heads, head_dim, state_dim], always F32
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MambaForwardMode {
+    FastPrefill,
+    FusedDecode,
+    Tokenwise,
 }
 
 struct Mamba2 {
@@ -299,10 +309,10 @@ impl Mamba2 {
         states: &mut HashMap<usize, Vec<Option<MambaState>>>,
         layer: usize,
         num_layers: usize,
-        fast_prefill: bool,
+        mode: MambaForwardMode,
     ) -> Result<Tensor> {
         let projected = self.in_proj.forward(xs)?;
-        let mut outputs = Vec::with_capacity(if fast_prefill {
+        let mut outputs = Vec::with_capacity(if mode == MambaForwardMode::FastPrefill {
             spans.len()
         } else {
             xs.dim(0)?
@@ -319,7 +329,10 @@ impl Mamba2 {
                 }
             };
             #[cfg(feature = "cuda")]
-            if fast_prefill && end - start > 1 && prefill::supported(self, &projected) {
+            if mode == MambaForwardMode::FastPrefill
+                && end - start > 1
+                && prefill::supported(self, &projected)
+            {
                 outputs.push(prefill::run(
                     self,
                     &projected.narrow(0, start, end - start)?,
@@ -328,9 +341,15 @@ impl Mamba2 {
                 continue;
             }
             #[cfg(not(feature = "cuda"))]
-            let _ = fast_prefill;
+            let _ = mode;
             for index in start..end {
-                outputs.push(self.step(&projected.get(index)?, state)?);
+                let row = projected.get(index)?;
+                #[cfg(feature = "cuda")]
+                if mode == MambaForwardMode::FusedDecode && prefill::supported_step(self, &row) {
+                    outputs.push(prefill::run_step(self, &row, state)?);
+                    continue;
+                }
+                outputs.push(self.step(&row, state)?);
             }
         }
         if outputs.len() == 1 {
@@ -379,6 +398,8 @@ impl NemotronMlp {
 
 enum ExpertStore {
     Eager(Vec<NemotronMlp>),
+    #[cfg(all(feature = "cuda", feature = "cutlass"))]
+    Grouped(Box<grouped_moe::GroupedNvfp4Experts>),
     Lazy {
         count: usize,
         layer: usize,
@@ -387,11 +408,42 @@ enum ExpertStore {
 }
 
 struct NemotronMoe {
+    layer: usize,
     gate: ReplicatedLinear,
     routing: MoeRouting,
     shared: NemotronMlp,
     experts: ExpertStore,
     hidden: usize,
+}
+
+// Opt-in binary trace for real-checkpoint route parity probes. It is kept out
+// of the normal path because reading IDs to the host would serialize CUDA.
+fn trace_nemotron_routes(layer: usize, ids: &Tensor) -> Result<Option<Vec<Vec<u32>>>> {
+    let Some(path) = std::env::var_os("XINFER_NEMOTRON_ROUTING_TRACE") else {
+        return Ok(None);
+    };
+    let routes = ids.to_vec2::<u32>()?;
+    let rows = u32::try_from(routes.len())
+        .map_err(|_| candle_core::Error::Msg("Nemotron route rows overflow u32".into()))?;
+    let topk = u32::try_from(routes.first().map_or(0, Vec::len))
+        .map_err(|_| candle_core::Error::Msg("Nemotron route top-k overflow u32".into()))?;
+    let mut bytes = Vec::with_capacity(16 + routes.len() * topk as usize * 4);
+    bytes.extend_from_slice(b"XNRT");
+    for word in [layer as u32, rows, topk] {
+        bytes.extend_from_slice(&word.to_le_bytes());
+    }
+    for row in &routes {
+        for &id in row {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(&bytes))
+        .map_err(candle_core::Error::wrap)?;
+    Ok(Some(routes))
 }
 
 impl NemotronMoe {
@@ -449,9 +501,33 @@ impl NemotronMoe {
                     dtype,
                 )?);
             }
+            #[cfg(all(feature = "cuda", feature = "cutlass"))]
+            // Use the grouped path only where attention-rs selects native FP4
+            // tensor cores. The diagnostic toggle permits eager comparisons.
+            if vb.device().is_cuda()
+                && vb
+                    .device()
+                    .as_cuda_device()
+                    .ok()
+                    .and_then(|device| attention_rs::cuda_utils::sm_version(device))
+                    .unwrap_or(0)
+                    >= 100
+                && std::env::var_os("XINFER_NEMOTRON_GROUPED_MOE").as_deref()
+                    != Some(std::ffi::OsStr::new("0"))
+            {
+                if let Some(grouped) = grouped_moe::GroupedNvfp4Experts::from_experts(&experts)? {
+                    ExpertStore::Grouped(Box::new(grouped))
+                } else {
+                    ExpertStore::Eager(experts)
+                }
+            } else {
+                ExpertStore::Eager(experts)
+            }
+            #[cfg(not(all(feature = "cuda", feature = "cutlass")))]
             ExpertStore::Eager(experts)
         };
         Ok(Self {
+            layer,
             gate,
             routing,
             shared,
@@ -464,10 +540,20 @@ impl NemotronMoe {
         let rows = xs.dim(0)?;
         let logits = self.gate.forward(&xs.to_dtype(DType::F32)?)?;
         let (weights, ids) = self.routing.route(&logits, is_prefill)?;
-        let ids = ids.to_vec2::<u32>()?;
+        let traced_ids = trace_nemotron_routes(self.layer, &ids)?;
+        #[cfg(all(feature = "cuda", feature = "cutlass"))]
+        if let ExpertStore::Grouped(grouped) = &self.experts {
+            return grouped.forward(xs, &self.shared, &weights, &ids, is_prefill);
+        }
+        let ids = match traced_ids {
+            Some(ids) => ids,
+            None => ids.to_vec2::<u32>()?,
+        };
         let weights = weights.to_vec2::<f32>()?;
         let count = match &self.experts {
             ExpertStore::Eager(experts) => experts.len(),
+            #[cfg(all(feature = "cuda", feature = "cutlass"))]
+            ExpertStore::Grouped(_) => unreachable!(),
             ExpertStore::Lazy { count, .. } => *count,
         };
         let mut assignments = vec![Vec::<(u32, f32)>::new(); count];
@@ -486,12 +572,16 @@ impl NemotronMoe {
             // the original expert order and its exact packed checkpoint data.
             let selected = match &self.experts {
                 ExpertStore::Eager(_) => None,
+                #[cfg(all(feature = "cuda", feature = "cutlass"))]
+                ExpertStore::Grouped(_) => unreachable!(),
                 ExpertStore::Lazy { layer, cache, .. } => {
                     Some(ExpertCache::resolve_shared(cache, *layer, index)?)
                 }
             };
             let expert: &NemotronMlp = match &self.experts {
                 ExpertStore::Eager(experts) => &experts[index],
+                #[cfg(all(feature = "cuda", feature = "cutlass"))]
+                ExpertStore::Grouped(_) => unreachable!(),
                 ExpertStore::Lazy { .. } => selected.as_ref().unwrap(),
             };
             let indices = assigned.iter().map(|(token, _)| *token).collect::<Vec<_>>();
@@ -537,6 +627,7 @@ pub struct NemotronHForCausalLM {
     prefix_capacity: AtomicUsize,
     expert_cache: Option<Arc<Mutex<ExpertCache>>>,
     mamba_prefill_fast_enabled: AtomicBool,
+    mamba_decode_fused_enabled: AtomicBool,
 }
 
 impl NemotronHForCausalLM {
@@ -701,14 +792,22 @@ impl NemotronHForCausalLM {
             prefix_capacity: AtomicUsize::new(0),
             expert_cache,
             mamba_prefill_fast_enabled: AtomicBool::new(true),
+            mamba_decode_fused_enabled: AtomicBool::new(true),
         })
     }
 
     /// Use the token-wise Mamba path for a controlled prefill comparison.
-    /// Decode always uses that path. A change takes effect on the next forward
-    /// call; callers must not change it concurrently with a forward call.
+    /// A change takes effect on the next forward call; callers must not change
+    /// it concurrently with a forward call.
     pub fn set_mamba_prefill_fast_enabled(&self, enabled: bool) {
         self.mamba_prefill_fast_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Select the one-kernel CUDA Mamba decode step. Changes take effect on
+    /// the next forward call; do not toggle this concurrently with a call.
+    pub fn set_mamba_decode_fused_enabled(&self, enabled: bool) {
+        self.mamba_decode_fused_enabled
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -914,14 +1013,20 @@ impl NemotronHForCausalLM {
         for (i, block) in self.layers.iter().enumerate() {
             let input = block.norm.forward(&xs)?;
             let output = match &block.mixer {
-                Mixer::Mamba(m) => m.forward(
-                    &input,
-                    &spans,
-                    &mut states,
-                    i,
-                    self.layers.len(),
-                    metadata.is_prefill && self.mamba_prefill_fast_enabled.load(Ordering::Relaxed),
-                )?,
+                Mixer::Mamba(m) => {
+                    let mode = if metadata.is_prefill
+                        && self.mamba_prefill_fast_enabled.load(Ordering::Relaxed)
+                    {
+                        MambaForwardMode::FastPrefill
+                    } else if !metadata.is_prefill
+                        && self.mamba_decode_fused_enabled.load(Ordering::Relaxed)
+                    {
+                        MambaForwardMode::FusedDecode
+                    } else {
+                        MambaForwardMode::Tokenwise
+                    };
+                    m.forward(&input, &spans, &mut states, i, self.layers.len(), mode)?
+                }
                 Mixer::Attention(attn) => {
                     let cache = kv_caches.map(|all| {
                         let pair = &all[kv_index];
@@ -1199,6 +1304,7 @@ mod tests {
             })
         };
         let moe = NemotronMoe {
+            layer: 0,
             gate: linear(vec![0.0, 0.0, 1.0, 0.0, 2.0, 0.0], (3, 2))?,
             routing: MoeRouting {
                 e_score_correction_bias: Some(Tensor::new(&[1.0f32, 0.0, 0.0], &device)?),
@@ -1279,8 +1385,14 @@ mod tests {
 
         let mut states = HashMap::new();
         let packed = tensor(vec![1.0, 1.0, 1.0], vec![3, 1])?;
-        let outputs =
-            mixer.forward(&packed, &[(10, 0, 2), (20, 2, 3)], &mut states, 0, 1, false)?;
+        let outputs = mixer.forward(
+            &packed,
+            &[(10, 0, 2), (20, 2, 3)],
+            &mut states,
+            0,
+            1,
+            MambaForwardMode::Tokenwise,
+        )?;
         assert_eq!(outputs.dims(), &[3, 1]);
         let for_id = |id| {
             states[&id][0]

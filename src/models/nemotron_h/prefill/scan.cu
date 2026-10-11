@@ -11,8 +11,10 @@ struct Params {
     int conv_dim;
     int in_dim;
     int projected_dtype;
+    int output_dtype;
     float dt_min;
     float dt_max;
+    float eps;
 };
 
 __device__ __forceinline__ float half_bits_to_float(uint16_t bits) {
@@ -33,6 +35,20 @@ __device__ __forceinline__ float half_bits_to_float(uint16_t bits) {
             ? sign | 0x7f800000u | (mantissa << 13)
             : sign | (uint32_t(exponent + 112) << 23) | (mantissa << 13);
     return __uint_as_float(f32_bits);
+}
+
+__device__ __forceinline__ void store_projected(void* output, int index, float value, int dtype) {
+    if (dtype == 0) {
+        uint16_t bits;
+        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(bits) : "f"(value));
+        static_cast<uint16_t*>(output)[index] = bits;
+    } else if (dtype == 1) {
+        uint16_t bits;
+        asm("cvt.rn.f16.f32 %0, %1;" : "=h"(bits) : "f"(value));
+        static_cast<uint16_t*>(output)[index] = bits;
+    } else {
+        static_cast<float*>(output)[index] = value;
+    }
 }
 
 __device__ __forceinline__ float projected_at(const void* projected, int index, int dtype) {
@@ -150,5 +166,93 @@ extern "C" __global__ void nemotron_mamba_scan(
         const int offset = (head * HEAD_DIM + row) * 128 + channel;
         #pragma unroll
         for (int j = 0; j < 4; ++j) final_state[offset + j] = state[r][j];
+    }
+}
+
+// Single-token decode. A block owns one Mamba group and writes its disjoint
+// conv/SSM state to fresh buffers. The block also reduces its grouped RMSNorm, so the
+// only subsequent operation is out_proj's GEMV. No atomics or host reads.
+extern "C" __global__ void nemotron_mamba_step(
+    const void* projected, const float* history, float* next_history, const float* weight,
+    const float* bias, const float* dt_bias, const float* a, const float* d,
+    const float* norm_weight, const float* state, float* next_state,
+    void* normalized, Params p) {
+    const int group = int(blockIdx.x);
+    const int lane = int(threadIdx.x);
+    const int inner = p.heads * p.head_dim;
+    const int heads_per_group = p.heads / p.groups;
+    const int group_rows = heads_per_group * p.head_dim;
+    extern __shared__ float scratch[];
+    float* bc = scratch;                       // 128 B + 128 C values
+    float* gated = scratch + 256;             // group_rows values
+    float* reduction = gated + group_rows;    // 256 values
+
+    const int bc_channel = lane < 128
+        ? inner + group * 128 + lane
+        : inner + p.groups * 128 + group * 128 + lane - 128;
+    float conv_sum = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < p.kernel - 1; ++k) {
+        conv_sum += history[k * p.conv_dim + bc_channel] * weight[k * p.conv_dim + bc_channel];
+    }
+    const float bc_input = projected_at(projected, inner + bc_channel, p.projected_dtype);
+    conv_sum += bc_input * weight[(p.kernel - 1) * p.conv_dim + bc_channel];
+    conv_sum += bias[bc_channel];
+    bc[lane] = conv_sum / (1.0f + expf(-conv_sum));
+    for (int k = 0; k < p.kernel - 2; ++k) {
+        next_history[k * p.conv_dim + bc_channel] = history[(k + 1) * p.conv_dim + bc_channel];
+    }
+    next_history[(p.kernel - 2) * p.conv_dim + bc_channel] = bc_input;
+    __syncthreads();
+
+    for (int local_row = lane; local_row < group_rows; local_row += blockDim.x) {
+        const int head = group * heads_per_group + local_row / p.head_dim;
+        const int global_row = head * p.head_dim + local_row % p.head_dim;
+        float x_sum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < p.kernel - 1; ++k) {
+            x_sum += history[k * p.conv_dim + global_row] * weight[k * p.conv_dim + global_row];
+        }
+        const float x_input = projected_at(projected, inner + global_row, p.projected_dtype);
+        x_sum += x_input * weight[(p.kernel - 1) * p.conv_dim + global_row];
+        x_sum += bias[global_row];
+        const float x = x_sum / (1.0f + expf(-x_sum));
+        for (int k = 0; k < p.kernel - 2; ++k) {
+            next_history[k * p.conv_dim + global_row] = history[(k + 1) * p.conv_dim + global_row];
+        }
+        next_history[(p.kernel - 2) * p.conv_dim + global_row] = x_input;
+
+        const float raw = projected_at(projected, inner + p.conv_dim + head, p.projected_dtype)
+            + dt_bias[head];
+        const float dt = fminf(fmaxf(fmaxf(raw, 0.0f) + log1pf(expf(-fabsf(raw))), p.dt_min), p.dt_max);
+        const float decay = expf(dt * a[head]);
+        float y = 0.0f;
+        const int state_base = global_row * 128;
+        #pragma unroll 4
+        for (int channel = 0; channel < 128; ++channel) {
+            const float updated = decay * state[state_base + channel]
+                + (dt * x) * bc[channel];
+            next_state[state_base + channel] = updated;
+            y += updated * bc[128 + channel];
+        }
+        y += d[head] * x;
+        const float gate = projected_at(projected, global_row, p.projected_dtype);
+        gated[local_row] = y * (gate / (1.0f + expf(-gate)));
+    }
+    __syncthreads();
+    float sumsq = 0.0f;
+    for (int row = lane; row < group_rows; row += blockDim.x) {
+        sumsq += gated[row] * gated[row];
+    }
+    reduction[lane] = sumsq;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) reduction[lane] += reduction[lane + stride];
+        __syncthreads();
+    }
+    const float inv_rms = rsqrtf(reduction[0] / float(group_rows) + p.eps);
+    for (int row = lane; row < group_rows; row += blockDim.x) {
+        const int global_row = group * group_rows + row;
+        store_projected(normalized, global_row, gated[row] * inv_rms * norm_weight[global_row], p.output_dtype);
     }
 }

@@ -2,9 +2,8 @@ use super::*;
 use crate::models::layers::distributed::ReplicatedLinear;
 use candle_core::Device;
 
-fn fixture(device: &Device) -> Result<(Mamba2, Tensor)> {
+fn fixture(device: &Device, head_dim: usize) -> Result<(Mamba2, Tensor)> {
     let heads = 8;
-    let head_dim = 8;
     let groups = 2;
     let state_dim = 128;
     let kernel = 4;
@@ -75,7 +74,7 @@ fn span_scan_matches_steps_and_keeps_continued_state() -> Result<()> {
         Ok(device) => device,
         Err(_) => return Ok(()),
     };
-    let (mixer, projected) = fixture(&device)?;
+    let (mixer, projected) = fixture(&device, 8)?;
     let mut initial = mixer.zero_state()?;
     initial.conv = Tensor::from_vec(
         (0..(mixer.kernel - 1) * mixer.conv_dim)
@@ -144,5 +143,61 @@ fn span_scan_matches_steps_and_keeps_continued_state() -> Result<()> {
         fast_state.ssm.flatten_all()?.to_vec1::<f32>()?,
         repeated.ssm.flatten_all()?.to_vec1::<f32>()?
     );
+    Ok(())
+}
+
+#[test]
+fn fused_decode_step_matches_candle_and_is_deterministic() -> Result<()> {
+    let device = match Device::new_cuda(0) {
+        Ok(device) => device,
+        Err(_) => return Ok(()),
+    };
+    let (mixer, projected) = fixture(&device, 64)?;
+    let row = projected.get(0)?;
+    let mut initial = mixer.zero_state()?;
+    initial.conv = Tensor::from_vec(
+        (0..(mixer.kernel - 1) * mixer.conv_dim)
+            .map(|i| (i % 23) as f32 * 0.003)
+            .collect::<Vec<_>>(),
+        (mixer.kernel - 1, mixer.conv_dim),
+        &device,
+    )?;
+    initial.ssm = Tensor::from_vec(
+        (0..mixer.heads * mixer.head_dim * mixer.state_dim)
+            .map(|i| (i % 31) as f32 * 0.001)
+            .collect::<Vec<_>>(),
+        (mixer.heads, mixer.head_dim, mixer.state_dim),
+        &device,
+    )?;
+    let mut old = initial.clone();
+    let mut fused = initial.clone();
+    let expected = mixer
+        .step(&row, &mut old)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let actual = run_step(&mixer, &row, &mut fused)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let max_output = expected
+        .iter()
+        .zip(&actual)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let old_ssm = old.ssm.flatten_all()?.to_vec1::<f32>()?;
+    let fused_ssm = fused.ssm.flatten_all()?.to_vec1::<f32>()?;
+    let max_state = old_ssm
+        .iter()
+        .zip(&fused_ssm)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_output < 5e-3, "decode output max abs {max_output}");
+    assert!(max_state < 5e-5, "decode state max abs {max_state}");
+
+    let mut repeated = initial;
+    let repeat = run_step(&mixer, &row, &mut repeated)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert_eq!(actual, repeat);
+    assert_eq!(fused_ssm, repeated.ssm.flatten_all()?.to_vec1::<f32>()?);
     Ok(())
 }
