@@ -7,7 +7,8 @@ use anyhow::{ensure, Context, Result};
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Tensor};
 use parking_lot::RwLock;
-use std::{path::Path, rc::Rc, sync::Arc, time::Instant};
+use sha2::{Digest, Sha256};
+use std::{io::Write, path::Path, rc::Rc, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 use xinfer::{
     models::{
@@ -159,6 +160,149 @@ fn top1(logits: &[f32]) -> usize {
         .max_by(|left, right| left.1.total_cmp(right.1))
         .unwrap()
         .0
+}
+
+fn logit_bytes(logits: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(logits.len() * 4);
+    for &value in logits {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn real_30b_moe_prefill_and_decode_benchmark() -> Result<()> {
+    if std::env::var_os("XINFER_NEMOTRON_MOE_BENCH").is_none() {
+        return Ok(());
+    }
+    let directory = std::env::var_os("XINFER_NEMOTRON_PREFILL_CHECKPOINT")
+        .context("XINFER_NEMOTRON_PREFILL_CHECKPOINT is required")?;
+    let directory = Path::new(&directory);
+    let length = std::env::var("XINFER_NEMOTRON_PREFILL_TOKENS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(2048);
+    let steps = 256;
+    if let Some(path) = std::env::var_os("XINFER_NEMOTRON_ROUTING_TRACE") {
+        std::fs::File::create(path)?;
+    }
+    let device = Device::new_cuda(0)?;
+    let free_before = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()?.0;
+    let began = Instant::now();
+    let (model, config) = load(directory, &device)?;
+    device.synchronize()?;
+    let free_after = candle_core::cuda_backend::cudarc::driver::result::mem_get_info()?.0;
+    eprintln!(
+        "model_gpu_used_delta_bytes={}",
+        free_before.saturating_sub(free_after)
+    );
+    model.set_mamba_decode_fused_enabled(
+        std::env::var_os("XINFER_NEMOTRON_FUSED_DECODE").as_deref()
+            != Some(std::ffi::OsStr::new("0")),
+    );
+    eprintln!(
+        "model_load_ms={:.3}",
+        began.elapsed().as_secs_f64() * 1000.0
+    );
+    let tokenizer =
+        Tokenizer::from_file(directory.join("tokenizer.json")).map_err(anyhow::Error::msg)?;
+    let sample = tokenizer
+        .encode(
+            "A long document can mix history, engineering, mathematics, and everyday language. The model must continue each sentence from its exact preceding context. ",
+            false,
+        )
+        .map_err(anyhow::Error::msg)?
+        .get_ids()
+        .to_vec();
+    let tokens = sample
+        .iter()
+        .copied()
+        .cycle()
+        .take(length + steps)
+        .collect::<Vec<_>>();
+    let kv = cache(&config, length + steps, &device)?;
+    let (prefix_logits, prefill_ms) = prefill(&model, &device, &kv, 0, &tokens[..length], true)?;
+    eprintln!(
+        "prefill_tokens={length} prefill_ms={prefill_ms:.3} prefill_ms_per_token={:.6}",
+        prefill_ms / length as f64
+    );
+    let check_repeat = std::env::var_os("XINFER_NEMOTRON_CHECK_DETERMINISM").is_some();
+    let prefix_state = check_repeat
+        .then(|| model.export_mamba_state_bytes(0, length as u64, [0; 32]))
+        .transpose()?;
+    let mut output = std::env::var_os("XINFER_NEMOTRON_LOGITS_FILE")
+        .map(std::fs::File::create)
+        .transpose()?
+        .map(std::io::BufWriter::new);
+    if let Some(file) = output.as_mut() {
+        file.write_all(&logit_bytes(&prefix_logits))?;
+    }
+    let mut times = Vec::with_capacity(steps);
+    let mut hashes = Vec::with_capacity(steps);
+    for index in 0..steps {
+        let now = Instant::now();
+        let logits = forward(
+            &model,
+            &device,
+            &kv,
+            0,
+            &tokens[length + index..length + index + 1],
+            length + index,
+        )?;
+        times.push(now.elapsed().as_secs_f64() * 1000.0);
+        let bytes = logit_bytes(&logits);
+        if let Some(file) = output.as_mut() {
+            file.write_all(&bytes)?;
+        }
+        if check_repeat {
+            hashes.push(Sha256::digest(&bytes).to_vec());
+        }
+    }
+    if let Some(file) = output.as_mut() {
+        file.flush()?;
+    }
+    times.sort_by(f64::total_cmp);
+    eprintln!(
+        "decode_steps={steps} decode_p50_ms={:.3} decode_p95_ms={:.3} decode_mean_ms={:.3}",
+        times[steps / 2],
+        times[(steps * 95 / 100).min(steps - 1)],
+        times.iter().sum::<f64>() / steps as f64
+    );
+    if check_repeat {
+        let end_state = model.export_mamba_state_bytes(0, (length + steps) as u64, [0; 32])?;
+        model.release_sequence_state(0);
+        let repeat_kv = cache(&config, length + steps, &device)?;
+        let (repeat_prefix, _) = prefill(&model, &device, &repeat_kv, 0, &tokens[..length], true)?;
+        ensure!(
+            prefix_logits == repeat_prefix,
+            "repeat prefill logits differ"
+        );
+        ensure!(
+            prefix_state.unwrap() == model.export_mamba_state_bytes(0, length as u64, [0; 32])?,
+            "repeat prefill state differs"
+        );
+        for index in 0..steps {
+            let logits = forward(
+                &model,
+                &device,
+                &repeat_kv,
+                0,
+                &tokens[length + index..length + index + 1],
+                length + index,
+            )?;
+            ensure!(
+                Sha256::digest(logit_bytes(&logits)).as_slice() == hashes[index],
+                "repeat decode logits differ at {index}"
+            );
+        }
+        ensure!(
+            end_state == model.export_mamba_state_bytes(0, (length + steps) as u64, [0; 32])?,
+            "repeat decode state differs"
+        );
+        eprintln!("repeat_prefill_decode_logits_and_states_bit_identical=true");
+    }
+    Ok(())
 }
 
 #[test]

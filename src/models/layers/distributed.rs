@@ -1435,6 +1435,11 @@ impl ReplicatedLinear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.linear.forward(x)
     }
+
+    /// Borrow the native packed projection for a grouped NVFP4 expert path.
+    pub fn as_nvfp4(&self) -> Option<&crate::models::layers::linear::LnNvfp4> {
+        self.linear.as_nvfp4()
+    }
 }
 
 /// Vocabulary-parallel linear layer for lm_head.
