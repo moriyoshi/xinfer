@@ -1,8 +1,11 @@
 //! Nemotron-H: a sequence of Mamba2, MLP, and unrotated attention blocks.
 //! The recurrent path is deliberately expressed in Candle operations so the
 //! checkpoint can run without the optional mamba-ssm CUDA extension.
+mod compact_state;
 mod expert_cache;
 mod expert_snapshot;
+#[cfg(feature = "cuda")]
+mod prefill;
 mod state;
 
 pub use expert_cache::NemotronExpertCacheStats;
@@ -34,7 +37,7 @@ use parking_lot::RwLock;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone, Deserialize)]
@@ -296,9 +299,14 @@ impl Mamba2 {
         states: &mut HashMap<usize, Vec<Option<MambaState>>>,
         layer: usize,
         num_layers: usize,
+        fast_prefill: bool,
     ) -> Result<Tensor> {
         let projected = self.in_proj.forward(xs)?;
-        let mut outputs = Vec::with_capacity(xs.dim(0)?);
+        let mut outputs = Vec::with_capacity(if fast_prefill {
+            spans.len()
+        } else {
+            xs.dim(0)?
+        });
         for &(seq_id, start, end) in spans {
             let entry = states
                 .entry(seq_id)
@@ -310,9 +318,23 @@ impl Mamba2 {
                     entry[layer].as_mut().unwrap()
                 }
             };
+            #[cfg(feature = "cuda")]
+            if fast_prefill && end - start > 1 && prefill::supported(self, &projected) {
+                outputs.push(prefill::run(
+                    self,
+                    &projected.narrow(0, start, end - start)?,
+                    state,
+                )?);
+                continue;
+            }
+            #[cfg(not(feature = "cuda"))]
+            let _ = fast_prefill;
             for index in start..end {
                 outputs.push(self.step(&projected.get(index)?, state)?);
             }
+        }
+        if outputs.len() == 1 {
+            return Ok(outputs.pop().unwrap());
         }
         let refs = outputs.iter().collect::<Vec<_>>();
         Tensor::cat(&refs, 0)
@@ -514,6 +536,7 @@ pub struct NemotronHForCausalLM {
     state_capacity: AtomicUsize,
     prefix_capacity: AtomicUsize,
     expert_cache: Option<Arc<Mutex<ExpertCache>>>,
+    mamba_prefill_fast_enabled: AtomicBool,
 }
 
 impl NemotronHForCausalLM {
@@ -677,7 +700,16 @@ impl NemotronHForCausalLM {
             state_capacity: AtomicUsize::new(usize::MAX),
             prefix_capacity: AtomicUsize::new(0),
             expert_cache,
+            mamba_prefill_fast_enabled: AtomicBool::new(true),
         })
+    }
+
+    /// Use the token-wise Mamba path for a controlled prefill comparison.
+    /// Decode always uses that path. A change takes effect on the next forward
+    /// call; callers must not change it concurrently with a forward call.
+    pub fn set_mamba_prefill_fast_enabled(&self, enabled: bool) {
+        self.mamba_prefill_fast_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub fn expert_cache_stats(&self) -> Option<NemotronExpertCacheStats> {
@@ -882,7 +914,14 @@ impl NemotronHForCausalLM {
         for (i, block) in self.layers.iter().enumerate() {
             let input = block.norm.forward(&xs)?;
             let output = match &block.mixer {
-                Mixer::Mamba(m) => m.forward(&input, &spans, &mut states, i, self.layers.len())?,
+                Mixer::Mamba(m) => m.forward(
+                    &input,
+                    &spans,
+                    &mut states,
+                    i,
+                    self.layers.len(),
+                    metadata.is_prefill && self.mamba_prefill_fast_enabled.load(Ordering::Relaxed),
+                )?,
                 Mixer::Attention(attn) => {
                     let cache = kv_caches.map(|all| {
                         let pair = &all[kv_index];
@@ -1053,6 +1092,41 @@ impl NemotronHForCausalLM {
         )
     }
 
+    /// Import a verified `SHMS` v1 compact recurrent snapshot. The frame is
+    /// checked against this model before any GPU state is allocated. Active
+    /// recurrent state is expanded to FP32; attention KV belongs to the same
+    /// prefix boundary and must be restored separately by the caller.
+    pub fn import_compact_mamba_state_bytes(
+        &self,
+        seq_id: usize,
+        expected_prefix_tokens: u64,
+        expected_model_fingerprint: [u8; 32],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let states = self.states.read();
+        if states.contains_key(&seq_id) {
+            candle_core::bail!("Nemotron-H sequence {seq_id} already has Mamba state")
+        }
+        if states.len() >= self.state_capacity.load(Ordering::Relaxed) {
+            candle_core::bail!("Nemotron-H recurrent state capacity exceeded")
+        }
+        drop(states);
+        let layout = state::layout_from_layers(&self.layers)?;
+        let frame = compact_state::CompactMambaFrame::parse(
+            bytes,
+            &layout,
+            expected_prefix_tokens,
+            expected_model_fingerprint,
+        )?;
+        let restored = frame.expand(&self.device)?;
+        state::install(
+            &mut self.states.write(),
+            seq_id,
+            restored,
+            self.state_capacity.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn has_mamba_prefix_state(&self, hash: u64) -> bool {
         self.prefixes.read().contains_key(&hash)
     }
@@ -1205,7 +1279,8 @@ mod tests {
 
         let mut states = HashMap::new();
         let packed = tensor(vec![1.0, 1.0, 1.0], vec![3, 1])?;
-        let outputs = mixer.forward(&packed, &[(10, 0, 2), (20, 2, 3)], &mut states, 0, 1)?;
+        let outputs =
+            mixer.forward(&packed, &[(10, 0, 2), (20, 2, 3)], &mut states, 0, 1, false)?;
         assert_eq!(outputs.dims(), &[3, 1]);
         let for_id = |id| {
             states[&id][0]

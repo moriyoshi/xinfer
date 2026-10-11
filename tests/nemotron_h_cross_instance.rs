@@ -122,7 +122,13 @@ impl Model {
             .collect()
     }
 
-    fn forward(&self, tokens: &[u32], start: usize, cache: &Cache) -> Result<Vec<f32>> {
+    fn forward(
+        &self,
+        tokens: &[u32],
+        start: usize,
+        seq_id: usize,
+        cache: &Cache,
+    ) -> Result<Vec<f32>> {
         let prefill = start == 0;
         ensure!(!tokens.is_empty());
         ensure!(prefill || tokens.len() == 1);
@@ -133,7 +139,7 @@ impl Model {
         let metadata = InputMetadata {
             is_prefill: prefill,
             is_mla: false,
-            sequence_ids: Some(vec![0]),
+            sequence_ids: Some(vec![seq_id]),
             mamba_slot_mapping: None,
             slot_mapping: Tensor::from_vec(positions.clone(), tokens.len(), &self.device)?,
             block_tables: Some(Tensor::from_vec(
@@ -183,6 +189,46 @@ impl Model {
     }
 }
 
+fn pack_exact_groups(native: &[u8], snapshot: &NemotronMambaSnapshot) -> Result<Vec<u8>> {
+    let layout = &snapshot.layout;
+    let layers = layout.model_layer_indices.len();
+    let conv_words = layout
+        .conv_shape
+        .iter()
+        .map(|&x| x as usize)
+        .product::<usize>();
+    let [heads, values, channels] = layout.ssm_shape.map(|x| x as usize);
+    let groups = layers * heads * channels;
+    let header_len = native.len() - snapshot.payload.len();
+    let mut packed = Vec::with_capacity(native.len() + groups + 64);
+    packed.extend_from_slice(b"SHMS\0\0\0\x01");
+    for number in [
+        header_len, layers, conv_words, heads, values, channels, groups,
+    ] {
+        packed.extend_from_slice(&u32::try_from(number)?.to_le_bytes());
+    }
+    packed.extend_from_slice(&native[..header_len]);
+    let layer_bytes = (conv_words + heads * values * channels) * 4;
+    for layer in 0..layers {
+        let start = layer * layer_bytes;
+        packed.extend_from_slice(&snapshot.payload[start..start + conv_words * 4]);
+    }
+    packed.resize(packed.len() + groups, 2); // exact FP32 mode
+    for layer in 0..layers {
+        for head in 0..heads {
+            for channel in 0..channels {
+                for value in 0..values {
+                    let word = layer * layer_bytes
+                        + (conv_words + (head * values + value) * channels + channel) * 4;
+                    packed.extend_from_slice(&snapshot.payload[word..word + 4]);
+                }
+            }
+        }
+    }
+    packed.extend_from_slice(&Sha256::digest(&packed));
+    Ok(packed)
+}
+
 #[test]
 fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     let directory = match std::env::var_os("XINFER_NEMOTRON_H_CHECKPOINT") {
@@ -199,7 +245,7 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     ensure!(tokens.len() >= prefix_len + 4, "prompt too short");
     let source = Model::load(&directory)?;
     let source_cache = source.empty_cache(prefix_len + 4)?;
-    let prefill = source.forward(&tokens[..prefix_len], 0, &source_cache)?;
+    let prefill = source.forward(&tokens[..prefix_len], 0, 0, &source_cache)?;
     ensure!(
         prefill.iter().all(|value| value.is_finite()),
         "non-finite prefill logits"
@@ -254,6 +300,7 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
         .iter()
         .map(|(key, value)| Ok((export_attention(key)?, export_attention(value)?)))
         .collect::<Result<Vec<_>>>()?;
+    let compact = pack_exact_groups(&encoded, &snapshot)?;
 
     // A second model owns its own weights, recurrent map, and attention cache.
     let target = Model::load(&directory)?;
@@ -264,6 +311,7 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
         restored.payload == snapshot.payload,
         "parsed payload changed"
     );
+    let attention_start = Instant::now();
     let target_cache = attention
         .iter()
         .map(|(key, value)| {
@@ -273,12 +321,32 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
             ))
         })
         .collect::<Result<Cache>>()?;
+    target.device.synchronize()?;
+    let native_attention_s = attention_start.elapsed().as_secs_f64();
+    let attention_start = Instant::now();
+    let compact_cache = attention
+        .iter()
+        .map(|(key, value)| {
+            Ok((
+                import_attention(key, &target.device)?,
+                import_attention(value, &target.device)?,
+            ))
+        })
+        .collect::<Result<Cache>>()?;
+    target.device.synchronize()?;
+    let compact_attention_s = attention_start.elapsed().as_secs_f64();
     let import_start = Instant::now();
     target
         .inner
         .import_mamba_state_bytes(0, prefix_len as u64, fingerprint, &encoded)?;
     target.device.synchronize()?;
     let import_s = import_start.elapsed().as_secs_f64();
+    let compact_start = Instant::now();
+    target
+        .inner
+        .import_compact_mamba_state_bytes(1, prefix_len as u64, fingerprint, &compact)?;
+    target.device.synchronize()?;
+    let compact_import_s = compact_start.elapsed().as_secs_f64();
     ensure!(
         target
             .inner
@@ -288,11 +356,18 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
     );
 
     let mut max_abs = 0.0f32;
+    let mut compact_max_abs = 0.0f32;
     for i in 0..4 {
         let token = &tokens[prefix_len + i..prefix_len + i + 1];
-        let baseline = source.forward(token, prefix_len + i, &source_cache)?;
-        let replay = target.forward(token, prefix_len + i, &target_cache)?;
+        let baseline = source.forward(token, prefix_len + i, 0, &source_cache)?;
+        let replay = target.forward(token, prefix_len + i, 0, &target_cache)?;
+        let compact_replay = target.forward(token, prefix_len + i, 1, &compact_cache)?;
         ensure!(baseline.len() == replay.len(), "logit length changed");
+        ensure!(
+            baseline.len() == compact_replay.len()
+                && compact_replay.iter().all(|value| value.is_finite()),
+            "compact continuation logits changed shape or became non-finite"
+        );
         ensure!(
             baseline.iter().all(|v| v.is_finite()) && replay.iter().all(|v| v.is_finite()),
             "non-finite continuation logits"
@@ -300,15 +375,24 @@ fn real_checkpoint_cross_instance_continuation() -> Result<()> {
         for (&a, &b) in baseline.iter().zip(&replay) {
             max_abs = max_abs.max((a - b).abs());
         }
+        for (&a, &b) in baseline.iter().zip(&compact_replay) {
+            compact_max_abs = compact_max_abs.max((a - b).abs());
+        }
     }
     target.device.synchronize()?;
     eprintln!(
-        "Nemotron-H snapshot hash_s={hash_s:.6} ring_hash_s={ring_s:.6} export_s={export_s:.6} encode_s={encode_s:.6} decode_s={decode_s:.6} export_bytes_s={export_bytes_s:.6} import_bytes_s={import_s:.6}"
+        "Nemotron-H snapshot hash_s={hash_s:.6} ring_hash_s={ring_s:.6} export_s={export_s:.6} encode_s={encode_s:.6} decode_s={decode_s:.6} export_bytes_s={export_bytes_s:.6} import_bytes_s={import_s:.6} compact_exact_import_s={compact_import_s:.6} native_attention_restore_s={native_attention_s:.6} compact_attention_restore_s={compact_attention_s:.6} native_local_restore_s={:.6} compact_local_restore_s={:.6}",
+        native_attention_s + import_s,
+        compact_attention_s + compact_import_s,
     );
-    eprintln!("Nemotron-H cross-instance continuation max_abs_logit_diff={max_abs}");
+    eprintln!("Nemotron-H cross-instance continuation max_abs_logit_diff={max_abs} compact_exact_max_abs_logit_diff={compact_max_abs}");
     ensure!(
         max_abs <= 1e-3,
         "cross-instance continuation changed logits"
+    );
+    ensure!(
+        compact_max_abs <= 1e-3,
+        "compact exact-state continuation changed logits"
     );
     Ok(())
 }

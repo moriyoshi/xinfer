@@ -126,6 +126,43 @@ pub struct NemotronMambaSnapshot {
     pub payload: Vec<u8>,
 }
 
+/// The fixed-int bincode prefix of a v1 snapshot ends with the Vec length.
+/// Compact frames carry this prefix, but their lossy payload cannot match the
+/// original native payload checksum stored in it.
+#[derive(Deserialize)]
+pub(super) struct NemotronMambaSnapshotHeader {
+    pub version: u32,
+    pub prefix_tokens: u64,
+    pub model_fingerprint: [u8; 32],
+    pub layout: NemotronMambaStateLayout,
+    #[allow(dead_code)]
+    pub payload_sha256: [u8; 32],
+    pub payload_len: u64,
+}
+
+impl NemotronMambaSnapshotHeader {
+    pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let encoded = bytes.strip_prefix(MAGIC).ok_or_else(|| {
+            candle_core::Error::Msg("invalid embedded Nemotron-H state magic/version".into())
+        })?;
+        let header: Self = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(encoded.len() as u64)
+            .reject_trailing_bytes()
+            .deserialize(encoded)
+            .map_err(|e| {
+                candle_core::Error::Msg(format!("deserialize Nemotron-H state header: {e}"))
+            })?;
+        if header.version != NEMOTRON_MAMBA_STATE_VERSION || header.prefix_tokens == 0 {
+            candle_core::bail!("invalid embedded Nemotron-H state version or prefix")
+        }
+        if header.payload_len != header.layout.payload_bytes()? as u64 {
+            candle_core::bail!("embedded Nemotron-H state payload length mismatch")
+        }
+        Ok(header)
+    }
+}
+
 impl NemotronMambaSnapshot {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate_payload()?;

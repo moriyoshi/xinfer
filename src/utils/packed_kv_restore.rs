@@ -48,6 +48,34 @@ pub struct DensePackedKvPage {
     pub sha256: [u8; 32],
 }
 
+/// An owned page whose shape and checksum were checked at construction or
+/// while parsing an untrusted wire envelope.
+/// Its fields cannot be changed while sealed. Consuming it for wire bytes
+/// avoids repeating shape checks and SHA-256; an ordinary mutable page keeps
+/// the validating [`DensePackedKvPage::to_bytes`] path.
+#[derive(Debug)]
+pub struct SealedDensePackedKvPage {
+    page: DensePackedKvPage,
+}
+
+impl SealedDensePackedKvPage {
+    /// Inspect a sealed page without exposing mutable access to its payload.
+    pub fn page(&self) -> &DensePackedKvPage {
+        &self.page
+    }
+
+    /// Give up the seal and return the mutable page. Subsequent serialization
+    /// through `to_bytes` validates the page again.
+    pub fn into_page(self) -> DensePackedKvPage {
+        self.page
+    }
+
+    /// Consume a freshly validated page and serialize its existing checksum.
+    pub fn into_bytes(self) -> Result<Vec<u8>> {
+        self.page.serialize_wire()
+    }
+}
+
 impl DensePackedKvPage {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -81,6 +109,46 @@ impl DensePackedKvPage {
         page.validate_shape()?;
         page.sha256 = page.digest();
         Ok(page)
+    }
+
+    /// Construct an immutable, owned page for one-pass wire serialization.
+    /// Unlike sealing an existing mutable page, this does not revalidate the
+    /// shape or recompute the checksum after construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_sealed(
+        axis: PackedKvAxis,
+        bits: u8,
+        tokens: u32,
+        heads: u32,
+        channels: u32,
+        group_size: u32,
+        tail_tokens: u32,
+        codes: Vec<u8>,
+        params: Vec<f32>,
+        tail_bf16: Vec<u16>,
+        exceptions: Vec<PackedKvException>,
+    ) -> Result<SealedDensePackedKvPage> {
+        Ok(SealedDensePackedKvPage {
+            page: Self::new(
+                axis,
+                bits,
+                tokens,
+                heads,
+                channels,
+                group_size,
+                tail_tokens,
+                codes,
+                params,
+                tail_bf16,
+                exceptions,
+            )?,
+        })
+    }
+
+    /// Validate and seal a page that may have been mutated after construction.
+    pub fn seal(self) -> Result<SealedDensePackedKvPage> {
+        self.validate()?;
+        Ok(SealedDensePackedKvPage { page: self })
     }
 
     fn digest(&self) -> [u8; 32] {
@@ -216,6 +284,10 @@ impl DensePackedKvPage {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         self.validate()?;
+        self.serialize_wire()
+    }
+
+    fn serialize_wire(&self) -> Result<Vec<u8>> {
         let mut bytes = MAGIC.to_vec();
         bincode::DefaultOptions::new()
             .with_fixint_encoding()
@@ -225,6 +297,12 @@ impl DensePackedKvPage {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self::from_bytes_sealed(bytes)?.into_page())
+    }
+
+    /// Parse and validate an untrusted wire envelope once, retaining an
+    /// immutable proof for subsequent sealed-page restore or serialization.
+    pub fn from_bytes_sealed(bytes: &[u8]) -> Result<SealedDensePackedKvPage> {
         let payload = bytes.strip_prefix(MAGIC).ok_or_else(|| {
             candle_core::Error::Msg("invalid dense packed KV envelope magic/version".into())
         })?;
@@ -235,7 +313,7 @@ impl DensePackedKvPage {
             .deserialize(payload)
             .map_err(|e| candle_core::Error::Msg(format!("deserialize packed KV page: {e}")))?;
         page.validate()?;
-        Ok(page)
+        Ok(SealedDensePackedKvPage { page })
     }
 
     /// Portable byte-parity oracle. Output is token-major `[T,H,D]` BF16 bits.
@@ -296,6 +374,31 @@ pub fn encode_dense_packed_kv_tile(
     bits: u8,
     exact_tail_tokens: usize,
 ) -> Result<Vec<DensePackedKvPage>> {
+    Ok(encode_dense_packed_kv_tile_sealed(
+        bf16_le,
+        tokens,
+        heads,
+        channels,
+        axis,
+        bits,
+        exact_tail_tokens,
+    )?
+    .into_iter()
+    .map(SealedDensePackedKvPage::into_page)
+    .collect())
+}
+
+/// Encode an exact BF16 tile and keep each newly constructed page sealed for
+/// one-pass serialization with [`SealedDensePackedKvPage::into_bytes`].
+pub fn encode_dense_packed_kv_tile_sealed(
+    bf16_le: &[u8],
+    tokens: usize,
+    heads: usize,
+    channels: usize,
+    axis: PackedKvAxis,
+    bits: u8,
+    exact_tail_tokens: usize,
+) -> Result<Vec<SealedDensePackedKvPage>> {
     const BLOCK: usize = 16;
     if !matches!(bits, 2 | 4) || tokens == 0 || heads == 0 || channels == 0 {
         candle_core::bail!("invalid dense packed KV tile geometry")
@@ -390,7 +493,7 @@ pub fn encode_dense_packed_kv_tile(
                 }
             }
         }
-        pages.push(DensePackedKvPage::new(
+        pages.push(DensePackedKvPage::new_sealed(
             axis,
             bits,
             count as u32,
@@ -410,11 +513,90 @@ pub fn encode_dense_packed_kv_tile(
     Ok(pages)
 }
 
+/// Encode a live CUDA Flash KV tile without reading its quantized BF16 prefix
+/// back to the host. The returned pages use the same versioned wire format as
+/// [`encode_dense_packed_kv_tile`]. The exact tail is read back separately.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tile_gpu(
+    tile: &candle_core::Tensor,
+    tokens: usize,
+    axis: PackedKvAxis,
+    bits: u8,
+    exact_tail_tokens: usize,
+) -> Result<Vec<DensePackedKvPage>> {
+    Ok(
+        encode_dense_packed_kv_tile_gpu_sealed(tile, tokens, axis, bits, exact_tail_tokens)?
+            .into_iter()
+            .map(SealedDensePackedKvPage::into_page)
+            .collect(),
+    )
+}
+
+/// Encode one live CUDA tile into sealed pages for one-pass wire serialization.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tile_gpu_sealed(
+    tile: &candle_core::Tensor,
+    tokens: usize,
+    axis: PackedKvAxis,
+    bits: u8,
+    exact_tail_tokens: usize,
+) -> Result<Vec<SealedDensePackedKvPage>> {
+    encode::encode(tile, tokens, axis, bits, exact_tail_tokens)
+}
+
+/// One live Flash K/V tile for a bounded batched GPU encode. Requests must
+/// share geometry and a CUDA device. Each tile may choose its own exact tail.
+#[cfg(feature = "cuda")]
+pub struct DensePackedKvEncode<'a> {
+    pub tile: &'a candle_core::Tensor,
+    pub axis: PackedKvAxis,
+    pub exact_tail_tokens: usize,
+}
+
+/// Encode live CUDA tiles with at most 16 tiles staged per GPU batch.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tiles_gpu(
+    requests: &[DensePackedKvEncode<'_>],
+    tokens: usize,
+    bits: u8,
+) -> Result<Vec<Vec<DensePackedKvPage>>> {
+    Ok(
+        encode_dense_packed_kv_tiles_gpu_sealed(requests, tokens, bits)?
+            .into_iter()
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(SealedDensePackedKvPage::into_page)
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// Encode a bounded batch of live CUDA tiles into sealed pages. Each page can
+/// be consumed once to produce the same versioned wire bytes as `to_bytes`.
+#[cfg(feature = "cuda")]
+pub fn encode_dense_packed_kv_tiles_gpu_sealed(
+    requests: &[DensePackedKvEncode<'_>],
+    tokens: usize,
+    bits: u8,
+) -> Result<Vec<Vec<SealedDensePackedKvPage>>> {
+    encode_batch::encode(requests, tokens, bits)
+}
+
 pub struct DensePackedKvRestore<'a> {
     pub layer: usize,
     pub block: usize,
     pub token_offset: usize,
     pub page: &'a DensePackedKvPage,
+}
+
+/// Restore request backed by a page validated when it was parsed or built.
+pub struct SealedDensePackedKvRestore<'a> {
+    pub layer: usize,
+    pub block: usize,
+    pub token_offset: usize,
+    pub page: &'a SealedDensePackedKvPage,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -432,6 +614,34 @@ pub fn restore_dense_packed_kv_pages(
     cache: &GpuKvCache,
     requests: &[DensePackedKvRestore<'_>],
 ) -> Result<DensePackedKvRestoreStats> {
+    restore_dense_packed_kv_pages_inner(cache, requests, true)
+}
+
+/// Restore pages that have already passed shape and checksum validation.
+/// Destination geometry and overlapping ranges are still checked before any
+/// GPU writes. Mutable pages cannot enter this path without being revalidated
+/// and sealed first.
+pub fn restore_dense_packed_kv_pages_sealed(
+    cache: &GpuKvCache,
+    requests: &[SealedDensePackedKvRestore<'_>],
+) -> Result<DensePackedKvRestoreStats> {
+    let borrowed: Vec<_> = requests
+        .iter()
+        .map(|request| DensePackedKvRestore {
+            layer: request.layer,
+            block: request.block,
+            token_offset: request.token_offset,
+            page: request.page.page(),
+        })
+        .collect();
+    restore_dense_packed_kv_pages_inner(cache, &borrowed, false)
+}
+
+fn restore_dense_packed_kv_pages_inner(
+    cache: &GpuKvCache,
+    requests: &[DensePackedKvRestore<'_>],
+    validate_pages: bool,
+) -> Result<DensePackedKvRestoreStats> {
     let GpuKvCache::Flash(pairs) = cache else {
         candle_core::bail!("dense packed KV restore requires a standard Flash cache")
     };
@@ -440,7 +650,9 @@ pub fn restore_dense_packed_kv_pages(
     let mut device = None;
     for request in requests {
         let page = request.page;
-        page.validate()?;
+        if validate_pages {
+            page.validate()?;
+        }
         let (key, value) = pairs
             .get(request.layer)
             .ok_or_else(|| candle_core::Error::Msg("dense packed KV layer out of range".into()))?;
@@ -517,9 +729,111 @@ pub fn restore_dense_packed_kv_pages(
 #[cfg(feature = "cuda")]
 mod cuda;
 
+#[cfg(feature = "cuda")]
+mod encode;
+
+#[cfg(feature = "cuda")]
+mod encode_batch;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "Qwen3-4B-shaped 12,960-page CPU validation phase timing"]
+    fn qwen3_4b_shaped_validation_split() -> Result<()> {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mut pages = Vec::with_capacity(12_960);
+        for axis in [PackedKvAxis::Key, PackedKvAxis::Value] {
+            let groups = if axis == PackedKvAxis::Key {
+                8 * 128
+            } else {
+                16 * 8
+            };
+            let prototype = DensePackedKvPage::new(
+                axis,
+                4,
+                16,
+                8,
+                128,
+                if axis == PackedKvAxis::Key { 16 } else { 128 },
+                0,
+                vec![0x39; 16 * 8 * 128 * 4 / 8],
+                [0.0f32, 0.125].repeat(groups),
+                vec![],
+                vec![],
+            )?;
+            for index in 0..6_480 {
+                let mut page = prototype.clone();
+                page.codes[0] = index as u8;
+                page.sha256 = page.digest();
+                pages.push(page);
+            }
+        }
+        let timed = |name: &str, check: &dyn Fn(&DensePackedKvPage) -> Result<()>| -> Result<()> {
+            let mut samples = Vec::new();
+            for _ in 0..3 {
+                let start = Instant::now();
+                for page in &pages {
+                    check(black_box(page))?;
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!("{name}: p50={:.2} ms, samples={samples:?}", samples[1]);
+            Ok(())
+        };
+        timed("shape", &|page| page.validate_shape())?;
+        timed("digest", &|page| {
+            black_box(page.digest());
+            Ok(())
+        })?;
+        timed("validate", &|page| page.validate())?;
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_pages_keep_wire_bytes_and_mutation_boundary() -> Result<()> {
+        let words: Vec<u16> = (0..37 * 3 * 13)
+            .map(|n| half::bf16::from_f32(((n * 37 % 503) as f32 - 251.0) / 29.0).to_bits())
+            .collect();
+        let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        for axis in [PackedKvAxis::Key, PackedKvAxis::Value] {
+            for bits in [2, 4] {
+                for tail in [0, 1, 5, 16, 19, 37] {
+                    let checked = encode_dense_packed_kv_tile(&bytes, 37, 3, 13, axis, bits, tail)?;
+                    let sealed =
+                        encode_dense_packed_kv_tile_sealed(&bytes, 37, 3, 13, axis, bits, tail)?;
+                    assert_eq!(checked.len(), sealed.len());
+                    for (checked, sealed) in checked.into_iter().zip(sealed) {
+                        let old_wire = checked.to_bytes()?;
+                        let new_wire = sealed.into_bytes()?;
+                        assert_eq!(old_wire, new_wire);
+                        assert_eq!(
+                            DensePackedKvPage::from_bytes(&new_wire)?.sha256,
+                            checked.sha256
+                        );
+                    }
+                }
+            }
+        }
+        let sealed =
+            encode_dense_packed_kv_tile_sealed(&bytes, 37, 3, 13, PackedKvAxis::Key, 2, 0)?;
+        let mut mutable = sealed.into_iter().next().unwrap().into_page();
+        mutable.codes[0] ^= 1;
+        assert!(mutable.to_bytes().is_err());
+        assert!(mutable.seal().is_err());
+
+        let mut corrupt =
+            encode_dense_packed_kv_tile_sealed(&bytes, 37, 3, 13, PackedKvAxis::Value, 4, 5)?[0]
+                .page()
+                .to_bytes()?;
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(DensePackedKvPage::from_bytes(&corrupt).is_err());
+        Ok(())
+    }
 
     #[test]
     fn direct_encoder_preserves_tail_and_rejects_bad_input() -> Result<()> {
@@ -570,6 +884,208 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_encoder_matches_cpu_page_bytes() -> Result<()> {
+        use candle_core::{Device, Tensor};
+
+        let device = Device::new_cuda(0)?;
+        let heads = 3;
+        let channels = 13;
+        let tokens = 37;
+        let words: Vec<half::bf16> = (0..3 * 16 * heads * channels)
+            .map(|n| {
+                let value = ((n * 37 % 503) as f32 - 251.0) / 29.0;
+                half::bf16::from_f32(value)
+            })
+            .collect();
+        let tile = Tensor::from_vec(words.clone(), (3, 16, heads, channels), &device)?;
+        let bytes: Vec<u8> = words[..tokens * heads * channels]
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        for axis in [PackedKvAxis::Key, PackedKvAxis::Value] {
+            for bits in [2, 4] {
+                for tail in [0, 1, 5, 16, 19, 37] {
+                    let cpu = encode_dense_packed_kv_tile(
+                        &bytes, tokens, heads, channels, axis, bits, tail,
+                    )?;
+                    let gpu = encode_dense_packed_kv_tile_gpu(&tile, tokens, axis, bits, tail)?;
+                    assert_eq!(cpu.len(), gpu.len());
+                    for (index, (expected, actual)) in cpu.iter().zip(&gpu).enumerate() {
+                        assert_eq!(
+                            expected.to_bytes()?,
+                            actual.to_bytes()?,
+                            "GPU page differs at axis {axis:?}, {bits} bits, tail {tail}, page {index}"
+                        );
+                    }
+                }
+            }
+        }
+        let requests = [
+            DensePackedKvEncode {
+                tile: &tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 19,
+            },
+            DensePackedKvEncode {
+                tile: &tile,
+                axis: PackedKvAxis::Value,
+                exact_tail_tokens: 5,
+            },
+            DensePackedKvEncode {
+                tile: &tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 37,
+            },
+        ];
+        let batch = encode_dense_packed_kv_tiles_gpu(&requests, tokens, 4)?;
+        let sealed_batch = encode_dense_packed_kv_tiles_gpu_sealed(&requests, tokens, 4)?;
+        for (checked, sealed) in batch.iter().zip(sealed_batch) {
+            assert_eq!(checked.len(), sealed.len());
+            for (checked, sealed) in checked.iter().zip(sealed) {
+                assert_eq!(checked.to_bytes()?, sealed.into_bytes()?);
+            }
+        }
+        for (request, actual) in requests.iter().zip(batch) {
+            let expected = encode_dense_packed_kv_tile(
+                &bytes,
+                tokens,
+                heads,
+                channels,
+                request.axis,
+                4,
+                request.exact_tail_tokens,
+            )?;
+            assert_eq!(
+                expected
+                    .iter()
+                    .map(DensePackedKvPage::to_bytes)
+                    .collect::<Result<Vec<_>>>()?,
+                actual
+                    .iter()
+                    .map(DensePackedKvPage::to_bytes)
+                    .collect::<Result<Vec<_>>>()?
+            );
+        }
+        // A BF16 midpoint can round to a different 2-bit code if the
+        // subtraction and division are narrowed to f32 before rounding.
+        let midpoint = [-0.0159912109375, -0.0120849609375, -0.0081787109375];
+        let edge_words: Vec<half::bf16> = midpoint
+            .into_iter()
+            .cycle()
+            .take(16 * 3)
+            .map(half::bf16::from_f32)
+            .collect();
+        let edge_tile = Tensor::from_vec(edge_words.clone(), (1, 16, 1, 3), &device)?;
+        let edge_bytes: Vec<u8> = edge_words
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        let edge_cpu =
+            encode_dense_packed_kv_tile(&edge_bytes, 16, 1, 3, PackedKvAxis::Value, 2, 0)?;
+        let edge_request = [DensePackedKvEncode {
+            tile: &edge_tile,
+            axis: PackedKvAxis::Value,
+            exact_tail_tokens: 0,
+        }];
+        for edge_gpu in [
+            encode_dense_packed_kv_tiles_gpu(&edge_request, 16, 2)?,
+            encode_batch::encode_with_rounding(&edge_request, 16, 2, true)?,
+        ] {
+            assert_eq!(edge_cpu[0].to_bytes()?, edge_gpu[0][0].to_bytes()?);
+        }
+
+        // Mixed BF16 exponents exercise subtraction, division and clamping.
+        let mut state = 0x1234_5678u32;
+        let diverse_words: Vec<half::bf16> = (0..32 * 16 * 4 * 32)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let exponent = 1 + ((state >> 8) % 230) as u16;
+                half::bf16::from_bits(
+                    (((state >> 31) as u16) << 15) | (exponent << 7) | (state as u16 & 127),
+                )
+            })
+            .collect();
+        let diverse_tile = Tensor::from_vec(diverse_words.clone(), (32, 16, 4, 32), &device)?;
+        let diverse_bytes: Vec<u8> = diverse_words
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        let diverse_requests = [
+            DensePackedKvEncode {
+                tile: &diverse_tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 0,
+            },
+            DensePackedKvEncode {
+                tile: &diverse_tile,
+                axis: PackedKvAxis::Value,
+                exact_tail_tokens: 7,
+            },
+            DensePackedKvEncode {
+                tile: &diverse_tile,
+                axis: PackedKvAxis::Key,
+                exact_tail_tokens: 32,
+            },
+        ];
+        for width in [2, 4] {
+            for gpu in [
+                encode_dense_packed_kv_tiles_gpu(&diverse_requests, 512, width)?,
+                encode_batch::encode_with_rounding(&diverse_requests, 512, width, true)?,
+            ] {
+                for (request, actual) in diverse_requests.iter().zip(gpu) {
+                    let expected = encode_dense_packed_kv_tile(
+                        &diverse_bytes,
+                        512,
+                        4,
+                        32,
+                        request.axis,
+                        width,
+                        request.exact_tail_tokens,
+                    )?;
+                    assert_eq!(
+                        expected
+                            .iter()
+                            .map(DensePackedKvPage::to_bytes)
+                            .collect::<Result<Vec<_>>>()?,
+                        actual
+                            .iter()
+                            .map(DensePackedKvPage::to_bytes)
+                            .collect::<Result<Vec<_>>>()?
+                    );
+                }
+            }
+        }
+        let tiny_words: Vec<half::bf16> = [0x0001u16, 0x0002, 0x0003]
+            .into_iter()
+            .cycle()
+            .take(16 * 3)
+            .map(half::bf16::from_bits)
+            .collect();
+        let tiny_tile = Tensor::from_vec(tiny_words.clone(), (1, 16, 1, 3), &device)?;
+        let tiny_bytes: Vec<u8> = tiny_words
+            .iter()
+            .flat_map(|word| word.to_bits().to_le_bytes())
+            .collect();
+        let tiny_cpu =
+            encode_dense_packed_kv_tile(&tiny_bytes, 16, 1, 3, PackedKvAxis::Value, 4, 0)?;
+        let tiny_request = [DensePackedKvEncode {
+            tile: &tiny_tile,
+            axis: PackedKvAxis::Value,
+            exact_tail_tokens: 0,
+        }];
+        for tiny_gpu in [
+            encode_dense_packed_kv_tiles_gpu(&tiny_request, 16, 4)?,
+            encode_batch::encode_with_rounding(&tiny_request, 16, 4, true)?,
+        ] {
+            assert_eq!(tiny_cpu[0].to_bytes()?, tiny_gpu[0][0].to_bytes()?);
+        }
+        Ok(())
+    }
+
     #[test]
     fn envelope_rejects_corruption_shape_and_duplicate_exceptions() -> Result<()> {
         let page = DensePackedKvPage::new(
@@ -589,6 +1105,9 @@ mod tests {
             }],
         )?;
         let bytes = page.to_bytes()?;
+        let sealed = DensePackedKvPage::from_bytes_sealed(&bytes)?;
+        assert_eq!(sealed.page().sha256, page.sha256);
+        assert_eq!(sealed.into_bytes()?, bytes);
         assert_eq!(
             DensePackedKvPage::from_bytes(&bytes)?.decode_cpu_bf16()?,
             page.decode_cpu_bf16()?
@@ -596,6 +1115,9 @@ mod tests {
         let mut corrupt = bytes.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(DensePackedKvPage::from_bytes(&corrupt).is_err());
+        assert!(DensePackedKvPage::from_bytes_sealed(&corrupt).is_err());
+        assert!(DensePackedKvPage::from_bytes_sealed(&bytes[1..]).is_err());
+        assert!(DensePackedKvPage::from_bytes_sealed(&bytes[..bytes.len() - 1]).is_err());
         let mut wrong = page.clone();
         wrong.channels = 8;
         assert!(wrong.validate().is_err());
