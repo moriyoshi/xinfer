@@ -288,6 +288,8 @@ pub struct Config {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub max_position_embeddings: usize,
+    /// Original context window before long-context RoPE scaling (Phi-4).
+    pub original_max_position_embeddings: Option<usize>,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     pub max_model_len: Option<usize>,
@@ -346,6 +348,10 @@ impl fmt::Debug for Config {
             .field("num_attention_heads", &self.num_attention_heads)
             .field("num_key_value_heads", &self.num_key_value_heads)
             .field("max_position_embeddings", &self.max_position_embeddings)
+            .field(
+                "original_max_position_embeddings",
+                &self.original_max_position_embeddings,
+            )
             .field("hidden_size", &self.hidden_size)
             .field("num_hidden_layers", &self.num_hidden_layers)
             .field("max_model_len", &self.max_model_len)

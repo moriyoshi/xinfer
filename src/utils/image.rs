@@ -652,6 +652,7 @@ mod tests {
             num_attention_heads: 4,
             num_key_value_heads: 4,
             max_position_embeddings: 1024,
+            original_max_position_embeddings: None,
             hidden_size: 512,
             num_hidden_layers: 2,
             max_model_len: Some(1024),

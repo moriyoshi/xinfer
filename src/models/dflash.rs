@@ -106,6 +106,7 @@ impl DFlashModelConfig {
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             max_position_embeddings: self.max_position_embeddings,
+            original_max_position_embeddings: None,
             hidden_size: self.hidden_size,
             num_hidden_layers: self.num_hidden_layers,
             max_model_len: None,

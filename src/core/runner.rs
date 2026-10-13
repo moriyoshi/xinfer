@@ -2128,6 +2128,7 @@ impl ModelRunner {
         match &self.model {
             Model::Qwen3_5(model) => model.release_sequence_state(id),
             Model::NemotronH(model) => model.release_sequence_state(id),
+            Model::Phi4(model) => model.release_sequence_state(id),
             Model::Qwen3_5MoE(model) => model.release_sequence_state(id),
             Model::Qwen4(model) => model.release_sequence_state(id),
             Model::Qwen3VL(model) => model.release_sequence_state(id),
