@@ -1,4 +1,7 @@
-use super::{DensePackedKvRestore, DensePackedKvRestoreStats, PackedKvAxis};
+use super::{
+    packed_payload_bytes, DensePackedKvRestore, DensePackedKvRestoreOptions,
+    DensePackedKvRestoreStats, PackedKvAxis,
+};
 use candle_core::cuda_backend::cudarc::driver::{capture_status, sys::CUstreamCaptureStatus};
 use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr, LaunchAsync, LaunchConfig};
 use candle_core::cuda_backend::cudarc::nvrtc::compile_ptx;
@@ -8,8 +11,6 @@ use std::sync::Mutex;
 
 const MODULE: &str = "xinfer_dense_packed_kv_v1";
 const KERNEL: &str = "expand_dense_packed_kv";
-const MAX_BATCH_PAGES: usize = 128;
-const MAX_BATCH_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
 #[repr(C)]
@@ -62,6 +63,7 @@ fn destination_pointer(tensor: &Tensor, block: usize) -> Result<u64> {
 pub(super) fn expand(
     pairs: &[(Tensor, Tensor)],
     requests: &[DensePackedKvRestore<'_>],
+    options: DensePackedKvRestoreOptions,
     stats: &mut DensePackedKvRestoreStats,
 ) -> Result<()> {
     let first = &requests[0];
@@ -102,17 +104,19 @@ pub(super) fn expand(
         while cursor < group.len() {
             let start = cursor;
             let mut payload_bytes = 0usize;
-            while cursor < group.len() && cursor - start < MAX_BATCH_PAGES {
+            while cursor < group.len() && cursor - start < options.max_batch_pages {
                 let page = group[cursor].page;
-                let bytes = page.codes.len()
-                    + page.params.len() * 4
-                    + page.tail_bf16.len() * 2
-                    + page.exceptions.len() * 6;
-                if cursor > start && payload_bytes + bytes > MAX_BATCH_PAYLOAD_BYTES {
+                let bytes = packed_payload_bytes(page)?;
+                // Every page was checked against this hard limit before GPU
+                // writes. Keep the guard here for the accumulated batch too.
+                if bytes > options.max_batch_payload_bytes - payload_bytes {
                     break;
                 }
                 payload_bytes += bytes;
                 cursor += 1;
+            }
+            if cursor == start {
+                candle_core::bail!("dense packed KV page exceeds max_batch_payload_bytes")
             }
             let chunk = &group[start..cursor];
             let mut descriptors = Vec::with_capacity(chunk.len());
@@ -228,6 +232,8 @@ pub(super) fn expand(
                 candle_core::Error::Msg(format!("synchronize dense packed KV: {e}"))
             })?;
             stats.kernel_launches += 1;
+            stats.max_batch_pages = stats.max_batch_pages.max(chunk.len());
+            stats.max_batch_payload_bytes = stats.max_batch_payload_bytes.max(payload_bytes);
         }
     }
     Ok(())

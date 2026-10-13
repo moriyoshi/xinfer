@@ -605,6 +605,66 @@ pub struct DensePackedKvRestoreStats {
     pub packed_bytes: usize,
     pub output_bytes: usize,
     pub kernel_launches: usize,
+    /// Largest number of pages in one CUDA expansion launch.
+    pub max_batch_pages: usize,
+    /// Largest sum of packed codes, parameters, tails and exceptions staged
+    /// for one launch. Excludes descriptors and empty-buffer placeholders.
+    pub max_batch_payload_bytes: usize,
+}
+
+/// Limits for one dense packed KV expansion launch. The payload budget counts
+/// packed codes, parameters, tails and exceptions, not GPU descriptors.
+/// A page larger than the budget is rejected before any destination writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DensePackedKvRestoreOptions {
+    pub max_batch_pages: usize,
+    pub max_batch_payload_bytes: usize,
+}
+
+impl Default for DensePackedKvRestoreOptions {
+    fn default() -> Self {
+        Self {
+            max_batch_pages: 128,
+            max_batch_payload_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
+impl DensePackedKvRestoreOptions {
+    /// Keeps descriptor grids finite and staging below a practical bound.
+    pub const MAX_BATCH_PAGES: usize = 4096;
+    pub const MAX_BATCH_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+
+    pub fn validate(self) -> Result<Self> {
+        if self.max_batch_pages == 0 || self.max_batch_pages > Self::MAX_BATCH_PAGES {
+            candle_core::bail!(
+                "dense packed KV max_batch_pages must be in 1..={}",
+                Self::MAX_BATCH_PAGES
+            )
+        }
+        if self.max_batch_payload_bytes == 0
+            || self.max_batch_payload_bytes > Self::MAX_BATCH_PAYLOAD_BYTES
+        {
+            candle_core::bail!(
+                "dense packed KV max_batch_payload_bytes must be in 1..={}",
+                Self::MAX_BATCH_PAYLOAD_BYTES
+            )
+        }
+        Ok(self)
+    }
+}
+
+fn packed_payload_bytes(page: &DensePackedKvPage) -> Result<usize> {
+    page.codes
+        .len()
+        .checked_add(page.params.len().checked_mul(4).ok_or_else(|| {
+            candle_core::Error::Msg("dense packed KV payload byte count overflow".into())
+        })?)
+        .and_then(|bytes| bytes.checked_add(page.tail_bf16.len().checked_mul(2)?))
+        .and_then(|bytes| bytes.checked_add(page.exceptions.len().checked_mul(6)?))
+        .ok_or_else(|| {
+            candle_core::Error::Msg("dense packed KV payload byte count overflow".into())
+        })
 }
 
 /// Validate the complete batch before touching GPU slots. Only the standard
@@ -614,7 +674,22 @@ pub fn restore_dense_packed_kv_pages(
     cache: &GpuKvCache,
     requests: &[DensePackedKvRestore<'_>],
 ) -> Result<DensePackedKvRestoreStats> {
-    restore_dense_packed_kv_pages_inner(cache, requests, true)
+    restore_dense_packed_kv_pages_with_options(
+        cache,
+        requests,
+        DensePackedKvRestoreOptions::default(),
+    )
+}
+
+/// Restore mutable pages with explicit CUDA launch limits. Every page is
+/// revalidated, and all destinations and single-page payloads are checked
+/// before the first write.
+pub fn restore_dense_packed_kv_pages_with_options(
+    cache: &GpuKvCache,
+    requests: &[DensePackedKvRestore<'_>],
+    options: DensePackedKvRestoreOptions,
+) -> Result<DensePackedKvRestoreStats> {
+    restore_dense_packed_kv_pages_inner(cache, requests, true, options)
 }
 
 /// Restore pages that have already passed shape and checksum validation.
@@ -625,6 +700,20 @@ pub fn restore_dense_packed_kv_pages_sealed(
     cache: &GpuKvCache,
     requests: &[SealedDensePackedKvRestore<'_>],
 ) -> Result<DensePackedKvRestoreStats> {
+    restore_dense_packed_kv_pages_sealed_with_options(
+        cache,
+        requests,
+        DensePackedKvRestoreOptions::default(),
+    )
+}
+
+/// Restore already validated sealed pages with explicit CUDA launch limits.
+/// Destination and payload checks still cover the full batch before writes.
+pub fn restore_dense_packed_kv_pages_sealed_with_options(
+    cache: &GpuKvCache,
+    requests: &[SealedDensePackedKvRestore<'_>],
+    options: DensePackedKvRestoreOptions,
+) -> Result<DensePackedKvRestoreStats> {
     let borrowed: Vec<_> = requests
         .iter()
         .map(|request| DensePackedKvRestore {
@@ -634,14 +723,16 @@ pub fn restore_dense_packed_kv_pages_sealed(
             page: request.page.page(),
         })
         .collect();
-    restore_dense_packed_kv_pages_inner(cache, &borrowed, false)
+    restore_dense_packed_kv_pages_inner(cache, &borrowed, false, options)
 }
 
 fn restore_dense_packed_kv_pages_inner(
     cache: &GpuKvCache,
     requests: &[DensePackedKvRestore<'_>],
     validate_pages: bool,
+    options: DensePackedKvRestoreOptions,
 ) -> Result<DensePackedKvRestoreStats> {
+    let options = options.validate()?;
     let GpuKvCache::Flash(pairs) = cache else {
         candle_core::bail!("dense packed KV restore requires a standard Flash cache")
     };
@@ -704,19 +795,33 @@ fn restore_dense_packed_kv_pages_inner(
             candle_core::bail!("overlapping dense packed KV destination pages")
         }
         entry.push(interval);
-        stats.pages += 1;
-        stats.packed_bytes += page.codes.len()
-            + page.params.len() * 4
-            + page.tail_bf16.len() * 2
-            + page.exceptions.len() * 6;
-        stats.output_bytes += page.tokens as usize * heads * channels * 2;
+        let payload_bytes = packed_payload_bytes(page)?;
+        if payload_bytes > options.max_batch_payload_bytes {
+            candle_core::bail!("dense packed KV page exceeds max_batch_payload_bytes")
+        }
+        stats.pages = stats
+            .pages
+            .checked_add(1)
+            .ok_or_else(|| candle_core::Error::Msg("dense packed KV page count overflow".into()))?;
+        stats.packed_bytes = stats
+            .packed_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| {
+                candle_core::Error::Msg("dense packed KV total payload overflow".into())
+            })?;
+        stats.output_bytes = stats
+            .output_bytes
+            .checked_add(page.tokens as usize * heads * channels * 2)
+            .ok_or_else(|| {
+                candle_core::Error::Msg("dense packed KV total output overflow".into())
+            })?;
     }
     if requests.is_empty() {
         return Ok(stats);
     }
     #[cfg(feature = "cuda")]
     {
-        cuda::expand(pairs, requests, &mut stats)?;
+        cuda::expand(pairs, requests, options, &mut stats)?;
         Ok(stats)
     }
     #[cfg(not(feature = "cuda"))]

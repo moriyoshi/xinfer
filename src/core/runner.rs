@@ -940,12 +940,24 @@ impl ModelRunner {
         &self,
         requests: &[crate::utils::packed_kv_restore::DensePackedKvRestore<'_>],
     ) -> Result<crate::utils::packed_kv_restore::DensePackedKvRestoreStats> {
+        self.restore_dense_packed_kv_pages_with_options(
+            requests,
+            crate::utils::packed_kv_restore::DensePackedKvRestoreOptions::default(),
+        )
+    }
+
+    pub fn restore_dense_packed_kv_pages_with_options(
+        &self,
+        requests: &[crate::utils::packed_kv_restore::DensePackedKvRestore<'_>],
+        options: crate::utils::packed_kv_restore::DensePackedKvRestoreOptions,
+    ) -> Result<crate::utils::packed_kv_restore::DensePackedKvRestoreStats> {
         if self.config.kvcache_dtype.is_turboquant() {
             candle_core::bail!("dense packed KV restore cannot target TurboQuant cache mode")
         }
-        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages(
+        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages_with_options(
             &self.get_kv_cache(),
             requests,
+            options,
         )
     }
 
@@ -955,12 +967,24 @@ impl ModelRunner {
         &self,
         requests: &[crate::utils::packed_kv_restore::SealedDensePackedKvRestore<'_>],
     ) -> Result<crate::utils::packed_kv_restore::DensePackedKvRestoreStats> {
+        self.restore_dense_packed_kv_pages_sealed_with_options(
+            requests,
+            crate::utils::packed_kv_restore::DensePackedKvRestoreOptions::default(),
+        )
+    }
+
+    pub fn restore_dense_packed_kv_pages_sealed_with_options(
+        &self,
+        requests: &[crate::utils::packed_kv_restore::SealedDensePackedKvRestore<'_>],
+        options: crate::utils::packed_kv_restore::DensePackedKvRestoreOptions,
+    ) -> Result<crate::utils::packed_kv_restore::DensePackedKvRestoreStats> {
         if self.config.kvcache_dtype.is_turboquant() {
             candle_core::bail!("dense packed KV restore cannot target TurboQuant cache mode")
         }
-        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages_sealed(
+        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages_sealed_with_options(
             &self.get_kv_cache(),
             requests,
+            options,
         )
     }
 

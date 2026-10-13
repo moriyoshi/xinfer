@@ -4,8 +4,9 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use xinfer::utils::packed_kv_restore::{
     encode_dense_packed_kv_tile, restore_dense_packed_kv_pages,
-    restore_dense_packed_kv_pages_sealed, DensePackedKvPage, DensePackedKvRestore, PackedKvAxis,
-    PackedKvException, SealedDensePackedKvRestore,
+    restore_dense_packed_kv_pages_sealed, restore_dense_packed_kv_pages_sealed_with_options,
+    restore_dense_packed_kv_pages_with_options, DensePackedKvPage, DensePackedKvRestore,
+    DensePackedKvRestoreOptions, PackedKvAxis, PackedKvException, SealedDensePackedKvRestore,
 };
 
 #[cfg(feature = "cuda")]
@@ -372,6 +373,221 @@ fn batched_gpu_restore_matches_independent_bf16_and_exact_exceptions() -> Result
         .flatten_all()?
         .to_vec1::<half::bf16>()?;
     assert!(unchanged[..3072].iter().all(|word| word.to_bits() == 0));
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn restore_options_reject_invalid_and_oversized_pages_before_any_write() -> Result<()> {
+    let Ok(device) = Device::new_cuda(0) else {
+        return Ok(());
+    };
+    let (small, _) = fixture(PackedKvAxis::Key, 2)?;
+    let (large, _) = fixture(PackedKvAxis::Key, 4)?;
+    let bytes = |page: &DensePackedKvPage| {
+        page.codes.len()
+            + page.params.len() * 4
+            + page.tail_bf16.len() * 2
+            + page.exceptions.len() * 6
+    };
+    assert!(bytes(&large) > bytes(&small));
+    let make_cache = || -> Result<GpuKvCache> {
+        Ok(GpuKvCache::Flash(vec![(
+            Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+            Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+        )]))
+    };
+    let sealed_small = DensePackedKvPage::from_bytes_sealed(&small.to_bytes()?)?;
+    let sealed_large = DensePackedKvPage::from_bytes_sealed(&large.to_bytes()?)?;
+    let mutable = [
+        DensePackedKvRestore {
+            layer: 0,
+            block: 0,
+            token_offset: 0,
+            page: &small,
+        },
+        DensePackedKvRestore {
+            layer: 0,
+            block: 1,
+            token_offset: 0,
+            page: &large,
+        },
+    ];
+    let sealed = [
+        SealedDensePackedKvRestore {
+            layer: 0,
+            block: 0,
+            token_offset: 0,
+            page: &sealed_small,
+        },
+        SealedDensePackedKvRestore {
+            layer: 0,
+            block: 1,
+            token_offset: 0,
+            page: &sealed_large,
+        },
+    ];
+    let invalid = [
+        DensePackedKvRestoreOptions {
+            max_batch_pages: 0,
+            max_batch_payload_bytes: bytes(&large),
+        },
+        DensePackedKvRestoreOptions {
+            max_batch_pages: DensePackedKvRestoreOptions::MAX_BATCH_PAGES + 1,
+            max_batch_payload_bytes: bytes(&large),
+        },
+        DensePackedKvRestoreOptions {
+            max_batch_pages: 2,
+            max_batch_payload_bytes: 0,
+        },
+        DensePackedKvRestoreOptions {
+            max_batch_pages: 2,
+            max_batch_payload_bytes: DensePackedKvRestoreOptions::MAX_BATCH_PAYLOAD_BYTES + 1,
+        },
+        DensePackedKvRestoreOptions {
+            max_batch_pages: 2,
+            max_batch_payload_bytes: bytes(&small),
+        },
+        DensePackedKvRestoreOptions {
+            max_batch_pages: 2,
+            max_batch_payload_bytes: bytes(&small) - 1,
+        },
+    ];
+    for options in invalid {
+        let cache = make_cache()?;
+        assert!(restore_dense_packed_kv_pages_with_options(&cache, &mutable, options).is_err());
+        assert!(
+            restore_dense_packed_kv_pages_sealed_with_options(&cache, &sealed, options).is_err()
+        );
+        let actual = cache.as_pairs().unwrap()[0]
+            .0
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?;
+        assert!(actual.iter().all(|word| word.to_bits() == 0));
+    }
+    let hard_limit = DensePackedKvRestoreOptions {
+        max_batch_pages: 2,
+        max_batch_payload_bytes: bytes(&small),
+    };
+    let cache = make_cache()?;
+    assert!(restore_dense_packed_kv_pages_with_options(&cache, &mutable[1..], hard_limit).is_err());
+    assert!(
+        restore_dense_packed_kv_pages_sealed_with_options(&cache, &sealed[1..], hard_limit)
+            .is_err()
+    );
+    let at_boundary = DensePackedKvRestoreOptions {
+        max_batch_pages: 2,
+        max_batch_payload_bytes: bytes(&small),
+    };
+    let cache = make_cache()?;
+    let stats = restore_dense_packed_kv_pages_with_options(&cache, &mutable[..1], at_boundary)?;
+    assert_eq!(stats.max_batch_payload_bytes, bytes(&small));
+    assert_eq!(stats.max_batch_pages, 1);
+    let cache = make_cache()?;
+    let stats =
+        restore_dense_packed_kv_pages_sealed_with_options(&cache, &sealed[..1], at_boundary)?;
+    assert_eq!(stats.max_batch_payload_bytes, bytes(&small));
+    assert_eq!(stats.max_batch_pages, 1);
+    let small_requests = (0..2)
+        .map(|block| DensePackedKvRestore {
+            layer: 0,
+            block,
+            token_offset: 0,
+            page: &small,
+        })
+        .collect::<Vec<_>>();
+    let sealed_requests = (0..2)
+        .map(|block| SealedDensePackedKvRestore {
+            layer: 0,
+            block,
+            token_offset: 0,
+            page: &sealed_small,
+        })
+        .collect::<Vec<_>>();
+    let cache = make_cache()?;
+    let mutable_stats =
+        restore_dense_packed_kv_pages_with_options(&cache, &small_requests, at_boundary)?;
+    let cache = make_cache()?;
+    let sealed_stats =
+        restore_dense_packed_kv_pages_sealed_with_options(&cache, &sealed_requests, at_boundary)?;
+    assert_eq!(mutable_stats, sealed_stats);
+    assert_eq!(mutable_stats.kernel_launches, 2);
+    assert_eq!(mutable_stats.max_batch_pages, 1);
+    assert_eq!(mutable_stats.max_batch_payload_bytes, bytes(&small));
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn mixed_axis_2_4_bit_restore_respects_128_512_1024_page_limits() -> Result<()> {
+    let Ok(device) = Device::new_cuda(0) else {
+        return Ok(());
+    };
+    const PAGES: usize = 1025;
+    let pages = [
+        fixture(PackedKvAxis::Key, 2)?.0,
+        fixture(PackedKvAxis::Value, 2)?.0,
+        fixture(PackedKvAxis::Key, 4)?.0,
+        fixture(PackedKvAxis::Value, 4)?.0,
+    ];
+    let oracles = pages
+        .iter()
+        .map(DensePackedKvPage::decode_cpu_bf16)
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let sealed = pages
+        .iter()
+        .map(|page| DensePackedKvPage::from_bytes_sealed(&page.to_bytes()?))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let requests = (0..PAGES)
+        .map(|block| SealedDensePackedKvRestore {
+            layer: 0,
+            block,
+            token_offset: 0,
+            page: &sealed[block % 4],
+        })
+        .collect::<Vec<_>>();
+    for (page_limit, launches) in [(128, 9), (512, 3), (1024, 2)] {
+        let cache = GpuKvCache::Flash(vec![(
+            Tensor::zeros((PAGES, 96, 2, 16), DType::BF16, &device)?,
+            Tensor::zeros((PAGES, 96, 2, 16), DType::BF16, &device)?,
+        )]);
+        let options = DensePackedKvRestoreOptions {
+            max_batch_pages: page_limit,
+            max_batch_payload_bytes: 64 * 1024 * 1024,
+        };
+        let stats = restore_dense_packed_kv_pages_sealed_with_options(&cache, &requests, options)?;
+        assert_eq!(stats.pages, PAGES);
+        assert_eq!(stats.kernel_launches, launches);
+        assert_eq!(stats.max_batch_pages, page_limit);
+        assert!(stats.max_batch_payload_bytes <= options.max_batch_payload_bytes);
+        let pairs = cache.as_pairs().unwrap();
+        let keys = pairs[0]
+            .0
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?;
+        let values = pairs[0]
+            .1
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1::<half::bf16>()?;
+        for block in 0..PAGES {
+            let actual = if pages[block % 4].axis == PackedKvAxis::Key {
+                &keys
+            } else {
+                &values
+            };
+            let start = block * 96 * 2 * 16;
+            assert_eq!(
+                actual[start..start + 96 * 2 * 16]
+                    .iter()
+                    .map(|word| word.to_bits())
+                    .collect::<Vec<_>>(),
+                oracles[block % 4]
+            );
+        }
+    }
     Ok(())
 }
 
