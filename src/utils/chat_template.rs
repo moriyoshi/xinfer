@@ -468,7 +468,7 @@ impl ChatTemplate {
                   .as_deref()
                   .map(Value::from)
                   .unwrap_or(Value::from("medium")),
-              tools => tools,
+              tools => (!tools.is_empty()).then_some(tools),
             })
             .map_err(ApplyChatTemplateError::RenderTemplateError)
     }
@@ -802,6 +802,24 @@ You are MiniMax.
             rendered.contains("<invoke name=\"tool-name-1\">"),
             "rendered prompt: {}",
             rendered
+        );
+    }
+
+    #[test]
+    fn empty_tools_render_as_none_without_flattening_nonempty_tools() {
+        let template = build_template(
+            "{% if tools is not none %}Environment: ipython; {{ tools[0].function.name }}; {{ tools[0].function.parameters.type }}{% else %}Environment: no-tools{% endif %}",
+            false,
+        );
+        assert_eq!(
+            template.apply_chat_template(&Vec::new(), false).unwrap(),
+            "Environment: no-tools"
+        );
+
+        let tool = crate::tools::function_tool("search_web", "Search the web").build();
+        assert_eq!(
+            template.apply_chat_template(&vec![tool], false).unwrap(),
+            "Environment: ipython; search_web; object"
         );
     }
 
