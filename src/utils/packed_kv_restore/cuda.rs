@@ -2,14 +2,16 @@ use super::{
     packed_payload_bytes, DensePackedKvRestore, DensePackedKvRestoreOptions,
     DensePackedKvRestoreStats, PackedKvAxis,
 };
-use candle_core::cuda_backend::cudarc::driver::{capture_status, sys::CUstreamCaptureStatus};
-use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr, LaunchAsync, LaunchConfig};
+use candle_core::cuda_backend::cudarc::driver::{
+    capture_status, result::memcpy_htod_async, sys::CUstreamCaptureStatus, DevicePtr, DeviceRepr,
+    LaunchAsync, LaunchConfig,
+};
 use candle_core::cuda_backend::cudarc::nvrtc::compile_ptx;
 use candle_core::{Result, Storage, Tensor};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-const MODULE: &str = "xinfer_dense_packed_kv_v1";
+const MODULE: &str = "xinfer_dense_packed_kv_v2";
 const KERNEL: &str = "expand_dense_packed_kv";
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -35,6 +37,81 @@ struct GpuPage {
 
 // All fields are plain integers and the CUDA definition has the same C layout.
 unsafe impl DeviceRepr for GpuPage {}
+// The C layout is 8 bytes followed by fourteen 4-byte integers: no padding.
+// The CUDA declaration in expand.cu has the same field order and size.
+const _: () = assert!(std::mem::size_of::<GpuPage>() == 64);
+unsafe impl bytemuck::Zeroable for GpuPage {}
+unsafe impl bytemuck::Pod for GpuPage {}
+
+#[derive(Clone, Copy)]
+struct ArenaLayout {
+    codes: usize,
+    params: usize,
+    tails: usize,
+    exception_indices: usize,
+    exception_values: usize,
+    bytes: usize,
+}
+
+fn aligned(value: usize, alignment: usize) -> Result<usize> {
+    value
+        .checked_add(alignment - 1)
+        .map(|end| end & !(alignment - 1))
+        .ok_or_else(|| candle_core::Error::Msg("dense packed KV arena size overflow".into()))
+}
+
+fn append_bytes(offset: usize, items: usize, item_bytes: usize) -> Result<usize> {
+    offset
+        .checked_add(
+            items.checked_mul(item_bytes).ok_or_else(|| {
+                candle_core::Error::Msg("dense packed KV arena size overflow".into())
+            })?,
+        )
+        .ok_or_else(|| candle_core::Error::Msg("dense packed KV arena size overflow".into()))
+}
+
+impl ArenaLayout {
+    fn new(
+        pages: usize,
+        codes: usize,
+        params: usize,
+        tails: usize,
+        exceptions: usize,
+    ) -> Result<Self> {
+        let codes_offset = append_bytes(0, pages, std::mem::size_of::<GpuPage>())?;
+        let params_offset = aligned(append_bytes(codes_offset, codes, 1)?, 4)?;
+        let tails_offset = aligned(append_bytes(params_offset, params, 4)?, 2)?;
+        let indices_offset = aligned(append_bytes(tails_offset, tails, 2)?, 4)?;
+        let values_offset = aligned(append_bytes(indices_offset, exceptions, 4)?, 2)?;
+        let bytes = append_bytes(values_offset, exceptions, 2)?;
+        for offset in [
+            codes_offset,
+            params_offset,
+            tails_offset,
+            indices_offset,
+            values_offset,
+            bytes,
+        ] {
+            as_u32(offset)?;
+        }
+        Ok(Self {
+            codes: codes_offset,
+            params: params_offset,
+            tails: tails_offset,
+            exception_indices: indices_offset,
+            exception_values: values_offset,
+            bytes,
+        })
+    }
+}
+
+struct BatchPlan {
+    indices: Vec<usize>,
+    descriptors: Vec<GpuPage>,
+    layout: ArenaLayout,
+    payload_bytes: usize,
+    max_words: usize,
+}
 
 fn as_u32(value: usize) -> Result<u32> {
     u32::try_from(value)
@@ -91,21 +168,29 @@ pub(super) fn expand(
     }
     // Avoid launching a giant grid for a batch dominated by tiny pages.
     // A bucket spans at most an eightfold output-word range.
-    let mut groups: BTreeMap<u32, Vec<&DensePackedKvRestore<'_>>> = BTreeMap::new();
-    for request in requests {
+    let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (index, request) in requests.iter().enumerate() {
         let words = request.page.tokens as usize
             * request.page.heads as usize
             * request.page.channels as usize;
         let bucket = (usize::BITS - 1 - words.leading_zeros()) / 3;
-        groups.entry(bucket).or_default().push(request);
+        groups.entry(bucket).or_default().push(index);
     }
+    // Plan every batch before the first write. Besides preserving the hard
+    // payload budget, this gives one finite arena capacity for the whole call.
+    let mut plans = Vec::new();
     for group in groups.values() {
         let mut cursor = 0usize;
         while cursor < group.len() {
             let start = cursor;
             let mut payload_bytes = 0usize;
+            let mut codes = 0usize;
+            let mut params = 0usize;
+            let mut tails = 0usize;
+            let mut exceptions = 0usize;
+            let mut max_words = 0usize;
             while cursor < group.len() && cursor - start < options.max_batch_pages {
-                let page = group[cursor].page;
+                let page = requests[group[cursor]].page;
                 let bytes = packed_payload_bytes(page)?;
                 // Every page was checked against this hard limit before GPU
                 // writes. Keep the guard here for the accumulated batch too.
@@ -113,31 +198,48 @@ pub(super) fn expand(
                     break;
                 }
                 payload_bytes += bytes;
+                codes = codes.checked_add(page.codes.len()).ok_or_else(|| {
+                    candle_core::Error::Msg("dense packed KV code count overflow".into())
+                })?;
+                params = params.checked_add(page.params.len()).ok_or_else(|| {
+                    candle_core::Error::Msg("dense packed KV parameter count overflow".into())
+                })?;
+                tails = tails.checked_add(page.tail_bf16.len()).ok_or_else(|| {
+                    candle_core::Error::Msg("dense packed KV tail count overflow".into())
+                })?;
+                exceptions = exceptions
+                    .checked_add(page.exceptions.len())
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg("dense packed KV exception count overflow".into())
+                    })?;
+                max_words = max_words
+                    .max(page.tokens as usize * page.heads as usize * page.channels as usize);
                 cursor += 1;
             }
             if cursor == start {
                 candle_core::bail!("dense packed KV page exceeds max_batch_payload_bytes")
             }
-            let chunk = &group[start..cursor];
-            let mut descriptors = Vec::with_capacity(chunk.len());
-            let mut codes = Vec::new();
-            let mut params = Vec::new();
-            let mut tails = Vec::new();
-            let mut exception_indices = Vec::new();
-            let mut exception_values = Vec::new();
-            let mut max_words = 0usize;
-            for request in chunk {
+            let layout = ArenaLayout::new(cursor - start, codes, params, tails, exceptions)?;
+            // Descriptor and at most seven alignment bytes are outside the
+            // caller's packed-payload budget, but still bounded by page cap.
+            let overhead_limit = options
+                .max_batch_pages
+                .checked_mul(std::mem::size_of::<GpuPage>())
+                .and_then(|bytes| bytes.checked_add(7))
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("dense packed KV arena overhead overflow".into())
+                })?;
+            if layout.bytes > options.max_batch_payload_bytes + overhead_limit {
+                candle_core::bail!("dense packed KV aligned staging exceeds bounded arena")
+            }
+            let mut descriptors = Vec::with_capacity(cursor - start);
+            let mut code_offset = 0usize;
+            let mut param_offset = 0usize;
+            let mut tail_offset = 0usize;
+            let mut exception_offset = 0usize;
+            for &index in &group[start..cursor] {
+                let request = &requests[index];
                 let page = request.page;
-                for (current, additional) in [
-                    (codes.len(), page.codes.len()),
-                    (params.len(), page.params.len()),
-                    (tails.len(), page.tail_bf16.len()),
-                    (exception_indices.len(), page.exceptions.len()),
-                ] {
-                    as_u32(current.checked_add(additional).ok_or_else(|| {
-                        candle_core::Error::Msg("dense packed KV batch length overflow".into())
-                    })?)?;
-                }
                 let target = if page.axis == PackedKvAxis::Key {
                     &pairs[request.layer].0
                 } else {
@@ -145,10 +247,10 @@ pub(super) fn expand(
                 };
                 descriptors.push(GpuPage {
                     destination: destination_pointer(target, request.block)?,
-                    code_offset: as_u32(codes.len())?,
-                    param_offset: as_u32(params.len())?,
-                    tail_offset: as_u32(tails.len())?,
-                    exception_offset: as_u32(exception_indices.len())?,
+                    code_offset: as_u32(code_offset)?,
+                    param_offset: as_u32(param_offset)?,
+                    tail_offset: as_u32(tail_offset)?,
+                    exception_offset: as_u32(exception_offset)?,
                     exception_count: as_u32(page.exceptions.len())?,
                     tokens: page.tokens,
                     heads: page.heads,
@@ -160,81 +262,108 @@ pub(super) fn expand(
                     slot_offset: as_u32(request.token_offset)?,
                     key: u32::from(page.axis == PackedKvAxis::Key),
                 });
-                codes.extend_from_slice(&page.codes);
-                params.extend_from_slice(&page.params);
-                tails.extend_from_slice(&page.tail_bf16);
-                for exception in &page.exceptions {
-                    exception_indices.push(exception.index);
-                    exception_values.push(exception.bf16_bits);
-                }
-                max_words = max_words
-                    .max(page.tokens as usize * page.heads as usize * page.channels as usize);
+                code_offset += page.codes.len();
+                param_offset += page.params.len();
+                tail_offset += page.tail_bf16.len();
+                exception_offset += page.exceptions.len();
             }
-            // A batch may contain all-exact pages or no sparse exceptions. These
-            // one-word placeholders are never dereferenced by the kernel.
-            if codes.is_empty() {
-                codes.push(0);
-            }
-            if params.is_empty() {
-                params.push(0.0);
-            }
-            if tails.is_empty() {
-                tails.push(0);
-            }
-            if exception_indices.is_empty() {
-                exception_indices.push(0);
-                exception_values.push(0);
-            }
-            let d_descriptors = device.htod_copy(descriptors).map_err(|e| {
-                candle_core::Error::Msg(format!("upload packed KV descriptors: {e}"))
-            })?;
-            let d_codes = device
-                .htod_copy(codes)
-                .map_err(|e| candle_core::Error::Msg(format!("upload packed KV codes: {e}")))?;
-            let d_params = device
-                .htod_copy(params)
-                .map_err(|e| candle_core::Error::Msg(format!("upload packed KV scales: {e}")))?;
-            let d_tails = device
-                .htod_copy(tails)
-                .map_err(|e| candle_core::Error::Msg(format!("upload packed KV tail: {e}")))?;
-            let d_indices = device.htod_copy(exception_indices).map_err(|e| {
-                candle_core::Error::Msg(format!("upload packed KV exceptions: {e}"))
-            })?;
-            let d_values = device.htod_copy(exception_values).map_err(|e| {
-                candle_core::Error::Msg(format!("upload packed KV exception values: {e}"))
-            })?;
-            let function = device
-                .get_func(MODULE, KERNEL)
-                .ok_or_else(|| candle_core::Error::Msg("missing dense packed KV kernel".into()))?;
-            let blocks = as_u32(max_words.div_ceil(256))?;
-            let config = LaunchConfig {
-                grid_dim: (blocks, as_u32(chunk.len())?, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            // The descriptors and all buffers live through synchronization below;
-            // every validated destination tensor is held by `pairs` throughout.
-            unsafe {
-                function.launch(
-                    config,
-                    (
-                        &d_descriptors,
-                        &d_codes,
-                        &d_params,
-                        &d_tails,
-                        &d_indices,
-                        &d_values,
-                    ),
-                )
-            }
-            .map_err(|e| candle_core::Error::Msg(format!("launch dense packed KV: {e}")))?;
-            device.synchronize().map_err(|e| {
-                candle_core::Error::Msg(format!("synchronize dense packed KV: {e}"))
-            })?;
-            stats.kernel_launches += 1;
-            stats.max_batch_pages = stats.max_batch_pages.max(chunk.len());
-            stats.max_batch_payload_bytes = stats.max_batch_payload_bytes.max(payload_bytes);
+            plans.push(BatchPlan {
+                indices: group[start..cursor].to_vec(),
+                descriptors,
+                layout,
+                payload_bytes,
+                max_words,
+            });
         }
+    }
+    let capacity = plans.iter().map(|plan| plan.layout.bytes).max().unwrap();
+    // One page-locked host arena and one CUDA allocation are reused only after
+    // the matching upload and kernel have completed on this stream.
+    let mut host = unsafe { device.alloc_pinned::<u8>(capacity) }
+        .map_err(|e| candle_core::Error::Msg(format!("allocate packed KV pinned arena: {e}")))?;
+    stats.staging_host_allocations = 1;
+    let arena_gpu = unsafe { device.alloc::<u8>(capacity) }
+        .map_err(|e| candle_core::Error::Msg(format!("allocate packed KV GPU arena: {e}")))?;
+    stats.staging_device_allocations = 1;
+    let function = device
+        .get_func(MODULE, KERNEL)
+        .ok_or_else(|| candle_core::Error::Msg("missing dense packed KV kernel".into()))?;
+    for plan in plans {
+        let staging = &mut host.as_mut_slice()[..plan.layout.bytes];
+        // Pinned memory starts uninitialized. This also initializes alignment
+        // padding, which is uploaded but never read by the kernel.
+        staging.fill(0);
+        let mut code_offset = 0usize;
+        let mut param_offset = 0usize;
+        let mut tail_offset = 0usize;
+        let mut exception_offset = 0usize;
+        for index in &plan.indices {
+            let request = &requests[*index];
+            let page = request.page;
+            let start = plan.layout.codes + code_offset;
+            staging[start..start + page.codes.len()].copy_from_slice(&page.codes);
+            let start = plan.layout.params + param_offset * 4;
+            staging[start..start + page.params.len() * 4]
+                .copy_from_slice(bytemuck::cast_slice(&page.params));
+            let start = plan.layout.tails + tail_offset * 2;
+            staging[start..start + page.tail_bf16.len() * 2]
+                .copy_from_slice(bytemuck::cast_slice(&page.tail_bf16));
+            for exception in &page.exceptions {
+                let index = plan.layout.exception_indices + exception_offset * 4;
+                staging[index..index + 4].copy_from_slice(&exception.index.to_le_bytes());
+                let value = plan.layout.exception_values + exception_offset * 2;
+                staging[value..value + 2].copy_from_slice(&exception.bf16_bits.to_le_bytes());
+                exception_offset += 1;
+            }
+            code_offset += page.codes.len();
+            param_offset += page.params.len();
+            tail_offset += page.tail_bf16.len();
+        }
+        staging[..plan.descriptors.len() * std::mem::size_of::<GpuPage>()]
+            .copy_from_slice(bytemuck::cast_slice(&plan.descriptors));
+        let blocks = as_u32(plan.max_words.div_ceil(256))?;
+        let config = LaunchConfig {
+            grid_dim: (blocks, as_u32(plan.indices.len())?, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        device
+            .bind_to_thread()
+            .map_err(|e| candle_core::Error::Msg(format!("bind packed KV CUDA context: {e}")))?;
+        // The upload and kernel share one stream. Synchronize even on a
+        // submission error before reusing or dropping the pinned buffer.
+        let submitted =
+            unsafe { memcpy_htod_async(*arena_gpu.device_ptr(), staging, *device.cu_stream()) }
+                .map_err(|e| candle_core::Error::Msg(format!("upload packed KV arena: {e}")))
+                .and_then(|_| unsafe {
+                    function
+                        .clone()
+                        .launch(
+                            config,
+                            (
+                                &arena_gpu,
+                                as_u32(plan.layout.codes)?,
+                                as_u32(plan.layout.params)?,
+                                as_u32(plan.layout.tails)?,
+                                as_u32(plan.layout.exception_indices)?,
+                                as_u32(plan.layout.exception_values)?,
+                            ),
+                        )
+                        .map_err(|e| {
+                            candle_core::Error::Msg(format!("launch dense packed KV: {e}"))
+                        })
+                });
+        let synchronized = device
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("synchronize dense packed KV: {e}")));
+        submitted?;
+        synchronized?;
+        stats.kernel_launches += 1;
+        stats.staging_uploads += 1;
+        stats.batch_synchronizations += 1;
+        stats.max_batch_pages = stats.max_batch_pages.max(plan.indices.len());
+        stats.max_batch_payload_bytes = stats.max_batch_payload_bytes.max(plan.payload_bytes);
+        stats.max_batch_staging_bytes = stats.max_batch_staging_bytes.max(plan.layout.bytes);
     }
     Ok(())
 }

@@ -11,9 +11,16 @@ struct GpuPage {
 };
 
 extern "C" __global__ void expand_dense_packed_kv(
-    const GpuPage* pages, const uint8_t* codes, const float* params,
-    const uint16_t* tails, const uint32_t* exception_indices,
-    const uint16_t* exception_values) {
+    const uint8_t* arena, uint32_t codes_offset, uint32_t params_offset,
+    uint32_t tails_offset, uint32_t indices_offset, uint32_t values_offset) {
+  const GpuPage* pages = reinterpret_cast<const GpuPage*>(arena);
+  const uint8_t* codes = arena + codes_offset;
+  const float* params = reinterpret_cast<const float*>(arena + params_offset);
+  const uint16_t* tails = reinterpret_cast<const uint16_t*>(arena + tails_offset);
+  const uint32_t* exception_indices =
+      reinterpret_cast<const uint32_t*>(arena + indices_offset);
+  const uint16_t* exception_values =
+      reinterpret_cast<const uint16_t*>(arena + values_offset);
   const GpuPage page = pages[blockIdx.y];
   const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t width = page.heads * page.channels;

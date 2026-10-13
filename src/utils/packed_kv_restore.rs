@@ -610,6 +610,15 @@ pub struct DensePackedKvRestoreStats {
     /// Largest sum of packed codes, parameters, tails and exceptions staged
     /// for one launch. Excludes descriptors and empty-buffer placeholders.
     pub max_batch_payload_bytes: usize,
+    /// Largest aligned descriptor-plus-payload transfer. The reusable host
+    /// and GPU arenas each reserve this many bytes for the restore call.
+    pub max_batch_staging_bytes: usize,
+    /// CUDA transfers, allocations and synchronizations for the expansion
+    /// arena itself. Destination cache allocation is owned by the caller.
+    pub staging_uploads: usize,
+    pub staging_host_allocations: usize,
+    pub staging_device_allocations: usize,
+    pub batch_synchronizations: usize,
 }
 
 /// Limits for one dense packed KV expansion launch. The payload budget counts

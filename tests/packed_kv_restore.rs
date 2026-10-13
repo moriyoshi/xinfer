@@ -233,6 +233,11 @@ fn batched_gpu_restore_matches_independent_bf16_and_exact_exceptions() -> Result
     let stats = restore_dense_packed_kv_pages(&cache, &requests)?;
     assert_eq!(stats.pages, 6);
     assert_eq!(stats.kernel_launches, 1);
+    assert_eq!(stats.staging_uploads, 1);
+    assert_eq!(stats.staging_host_allocations, 1);
+    assert_eq!(stats.staging_device_allocations, 1);
+    assert_eq!(stats.batch_synchronizations, 1);
+    assert!(stats.max_batch_staging_bytes >= stats.max_batch_payload_bytes + 6 * 64);
     let sealed_pages = pages
         .iter()
         .map(|page| DensePackedKvPage::from_bytes_sealed(&page.to_bytes()?))
@@ -559,8 +564,15 @@ fn mixed_axis_2_4_bit_restore_respects_128_512_1024_page_limits() -> Result<()> 
         let stats = restore_dense_packed_kv_pages_sealed_with_options(&cache, &requests, options)?;
         assert_eq!(stats.pages, PAGES);
         assert_eq!(stats.kernel_launches, launches);
+        assert_eq!(stats.staging_uploads, launches);
+        assert_eq!(stats.batch_synchronizations, launches);
+        assert_eq!(stats.staging_host_allocations, 1);
+        assert_eq!(stats.staging_device_allocations, 1);
         assert_eq!(stats.max_batch_pages, page_limit);
         assert!(stats.max_batch_payload_bytes <= options.max_batch_payload_bytes);
+        assert!(
+            stats.max_batch_staging_bytes <= options.max_batch_payload_bytes + page_limit * 64 + 7
+        );
         let pairs = cache.as_pairs().unwrap();
         let keys = pairs[0]
             .0

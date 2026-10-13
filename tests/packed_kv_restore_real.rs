@@ -207,8 +207,16 @@ mod cuda_test {
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                 ensure!(stats.pages == 36_864);
                 ensure!(stats.kernel_launches == 36_864 / page_limit);
+                ensure!(stats.staging_uploads == stats.kernel_launches);
+                ensure!(stats.batch_synchronizations == stats.kernel_launches);
+                ensure!(stats.staging_host_allocations == 1);
+                ensure!(stats.staging_device_allocations == 1);
                 ensure!(stats.max_batch_pages == page_limit);
                 ensure!(stats.max_batch_payload_bytes <= options.max_batch_payload_bytes);
+                ensure!(
+                    stats.max_batch_staging_bytes
+                        <= options.max_batch_payload_bytes + page_limit * 64 + 7
+                );
                 if repeat == 0 {
                     for (layer, (key, value)) in gpu_cache.as_pairs().unwrap().iter().enumerate() {
                         for (axis, tensor) in [key, value].into_iter().enumerate() {
@@ -241,7 +249,7 @@ mod cuda_test {
                     }
                 }
                 samples.push(elapsed);
-                eprintln!("qwen3_4b_8192 page_limit={page_limit} repeat={repeat} restore_ms={elapsed:.3} launches={} max_pages={} max_payload={} packed_bytes={}", stats.kernel_launches, stats.max_batch_pages, stats.max_batch_payload_bytes, stats.packed_bytes);
+                eprintln!("qwen3_4b_8192 page_limit={page_limit} repeat={repeat} restore_ms={elapsed:.3} launches={} uploads={} host_allocs={} device_allocs={} syncs={} max_pages={} max_payload={} max_staging={} packed_bytes={}", stats.kernel_launches, stats.staging_uploads, stats.staging_host_allocations, stats.staging_device_allocations, stats.batch_synchronizations, stats.max_batch_pages, stats.max_batch_payload_bytes, stats.max_batch_staging_bytes, stats.packed_bytes);
             }
             eprintln!(
                 "qwen3_4b_8192 page_limit={page_limit} first_ms={:.3} later_ms={:.3}",
