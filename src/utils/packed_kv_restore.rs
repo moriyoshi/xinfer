@@ -618,7 +618,40 @@ pub struct DensePackedKvRestoreStats {
     pub staging_uploads: usize,
     pub staging_host_allocations: usize,
     pub staging_device_allocations: usize,
+    /// Host waits: serial waits once per batch; the two-buffer path waits
+    /// before reusing a slot and drains the stream once at the end.
     pub batch_synchronizations: usize,
+    /// Peak logical bytes reserved across pinned host and GPU staging arenas.
+    /// CUDA allocator metadata and alignment are outside this count.
+    pub max_aggregate_staging_bytes: usize,
+}
+
+/// Execution mode for dense packed KV expansion. The default restore APIs
+/// retain the serial, one-buffer path. The opt-in pipeline overlaps CPU
+/// staging of the next batch with work already queued on the CUDA stream.
+/// The cap applies to staging only; destination KV slots belong to the caller.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DensePackedKvRestoreExecution {
+    #[default]
+    Serial,
+    TwoBuffer {
+        /// Hard cap across both pinned host and GPU staging allocations.
+        max_aggregate_staging_bytes: usize,
+    },
+}
+
+/// Opt-in host wall timings. CUDA work is asynchronous: submission measures
+/// API time and synchronization includes queued GPU work, not GPU kernel time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DensePackedKvRestorePhaseTimings {
+    pub validation_ns: u64,
+    pub module_ns: u64,
+    pub planning_ns: u64,
+    pub allocation_ns: u64,
+    pub host_fill_ns: u64,
+    pub padding_ns: u64,
+    pub submission_ns: u64,
+    pub synchronization_ns: u64,
 }
 
 /// Limits for one dense packed KV expansion launch. The payload budget counts
@@ -698,7 +731,43 @@ pub fn restore_dense_packed_kv_pages_with_options(
     requests: &[DensePackedKvRestore<'_>],
     options: DensePackedKvRestoreOptions,
 ) -> Result<DensePackedKvRestoreStats> {
-    restore_dense_packed_kv_pages_inner(cache, requests, true, options)
+    restore_dense_packed_kv_pages_inner(
+        cache,
+        requests,
+        true,
+        options,
+        DensePackedKvRestoreExecution::Serial,
+        None,
+    )
+}
+
+/// Opt-in execution mode with an explicit aggregate staging memory cap.
+pub fn restore_dense_packed_kv_pages_with_execution(
+    cache: &GpuKvCache,
+    requests: &[DensePackedKvRestore<'_>],
+    options: DensePackedKvRestoreOptions,
+    execution: DensePackedKvRestoreExecution,
+) -> Result<DensePackedKvRestoreStats> {
+    restore_dense_packed_kv_pages_inner(cache, requests, true, options, execution, None)
+}
+
+/// Profile validation, planning, staging and CUDA submission/synchronization.
+pub fn restore_dense_packed_kv_pages_profiled(
+    cache: &GpuKvCache,
+    requests: &[DensePackedKvRestore<'_>],
+    options: DensePackedKvRestoreOptions,
+    execution: DensePackedKvRestoreExecution,
+) -> Result<(DensePackedKvRestoreStats, DensePackedKvRestorePhaseTimings)> {
+    let mut timings = DensePackedKvRestorePhaseTimings::default();
+    let stats = restore_dense_packed_kv_pages_inner(
+        cache,
+        requests,
+        true,
+        options,
+        execution,
+        Some(&mut timings),
+    )?;
+    Ok((stats, timings))
 }
 
 /// Restore pages that have already passed shape and checksum validation.
@@ -732,7 +801,61 @@ pub fn restore_dense_packed_kv_pages_sealed_with_options(
             page: request.page.page(),
         })
         .collect();
-    restore_dense_packed_kv_pages_inner(cache, &borrowed, false, options)
+    restore_dense_packed_kv_pages_inner(
+        cache,
+        &borrowed,
+        false,
+        options,
+        DensePackedKvRestoreExecution::Serial,
+        None,
+    )
+}
+
+/// Opt-in sealed restore with explicit aggregate staging memory cap.
+pub fn restore_dense_packed_kv_pages_sealed_with_execution(
+    cache: &GpuKvCache,
+    requests: &[SealedDensePackedKvRestore<'_>],
+    options: DensePackedKvRestoreOptions,
+    execution: DensePackedKvRestoreExecution,
+) -> Result<DensePackedKvRestoreStats> {
+    let borrowed: Vec<_> = requests
+        .iter()
+        .map(|request| DensePackedKvRestore {
+            layer: request.layer,
+            block: request.block,
+            token_offset: request.token_offset,
+            page: request.page.page(),
+        })
+        .collect();
+    restore_dense_packed_kv_pages_inner(cache, &borrowed, false, options, execution, None)
+}
+
+/// Profile the sealed restore path without rehashing immutable pages.
+pub fn restore_dense_packed_kv_pages_sealed_profiled(
+    cache: &GpuKvCache,
+    requests: &[SealedDensePackedKvRestore<'_>],
+    options: DensePackedKvRestoreOptions,
+    execution: DensePackedKvRestoreExecution,
+) -> Result<(DensePackedKvRestoreStats, DensePackedKvRestorePhaseTimings)> {
+    let borrowed: Vec<_> = requests
+        .iter()
+        .map(|request| DensePackedKvRestore {
+            layer: request.layer,
+            block: request.block,
+            token_offset: request.token_offset,
+            page: request.page.page(),
+        })
+        .collect();
+    let mut timings = DensePackedKvRestorePhaseTimings::default();
+    let stats = restore_dense_packed_kv_pages_inner(
+        cache,
+        &borrowed,
+        false,
+        options,
+        execution,
+        Some(&mut timings),
+    )?;
+    Ok((stats, timings))
 }
 
 fn restore_dense_packed_kv_pages_inner(
@@ -740,7 +863,10 @@ fn restore_dense_packed_kv_pages_inner(
     requests: &[DensePackedKvRestore<'_>],
     validate_pages: bool,
     options: DensePackedKvRestoreOptions,
+    execution: DensePackedKvRestoreExecution,
+    mut timings: Option<&mut DensePackedKvRestorePhaseTimings>,
 ) -> Result<DensePackedKvRestoreStats> {
+    let validation_start = timings.as_ref().map(|_| std::time::Instant::now());
     let options = options.validate()?;
     let GpuKvCache::Flash(pairs) = cache else {
         candle_core::bail!("dense packed KV restore requires a standard Flash cache")
@@ -826,16 +952,22 @@ fn restore_dense_packed_kv_pages_inner(
             })?;
     }
     if requests.is_empty() {
+        if let (Some(start), Some(timing)) = (validation_start, timings.as_deref_mut()) {
+            timing.validation_ns = start.elapsed().as_nanos() as u64;
+        }
         return Ok(stats);
+    }
+    if let (Some(start), Some(timing)) = (validation_start, timings.as_deref_mut()) {
+        timing.validation_ns = start.elapsed().as_nanos() as u64;
     }
     #[cfg(feature = "cuda")]
     {
-        cuda::expand(pairs, requests, options, &mut stats)?;
+        cuda::expand(pairs, requests, options, execution, &mut stats, timings)?;
         Ok(stats)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = device;
+        let _ = (device, execution, timings);
         candle_core::bail!("dense packed KV GPU expansion requires the cuda feature")
     }
 }

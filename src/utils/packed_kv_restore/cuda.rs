@@ -1,15 +1,19 @@
 use super::{
-    packed_payload_bytes, DensePackedKvRestore, DensePackedKvRestoreOptions,
-    DensePackedKvRestoreStats, PackedKvAxis,
+    packed_payload_bytes, DensePackedKvRestore, DensePackedKvRestoreExecution,
+    DensePackedKvRestoreOptions, DensePackedKvRestorePhaseTimings, DensePackedKvRestoreStats,
+    PackedKvAxis,
 };
 use candle_core::cuda_backend::cudarc::driver::{
-    capture_status, result::memcpy_htod_async, sys::CUstreamCaptureStatus, DevicePtr, DeviceRepr,
-    LaunchAsync, LaunchConfig,
+    capture_status,
+    result::{event, memcpy_htod_async},
+    sys::{self, CUstreamCaptureStatus},
+    DevicePtr, DeviceRepr, LaunchAsync, LaunchConfig,
 };
 use candle_core::cuda_backend::cudarc::nvrtc::compile_ptx;
 use candle_core::{Result, Storage, Tensor};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Instant;
 
 const MODULE: &str = "xinfer_dense_packed_kv_v2";
 const KERNEL: &str = "expand_dense_packed_kv";
@@ -103,6 +107,42 @@ impl ArenaLayout {
             bytes,
         })
     }
+
+    // The five payload sections and the descriptor section are written in
+    // full by stage_batch. Only alignment gaps need explicit initialization.
+    fn zero_padding(
+        self,
+        staging: &mut [u8],
+        descriptors: usize,
+        codes: usize,
+        params: usize,
+        tails: usize,
+        exceptions: usize,
+    ) -> Result<()> {
+        let ends = [
+            append_bytes(0, descriptors, std::mem::size_of::<GpuPage>())?,
+            append_bytes(self.codes, codes, 1)?,
+            append_bytes(self.params, params, 4)?,
+            append_bytes(self.tails, tails, 2)?,
+            append_bytes(self.exception_indices, exceptions, 4)?,
+            append_bytes(self.exception_values, exceptions, 2)?,
+        ];
+        let starts = [
+            self.codes,
+            self.params,
+            self.tails,
+            self.exception_indices,
+            self.exception_values,
+            self.bytes,
+        ];
+        if staging.len() != self.bytes || ends.iter().zip(starts).any(|(&end, start)| end > start) {
+            candle_core::bail!("dense packed KV staging layout mismatch")
+        }
+        for (&end, start) in ends.iter().zip(starts) {
+            staging[end..start].fill(0);
+        }
+        Ok(())
+    }
 }
 
 struct BatchPlan {
@@ -111,6 +151,75 @@ struct BatchPlan {
     layout: ArenaLayout,
     payload_bytes: usize,
     max_words: usize,
+}
+
+struct StagedLengths {
+    codes: usize,
+    params: usize,
+    tails: usize,
+    exceptions: usize,
+}
+
+fn stage_batch(
+    staging: &mut [u8],
+    plan: &BatchPlan,
+    requests: &[DensePackedKvRestore<'_>],
+) -> StagedLengths {
+    let mut code_offset = 0usize;
+    let mut param_offset = 0usize;
+    let mut tail_offset = 0usize;
+    let mut exception_offset = 0usize;
+    for &index in &plan.indices {
+        let page = requests[index].page;
+        let start = plan.layout.codes + code_offset;
+        staging[start..start + page.codes.len()].copy_from_slice(&page.codes);
+        let start = plan.layout.params + param_offset * 4;
+        staging[start..start + page.params.len() * 4]
+            .copy_from_slice(bytemuck::cast_slice(&page.params));
+        let start = plan.layout.tails + tail_offset * 2;
+        staging[start..start + page.tail_bf16.len() * 2]
+            .copy_from_slice(bytemuck::cast_slice(&page.tail_bf16));
+        for exception in &page.exceptions {
+            let index = plan.layout.exception_indices + exception_offset * 4;
+            staging[index..index + 4].copy_from_slice(&exception.index.to_le_bytes());
+            let value = plan.layout.exception_values + exception_offset * 2;
+            staging[value..value + 2].copy_from_slice(&exception.bf16_bits.to_le_bytes());
+            exception_offset += 1;
+        }
+        code_offset += page.codes.len();
+        param_offset += page.params.len();
+        tail_offset += page.tail_bf16.len();
+    }
+    staging[..plan.descriptors.len() * std::mem::size_of::<GpuPage>()]
+        .copy_from_slice(bytemuck::cast_slice(&plan.descriptors));
+    StagedLengths {
+        codes: code_offset,
+        params: param_offset,
+        tails: tail_offset,
+        exceptions: exception_offset,
+    }
+}
+
+struct CompletionEvent(sys::CUevent);
+
+impl CompletionEvent {
+    fn new() -> Result<Self> {
+        event::create(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING)
+            .map(Self)
+            .map_err(|e| candle_core::Error::Msg(format!("create packed KV completion event: {e}")))
+    }
+}
+
+impl Drop for CompletionEvent {
+    fn drop(&mut self) {
+        // CUDA permits event destruction before completion; on a drain error
+        // the arenas themselves are retained until process teardown.
+        let _ = unsafe { event::destroy(self.0) };
+    }
+}
+
+fn elapsed_ns(start: Option<Instant>) -> u64 {
+    start.map_or(0, |start| start.elapsed().as_nanos() as u64)
 }
 
 fn as_u32(value: usize) -> Result<u32> {
@@ -141,8 +250,11 @@ pub(super) fn expand(
     pairs: &[(Tensor, Tensor)],
     requests: &[DensePackedKvRestore<'_>],
     options: DensePackedKvRestoreOptions,
+    execution: DensePackedKvRestoreExecution,
     stats: &mut DensePackedKvRestoreStats,
+    mut timings: Option<&mut DensePackedKvRestorePhaseTimings>,
 ) -> Result<()> {
+    let module_start = timings.as_ref().map(|_| Instant::now());
     let first = &requests[0];
     let first_target = if first.page.axis == PackedKvAxis::Key {
         &pairs[first.layer].0
@@ -151,6 +263,9 @@ pub(super) fn expand(
     };
     let candle_device = first_target.device();
     let device = candle_device.as_cuda_device()?.cuda_device();
+    device
+        .bind_to_thread()
+        .map_err(|e| candle_core::Error::Msg(format!("bind packed KV CUDA context: {e}")))?;
     let capture = capture_status(*device.cu_stream())
         .map_err(|e| candle_core::Error::Msg(format!("check CUDA graph capture: {e}")))?;
     if capture == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE {
@@ -166,6 +281,10 @@ pub(super) fn expand(
                 .map_err(|e| candle_core::Error::Msg(format!("load dense packed KV PTX: {e}")))?;
         }
     }
+    if let Some(timing) = timings.as_deref_mut() {
+        timing.module_ns += elapsed_ns(module_start);
+    }
+    let planning_start = timings.as_ref().map(|_| Instant::now());
     // Avoid launching a giant grid for a batch dominated by tiny pages.
     // A bucket spans at most an eightfold output-word range.
     let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
@@ -277,93 +396,287 @@ pub(super) fn expand(
         }
     }
     let capacity = plans.iter().map(|plan| plan.layout.bytes).max().unwrap();
-    // One page-locked host arena and one CUDA allocation are reused only after
-    // the matching upload and kernel have completed on this stream.
-    let mut host = unsafe { device.alloc_pinned::<u8>(capacity) }
-        .map_err(|e| candle_core::Error::Msg(format!("allocate packed KV pinned arena: {e}")))?;
-    stats.staging_host_allocations = 1;
-    let arena_gpu = unsafe { device.alloc::<u8>(capacity) }
-        .map_err(|e| candle_core::Error::Msg(format!("allocate packed KV GPU arena: {e}")))?;
-    stats.staging_device_allocations = 1;
+    let slots = if matches!(execution, DensePackedKvRestoreExecution::TwoBuffer { .. }) {
+        plans.len().min(2)
+    } else {
+        1
+    };
+    let aggregate = capacity
+        .checked_mul(slots)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| {
+            candle_core::Error::Msg("dense packed KV aggregate staging size overflow".into())
+        })?;
+    if let DensePackedKvRestoreExecution::TwoBuffer {
+        max_aggregate_staging_bytes,
+    } = execution
+    {
+        if aggregate > max_aggregate_staging_bytes {
+            candle_core::bail!("dense packed KV aggregate staging exceeds two-buffer budget")
+        }
+    }
+    stats.max_aggregate_staging_bytes = aggregate;
+    if let Some(timing) = timings.as_deref_mut() {
+        timing.planning_ns += elapsed_ns(planning_start);
+    }
+    let allocation_start = timings.as_ref().map(|_| Instant::now());
+    let mut hosts = Vec::with_capacity(slots);
+    let mut arenas_gpu = Vec::with_capacity(slots);
+    for _ in 0..slots {
+        hosts.push(unsafe { device.alloc_pinned::<u8>(capacity) }.map_err(|e| {
+            candle_core::Error::Msg(format!("allocate packed KV pinned arena: {e}"))
+        })?);
+        arenas_gpu.push(
+            unsafe { device.alloc::<u8>(capacity) }.map_err(|e| {
+                candle_core::Error::Msg(format!("allocate packed KV GPU arena: {e}"))
+            })?,
+        );
+    }
+    stats.staging_host_allocations = slots;
+    stats.staging_device_allocations = slots;
+    let events = if slots == 2 {
+        (0..slots)
+            .map(|_| CompletionEvent::new())
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
+    let mut in_flight = vec![false; slots];
     let function = device
         .get_func(MODULE, KERNEL)
         .ok_or_else(|| candle_core::Error::Msg("missing dense packed KV kernel".into()))?;
-    for plan in plans {
-        let staging = &mut host.as_mut_slice()[..plan.layout.bytes];
-        // Pinned memory starts uninitialized. This also initializes alignment
-        // padding, which is uploaded but never read by the kernel.
-        staging.fill(0);
-        let mut code_offset = 0usize;
-        let mut param_offset = 0usize;
-        let mut tail_offset = 0usize;
-        let mut exception_offset = 0usize;
-        for index in &plan.indices {
-            let request = &requests[*index];
-            let page = request.page;
-            let start = plan.layout.codes + code_offset;
-            staging[start..start + page.codes.len()].copy_from_slice(&page.codes);
-            let start = plan.layout.params + param_offset * 4;
-            staging[start..start + page.params.len() * 4]
-                .copy_from_slice(bytemuck::cast_slice(&page.params));
-            let start = plan.layout.tails + tail_offset * 2;
-            staging[start..start + page.tail_bf16.len() * 2]
-                .copy_from_slice(bytemuck::cast_slice(&page.tail_bf16));
-            for exception in &page.exceptions {
-                let index = plan.layout.exception_indices + exception_offset * 4;
-                staging[index..index + 4].copy_from_slice(&exception.index.to_le_bytes());
-                let value = plan.layout.exception_values + exception_offset * 2;
-                staging[value..value + 2].copy_from_slice(&exception.bf16_bits.to_le_bytes());
-                exception_offset += 1;
-            }
-            code_offset += page.codes.len();
-            param_offset += page.params.len();
-            tail_offset += page.tail_bf16.len();
-        }
-        staging[..plan.descriptors.len() * std::mem::size_of::<GpuPage>()]
-            .copy_from_slice(bytemuck::cast_slice(&plan.descriptors));
-        let blocks = as_u32(plan.max_words.div_ceil(256))?;
-        let config = LaunchConfig {
-            grid_dim: (blocks, as_u32(plan.indices.len())?, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        device
-            .bind_to_thread()
-            .map_err(|e| candle_core::Error::Msg(format!("bind packed KV CUDA context: {e}")))?;
-        // The upload and kernel share one stream. Synchronize even on a
-        // submission error before reusing or dropping the pinned buffer.
-        let submitted =
-            unsafe { memcpy_htod_async(*arena_gpu.device_ptr(), staging, *device.cu_stream()) }
-                .map_err(|e| candle_core::Error::Msg(format!("upload packed KV arena: {e}")))
-                .and_then(|_| unsafe {
-                    function
-                        .clone()
-                        .launch(
-                            config,
-                            (
-                                &arena_gpu,
-                                as_u32(plan.layout.codes)?,
-                                as_u32(plan.layout.params)?,
-                                as_u32(plan.layout.tails)?,
-                                as_u32(plan.layout.exception_indices)?,
-                                as_u32(plan.layout.exception_values)?,
-                            ),
-                        )
-                        .map_err(|e| {
-                            candle_core::Error::Msg(format!("launch dense packed KV: {e}"))
-                        })
-                });
-        let synchronized = device
-            .synchronize()
-            .map_err(|e| candle_core::Error::Msg(format!("synchronize dense packed KV: {e}")));
-        submitted?;
-        synchronized?;
-        stats.kernel_launches += 1;
-        stats.staging_uploads += 1;
-        stats.batch_synchronizations += 1;
-        stats.max_batch_pages = stats.max_batch_pages.max(plan.indices.len());
-        stats.max_batch_payload_bytes = stats.max_batch_payload_bytes.max(plan.payload_bytes);
-        stats.max_batch_staging_bytes = stats.max_batch_staging_bytes.max(plan.layout.bytes);
+    if let Some(timing) = timings.as_deref_mut() {
+        timing.allocation_ns += elapsed_ns(allocation_start);
     }
-    Ok(())
+    // The closure can fail after an async upload. The error-path drain below
+    // keeps both pinned and GPU arenas live until that upload finishes.
+    let submitted = (|| -> Result<()> {
+        for (batch, plan) in plans.iter().enumerate() {
+            let slot = batch % slots;
+            if in_flight[slot] {
+                let sync_start = timings.as_ref().map(|_| Instant::now());
+                unsafe { event::synchronize(events[slot].0) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("wait packed KV completion: {e}"))
+                })?;
+                if let Some(timing) = timings.as_deref_mut() {
+                    timing.synchronization_ns += elapsed_ns(sync_start);
+                }
+                stats.batch_synchronizations += 1;
+                in_flight[slot] = false;
+            }
+            let staging = &mut hosts[slot].as_mut_slice()[..plan.layout.bytes];
+            let fill_start = timings.as_ref().map(|_| Instant::now());
+            let lengths = stage_batch(staging, plan, requests);
+            if let Some(timing) = timings.as_deref_mut() {
+                timing.host_fill_ns += elapsed_ns(fill_start);
+            }
+            let padding_start = timings.as_ref().map(|_| Instant::now());
+            plan.layout.zero_padding(
+                staging,
+                plan.descriptors.len(),
+                lengths.codes,
+                lengths.params,
+                lengths.tails,
+                lengths.exceptions,
+            )?;
+            if let Some(timing) = timings.as_deref_mut() {
+                timing.padding_ns += elapsed_ns(padding_start);
+            }
+            let blocks = as_u32(plan.max_words.div_ceil(256))?;
+            let config = LaunchConfig {
+                grid_dim: (blocks, as_u32(plan.indices.len())?, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            device.bind_to_thread().map_err(|e| {
+                candle_core::Error::Msg(format!("bind packed KV CUDA context: {e}"))
+            })?;
+            let submit_start = timings.as_ref().map(|_| Instant::now());
+            unsafe {
+                memcpy_htod_async(*arenas_gpu[slot].device_ptr(), staging, *device.cu_stream())
+            }
+            .map_err(|e| candle_core::Error::Msg(format!("upload packed KV arena: {e}")))?;
+            unsafe {
+                function.clone().launch(
+                    config,
+                    (
+                        &arenas_gpu[slot],
+                        as_u32(plan.layout.codes)?,
+                        as_u32(plan.layout.params)?,
+                        as_u32(plan.layout.tails)?,
+                        as_u32(plan.layout.exception_indices)?,
+                        as_u32(plan.layout.exception_values)?,
+                    ),
+                )
+            }
+            .map_err(|e| candle_core::Error::Msg(format!("launch dense packed KV: {e}")))?;
+            if slots == 2 {
+                unsafe { event::record(events[slot].0, *device.cu_stream()) }.map_err(|e| {
+                    candle_core::Error::Msg(format!("record packed KV completion: {e}"))
+                })?;
+                in_flight[slot] = true;
+            }
+            if let Some(timing) = timings.as_deref_mut() {
+                timing.submission_ns += elapsed_ns(submit_start);
+            }
+            if slots == 1 {
+                let sync_start = timings.as_ref().map(|_| Instant::now());
+                device.synchronize().map_err(|e| {
+                    candle_core::Error::Msg(format!("synchronize dense packed KV: {e}"))
+                })?;
+                if let Some(timing) = timings.as_deref_mut() {
+                    timing.synchronization_ns += elapsed_ns(sync_start);
+                }
+                stats.batch_synchronizations += 1;
+            }
+            stats.kernel_launches += 1;
+            stats.staging_uploads += 1;
+            stats.max_batch_pages = stats.max_batch_pages.max(plan.indices.len());
+            stats.max_batch_payload_bytes = stats.max_batch_payload_bytes.max(plan.payload_bytes);
+            stats.max_batch_staging_bytes = stats.max_batch_staging_bytes.max(plan.layout.bytes);
+        }
+        Ok(())
+    })();
+    let drained = if slots == 2 || submitted.is_err() {
+        let final_start = timings.as_ref().map(|_| Instant::now());
+        let result = device
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("drain dense packed KV stream: {e}")));
+        if let Some(timing) = timings {
+            timing.synchronization_ns += elapsed_ns(final_start);
+        }
+        result
+    } else {
+        Ok(())
+    };
+    if slots == 2 && submitted.is_ok() {
+        stats.batch_synchronizations += 1;
+    }
+    if drained.is_err() {
+        // CUDA did not confirm completion. Keep both DMA source and GPU arena
+        // alive rather than allowing their destructors to free in-flight data.
+        std::mem::forget(hosts);
+        std::mem::forget(arenas_gpu);
+    }
+    submitted?;
+    drained
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::packed_kv_restore::{DensePackedKvPage, PackedKvException};
+
+    #[test]
+    fn aligned_arena_initializes_every_uploaded_byte() -> Result<()> {
+        // The cases cover zero-length sections, alignment gaps, odd code
+        // lengths, exceptions, and a smaller batch reusing a larger arena.
+        let cases = [
+            (1, 0, 0, 512, 0),
+            (3, 17, 8, 0, 0),
+            (2, 7, 5, 13, 3),
+            (1, 1, 0, 0, 0),
+        ];
+        let capacity = cases
+            .iter()
+            .map(|&(p, c, a, t, e)| ArenaLayout::new(p, c, a, t, e).unwrap().bytes)
+            .max()
+            .unwrap();
+        let mut arena = vec![0xa5u8; capacity];
+        for (pages, codes, params, tails, exceptions) in cases {
+            let layout = ArenaLayout::new(pages, codes, params, tails, exceptions)?;
+            let slice = &mut arena[..layout.bytes];
+            let ranges = [
+                (0, pages * std::mem::size_of::<GpuPage>()),
+                (layout.codes, layout.codes + codes),
+                (layout.params, layout.params + params * 4),
+                (layout.tails, layout.tails + tails * 2),
+                (
+                    layout.exception_indices,
+                    layout.exception_indices + exceptions * 4,
+                ),
+                (
+                    layout.exception_values,
+                    layout.exception_values + exceptions * 2,
+                ),
+            ];
+            for &(start, end) in &ranges {
+                slice[start..end].fill(0x5a);
+            }
+            layout.zero_padding(slice, pages, codes, params, tails, exceptions)?;
+            assert!(slice.iter().all(|&byte| byte != 0xa5));
+            assert!(layout
+                .zero_padding(slice, pages, codes + 100, params, tails, exceptions)
+                .is_err());
+            arena.fill(0xa5);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn real_stage_writer_covers_exact_and_exception_sections() -> Result<()> {
+        let exact = DensePackedKvPage::new(
+            PackedKvAxis::Key,
+            2,
+            1,
+            1,
+            1,
+            1,
+            1,
+            vec![],
+            vec![],
+            vec![0x3f80],
+            vec![],
+        )?;
+        let quantized = DensePackedKvPage::new(
+            PackedKvAxis::Key,
+            2,
+            3,
+            1,
+            1,
+            2,
+            0,
+            vec![0x24],
+            vec![0.0, 1.0, 0.0, 1.0],
+            vec![],
+            vec![PackedKvException {
+                index: 1,
+                bf16_bits: 0x3f80,
+            }],
+        )?;
+        let requests = [
+            DensePackedKvRestore {
+                layer: 0,
+                block: 0,
+                token_offset: 0,
+                page: &exact,
+            },
+            DensePackedKvRestore {
+                layer: 0,
+                block: 1,
+                token_offset: 0,
+                page: &quantized,
+            },
+        ];
+        let plan = BatchPlan {
+            indices: vec![0, 1],
+            descriptors: vec![<GpuPage as bytemuck::Zeroable>::zeroed(); 2],
+            layout: ArenaLayout::new(2, 1, 4, 1, 1)?,
+            payload_bytes: packed_payload_bytes(&exact)? + packed_payload_bytes(&quantized)?,
+            max_words: 3,
+        };
+        let mut staging = vec![0xcdu8; plan.layout.bytes];
+        let lengths = stage_batch(&mut staging, &plan, &requests);
+        plan.layout.zero_padding(
+            &mut staging,
+            plan.descriptors.len(),
+            lengths.codes,
+            lengths.params,
+            lengths.tails,
+            lengths.exceptions,
+        )?;
+        assert!(staging.iter().all(|&byte| byte != 0xcd));
+        assert_eq!(&staging[plan.layout.codes..plan.layout.codes + 1], &[0x24]);
+        Ok(())
+    }
 }

@@ -961,6 +961,46 @@ impl ModelRunner {
         )
     }
 
+    /// Opt-in restore execution mode; the two-buffer mode requires a hard
+    /// aggregate pinned-host plus GPU staging budget.
+    pub fn restore_dense_packed_kv_pages_with_execution(
+        &self,
+        requests: &[crate::utils::packed_kv_restore::DensePackedKvRestore<'_>],
+        options: crate::utils::packed_kv_restore::DensePackedKvRestoreOptions,
+        execution: crate::utils::packed_kv_restore::DensePackedKvRestoreExecution,
+    ) -> Result<crate::utils::packed_kv_restore::DensePackedKvRestoreStats> {
+        if self.config.kvcache_dtype.is_turboquant() {
+            candle_core::bail!("dense packed KV restore cannot target TurboQuant cache mode")
+        }
+        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages_with_execution(
+            &self.get_kv_cache(),
+            requests,
+            options,
+            execution,
+        )
+    }
+
+    /// Return host phase timings for an opt-in mutable-page restore.
+    pub fn restore_dense_packed_kv_pages_profiled(
+        &self,
+        requests: &[crate::utils::packed_kv_restore::DensePackedKvRestore<'_>],
+        options: crate::utils::packed_kv_restore::DensePackedKvRestoreOptions,
+        execution: crate::utils::packed_kv_restore::DensePackedKvRestoreExecution,
+    ) -> Result<(
+        crate::utils::packed_kv_restore::DensePackedKvRestoreStats,
+        crate::utils::packed_kv_restore::DensePackedKvRestorePhaseTimings,
+    )> {
+        if self.config.kvcache_dtype.is_turboquant() {
+            candle_core::bail!("dense packed KV restore cannot target TurboQuant cache mode")
+        }
+        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages_profiled(
+            &self.get_kv_cache(),
+            requests,
+            options,
+            execution,
+        )
+    }
+
     /// Expand pages whose wire bytes were validated by
     /// `DensePackedKvPage::from_bytes_sealed` (or built by a sealed encoder).
     pub fn restore_dense_packed_kv_pages_sealed(
@@ -985,6 +1025,45 @@ impl ModelRunner {
             &self.get_kv_cache(),
             requests,
             options,
+        )
+    }
+
+    /// Opt-in sealed restore execution mode with bounded aggregate staging.
+    pub fn restore_dense_packed_kv_pages_sealed_with_execution(
+        &self,
+        requests: &[crate::utils::packed_kv_restore::SealedDensePackedKvRestore<'_>],
+        options: crate::utils::packed_kv_restore::DensePackedKvRestoreOptions,
+        execution: crate::utils::packed_kv_restore::DensePackedKvRestoreExecution,
+    ) -> Result<crate::utils::packed_kv_restore::DensePackedKvRestoreStats> {
+        if self.config.kvcache_dtype.is_turboquant() {
+            candle_core::bail!("dense packed KV restore cannot target TurboQuant cache mode")
+        }
+        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages_sealed_with_execution(
+            &self.get_kv_cache(),
+            requests,
+            options,
+            execution,
+        )
+    }
+
+    /// Return host phase timings for an opt-in sealed-page restore.
+    pub fn restore_dense_packed_kv_pages_sealed_profiled(
+        &self,
+        requests: &[crate::utils::packed_kv_restore::SealedDensePackedKvRestore<'_>],
+        options: crate::utils::packed_kv_restore::DensePackedKvRestoreOptions,
+        execution: crate::utils::packed_kv_restore::DensePackedKvRestoreExecution,
+    ) -> Result<(
+        crate::utils::packed_kv_restore::DensePackedKvRestoreStats,
+        crate::utils::packed_kv_restore::DensePackedKvRestorePhaseTimings,
+    )> {
+        if self.config.kvcache_dtype.is_turboquant() {
+            candle_core::bail!("dense packed KV restore cannot target TurboQuant cache mode")
+        }
+        crate::utils::packed_kv_restore::restore_dense_packed_kv_pages_sealed_profiled(
+            &self.get_kv_cache(),
+            requests,
+            options,
+            execution,
         )
     }
 

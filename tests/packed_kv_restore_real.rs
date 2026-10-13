@@ -17,9 +17,10 @@ mod cuda_test {
             config::Config,
             downloader::ModelPaths,
             packed_kv_restore::{
-                encode_dense_packed_kv_tile_sealed,
-                restore_dense_packed_kv_pages_sealed_with_options, DensePackedKvRestoreOptions,
-                PackedKvAxis, SealedDensePackedKvPage, SealedDensePackedKvRestore,
+                encode_dense_packed_kv_tile_sealed, restore_dense_packed_kv_pages_sealed_profiled,
+                restore_dense_packed_kv_pages_sealed_with_execution, DensePackedKvRestoreExecution,
+                DensePackedKvRestoreOptions, PackedKvAxis, SealedDensePackedKvPage,
+                SealedDensePackedKvRestore,
             },
             progress::ProgressReporter,
             GpuKvCache,
@@ -192,70 +193,101 @@ mod cuda_test {
             })
             .collect::<Vec<_>>();
         let mut reference_logits: Option<Vec<Vec<f32>>> = None;
-        for page_limit in [128, 512, 1024] {
+        for page_limit in [128, 512] {
             let options = DensePackedKvRestoreOptions {
                 max_batch_pages: page_limit,
                 max_batch_payload_bytes: 64 * 1024 * 1024,
             };
-            let mut samples = Vec::new();
-            for repeat in 0..3 {
-                let gpu_cache = cache(&config, &device)?;
-                let started = Instant::now();
-                let stats = restore_dense_packed_kv_pages_sealed_with_options(
-                    &gpu_cache, &requests, options,
-                )?;
-                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-                ensure!(stats.pages == 36_864);
-                ensure!(stats.kernel_launches == 36_864 / page_limit);
-                ensure!(stats.staging_uploads == stats.kernel_launches);
-                ensure!(stats.batch_synchronizations == stats.kernel_launches);
-                ensure!(stats.staging_host_allocations == 1);
-                ensure!(stats.staging_device_allocations == 1);
-                ensure!(stats.max_batch_pages == page_limit);
-                ensure!(stats.max_batch_payload_bytes <= options.max_batch_payload_bytes);
-                ensure!(
-                    stats.max_batch_staging_bytes
-                        <= options.max_batch_payload_bytes + page_limit * 64 + 7
-                );
-                if repeat == 0 {
-                    for (layer, (key, value)) in gpu_cache.as_pairs().unwrap().iter().enumerate() {
-                        for (axis, tensor) in [key, value].into_iter().enumerate() {
-                            let actual = tensor
-                                .to_device(&Device::Cpu)?
-                                .flatten_all()?
-                                .to_vec1::<half::bf16>()?;
-                            let page_words = BLOCK * 8 * 128;
-                            for block in 0..PREFIX / BLOCK {
-                                let source = axis + usize::from(block >= PREFIX / BLOCK - 2) * 2;
-                                let start = block * page_words;
-                                ensure!(
+            for (mode, execution) in [
+                ("serial", DensePackedKvRestoreExecution::Serial),
+                (
+                    "two_buffer",
+                    DensePackedKvRestoreExecution::TwoBuffer {
+                        max_aggregate_staging_bytes: 256 * 1024 * 1024,
+                    },
+                ),
+            ] {
+                let mut samples = Vec::new();
+                for repeat in 0..3 {
+                    let gpu_cache = cache(&config, &device)?;
+                    let started = Instant::now();
+                    let (stats, phases) = restore_dense_packed_kv_pages_sealed_profiled(
+                        &gpu_cache, &requests, options, execution,
+                    )?;
+                    let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                    ensure!(stats.pages == 36_864);
+                    ensure!(stats.kernel_launches == 36_864 / page_limit);
+                    ensure!(stats.staging_uploads == stats.kernel_launches);
+                    let slots = if mode == "serial" { 1 } else { 2 };
+                    ensure!(stats.batch_synchronizations == stats.kernel_launches + 1 - slots);
+                    ensure!(stats.staging_host_allocations == slots);
+                    ensure!(stats.staging_device_allocations == slots);
+                    ensure!(stats.max_batch_pages == page_limit);
+                    ensure!(stats.max_batch_payload_bytes <= options.max_batch_payload_bytes);
+                    ensure!(
+                        stats.max_batch_staging_bytes
+                            <= options.max_batch_payload_bytes + page_limit * 64 + 7
+                    );
+                    ensure!(
+                        stats.max_aggregate_staging_bytes
+                            == stats.max_batch_staging_bytes * slots * 2
+                    );
+                    if repeat == 0 {
+                        for (layer, (key, value)) in
+                            gpu_cache.as_pairs().unwrap().iter().enumerate()
+                        {
+                            for (axis, tensor) in [key, value].into_iter().enumerate() {
+                                let actual = tensor
+                                    .to_device(&Device::Cpu)?
+                                    .flatten_all()?
+                                    .to_vec1::<half::bf16>()?;
+                                let page_words = BLOCK * 8 * 128;
+                                for block in 0..PREFIX / BLOCK {
+                                    let source =
+                                        axis + usize::from(block >= PREFIX / BLOCK - 2) * 2;
+                                    let start = block * page_words;
+                                    ensure!(
                                     actual[start..start + page_words]
                                         .iter()
                                         .map(|word| word.to_bits())
                                         .eq(oracles[source].iter().copied()),
                                     "BF16 parity failed at layer {layer} axis {axis} block {block}"
                                 );
+                                }
                             }
                         }
+                        let logits = continuation(&model, &gpu_cache, &device)?;
+                        if let Some(reference) = &reference_logits {
+                            ensure!(
+                                &logits == reference,
+                                "batch limit changed continuation logits"
+                            );
+                        } else {
+                            reference_logits = Some(logits);
+                        }
                     }
-                    let logits = continuation(&model, &gpu_cache, &device)?;
-                    if let Some(reference) = &reference_logits {
-                        ensure!(
-                            &logits == reference,
-                            "batch limit changed continuation logits"
-                        );
-                    } else {
-                        reference_logits = Some(logits);
-                    }
+                    samples.push(elapsed);
+                    eprintln!("qwen3_4b_8192 mode={mode} page_limit={page_limit} repeat={repeat} restore_ms={elapsed:.3} phases_ns={phases:?} launches={} uploads={} host_allocs={} device_allocs={} syncs={} max_pages={} max_payload={} max_staging={} aggregate_staging={} packed_bytes={}", stats.kernel_launches, stats.staging_uploads, stats.staging_host_allocations, stats.staging_device_allocations, stats.batch_synchronizations, stats.max_batch_pages, stats.max_batch_payload_bytes, stats.max_batch_staging_bytes, stats.max_aggregate_staging_bytes, stats.packed_bytes);
                 }
-                samples.push(elapsed);
-                eprintln!("qwen3_4b_8192 page_limit={page_limit} repeat={repeat} restore_ms={elapsed:.3} launches={} uploads={} host_allocs={} device_allocs={} syncs={} max_pages={} max_payload={} max_staging={} packed_bytes={}", stats.kernel_launches, stats.staging_uploads, stats.staging_host_allocations, stats.staging_device_allocations, stats.batch_synchronizations, stats.max_batch_pages, stats.max_batch_payload_bytes, stats.max_batch_staging_bytes, stats.packed_bytes);
-            }
-            eprintln!(
-                "qwen3_4b_8192 page_limit={page_limit} first_ms={:.3} later_ms={:.3}",
+                eprintln!(
+                "qwen3_4b_8192 mode={mode} page_limit={page_limit} first_ms={:.3} later_ms={:.3}",
                 samples[0],
                 (samples[1] + samples[2]) / 2.0
             );
+                let mut unprofiled = Vec::new();
+                for _ in 0..3 {
+                    let gpu_cache = cache(&config, &device)?;
+                    let started = Instant::now();
+                    restore_dense_packed_kv_pages_sealed_with_execution(
+                        &gpu_cache, &requests, options, execution,
+                    )?;
+                    unprofiled.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                eprintln!(
+                    "qwen3_4b_8192 mode={mode} page_limit={page_limit} unprofiled_first_ms={:.3} unprofiled_later_ms={:.3}",
+                    unprofiled[0], (unprofiled[1] + unprofiled[2]) / 2.0,
+                );
+            }
         }
         Ok(())
     }

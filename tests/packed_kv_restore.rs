@@ -4,8 +4,10 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use xinfer::utils::packed_kv_restore::{
     encode_dense_packed_kv_tile, restore_dense_packed_kv_pages,
-    restore_dense_packed_kv_pages_sealed, restore_dense_packed_kv_pages_sealed_with_options,
-    restore_dense_packed_kv_pages_with_options, DensePackedKvPage, DensePackedKvRestore,
+    restore_dense_packed_kv_pages_sealed, restore_dense_packed_kv_pages_sealed_profiled,
+    restore_dense_packed_kv_pages_sealed_with_execution,
+    restore_dense_packed_kv_pages_sealed_with_options, restore_dense_packed_kv_pages_with_options,
+    DensePackedKvPage, DensePackedKvRestore, DensePackedKvRestoreExecution,
     DensePackedKvRestoreOptions, PackedKvAxis, PackedKvException, SealedDensePackedKvRestore,
 };
 
@@ -266,6 +268,87 @@ fn batched_gpu_restore_matches_independent_bf16_and_exact_exceptions() -> Result
         restore_dense_packed_kv_pages_sealed(&sealed_cache, &sealed_requests)?,
         stats
     );
+    let pipeline_cache = GpuKvCache::Flash(
+        (0..3)
+            .map(|_| {
+                Ok((
+                    Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+                    Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+                ))
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?,
+    );
+    let small_batches = DensePackedKvRestoreOptions {
+        max_batch_pages: 2,
+        max_batch_payload_bytes: 1 << 20,
+    };
+    let execution = DensePackedKvRestoreExecution::TwoBuffer {
+        max_aggregate_staging_bytes: 1 << 20,
+    };
+    let (pipelined, timings) = restore_dense_packed_kv_pages_sealed_profiled(
+        &pipeline_cache,
+        &sealed_requests,
+        small_batches,
+        execution,
+    )?;
+    assert!(timings.host_fill_ns > 0);
+    assert!(pipelined.kernel_launches >= 3);
+    assert_eq!(pipelined.staging_host_allocations, 2);
+    assert_eq!(pipelined.staging_device_allocations, 2);
+    assert_eq!(
+        pipelined.max_aggregate_staging_bytes,
+        4 * pipelined.max_batch_staging_bytes
+    );
+    assert!(pipelined.max_aggregate_staging_bytes <= 1 << 20);
+    for (ordinary, piped) in cache
+        .as_pairs()
+        .unwrap()
+        .iter()
+        .zip(pipeline_cache.as_pairs().unwrap())
+    {
+        for (old, new) in [(&ordinary.0, &piped.0), (&ordinary.1, &piped.1)] {
+            assert_eq!(
+                old.to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?,
+                new.to_device(&Device::Cpu)?
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?
+            );
+        }
+    }
+    let budget_cache = GpuKvCache::Flash(
+        (0..3)
+            .map(|_| {
+                Ok((
+                    Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+                    Tensor::zeros((2, 96, 2, 16), DType::BF16, &device)?,
+                ))
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?,
+    );
+    assert!(restore_dense_packed_kv_pages_sealed_with_execution(
+        &budget_cache,
+        &sealed_requests,
+        small_batches,
+        DensePackedKvRestoreExecution::TwoBuffer {
+            max_aggregate_staging_bytes: 1
+        },
+    )
+    .is_err());
+    assert!(budget_cache.as_pairs().unwrap().iter().all(|(key, value)| {
+        [key, value].into_iter().all(|tensor| {
+            tensor
+                .to_device(&Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<half::bf16>()
+                .unwrap()
+                .iter()
+                .all(|word| word.to_bits() == 0)
+        })
+    }));
     for (ordinary, sealed) in cache
         .as_pairs()
         .unwrap()
