@@ -54,3 +54,53 @@ about 4.4/5.7 ms for up/down. A 128×256×128 tile took about 32/36 ms, a
 128×128×256 tile was effectively unchanged, and CUTLASS automatic scheduling
 at 128×128×128 was also unchanged. Those synthetic times did not motivate a
 GEMM tile change.
+
+## Fresh vLLM profile against fused Xinfer
+
+On the same GB10, a fresh Nsight Systems 2025.3.2 capture of the warmed
+NVIDIA `nvcr.io/nvidia/vllm:26.05-py3` container (vLLM
+`0.20.1+7124b12a.dev`) took **1,020.3 ms** for the same 9,538 token IDs.
+The container and BF16-KV metadata overlay are described in
+`nemotron-3-nano-gb10-prefill.md`. It used eager execution, batch size one,
+all experts resident, `gpu_memory_utilization=0.35`, and
+`VLLM_ENABLE_V1_MULTIPROCESSING=0` so Nsight could capture its worker.
+The `BENCH_PREFILL_9538` range excludes model loading, warmup, and FP4
+autotuning. Minimum observed host `MemAvailable` was 56.0 GiB. The same
+Xinfer revision `db829fb890da048806393340b000b72d759b3dec` with fused
+quantization measured 1,900–1,916 ms in its
+unprofiled runs, a roughly **1.86–1.88×** vLLM gap.
+
+| Named GPU work in the 9,538-token prefill | Xinfer fused quant | vLLM |
+| --- | ---: | ---: |
+| Mamba scan/summary/prepare/prefix vs. SSD scan/state/conv/BMM | 452.5 ms / 184 launches | 139.7 ms / 138 launches |
+| Grouped NVFP4 expert GEMMs | 311.5 ms / 92 launches | 197.8 ms / 46 launches |
+| Main attention prefill | 172.2 ms / 12 launches | 62.8 ms / 6 launches |
+| Xinfer expert scatter vs. vLLM expert input expansion | 163.6 ms / 92 launches | 20.5 ms / 23 launches |
+| **All GPU kernels, including unlisted work** | **1,755.0 ms / 3,975 launches** | **1,003.7 ms / 1,207 launches** |
+
+These named rows identify different implementations and **are not an additive
+or like-for-like layer-time partition**. Xinfer's runner processes this prompt
+as 8,192 plus 1,346 tokens, so each hybrid layer runs twice; vLLM processes
+all 9,538 tokens in one prefill chunk. This accounts for the 92 vs. 46 expert
+GEMM launches and 12 vs. 6 attention launches, and makes the per-kernel
+differences unsuitable as a pure GEMM efficiency ratio. The total times still
+describe the actual configured paths. vLLM's 1,003.7 ms of kernels occupy
+98.4% of its measured 1,020.3 ms range, so its host schedule is not a large
+unexplained portion of this profile. Its 3 CUDA event synchronizations spent
+820 ms waiting for GPU work; that API time overlaps kernels and is not an
+additional cost.
+
+The grouped expert GEMM difference is about 114 ms in this run. Even fully
+eliminating that difference would close only a small part of the roughly
+880–896 ms wall gap. The Mamba core kernels differ by about 313 ms, attention
+by 109 ms, and Xinfer's expert scatter alone costs 164 ms. The Xinfer trace
+also contains 58.6 ms of fused expert quantization, 56.0 ms of ReLU², and
+41.1 ms of route-combine kernels; vLLM fuses some corresponding work into
+other kernels, so subtracting individual rows cannot predict an optimization's
+gain. A custom expert GEMM remains a possible target, but matching vLLM
+requires reducing Mamba, attention, and expert row-movement work as well.
+
+Raw trace: `/tmp/xinfer-nemotron-prefill/nsys-vllm-9538-current.nsys-rep`
+and its SQLite export; current Xinfer trace:
+`/tmp/xinfer-expert-tune/fused.sqlite`. These are local artifacts, not files
+tracked by the repository.
