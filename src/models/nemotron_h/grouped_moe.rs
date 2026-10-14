@@ -4,6 +4,14 @@
 
 use super::NemotronMlp;
 use candle_core::{DType, Result, Tensor};
+#[cfg(feature = "nemotron-expert-fused-quant")]
+use std::sync::LazyLock;
+
+#[cfg(feature = "nemotron-expert-fused-quant")]
+static FUSED_QUANT: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_EXPERT_FUSED_QUANT").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
 
 struct Projection {
     blocks: Tensor,
@@ -74,6 +82,38 @@ impl Projection {
         sorted: Option<(&Tensor, &Tensor)>,
         is_prefill: bool,
     ) -> Result<Tensor> {
+        #[cfg(feature = "nemotron-expert-fused-quant")]
+        if *FUSED_QUANT
+            && is_prefill
+            && input.dtype() == DType::BF16
+            && input.is_contiguous()
+            && input.storage_and_layout().1.start_offset() == 0
+            && !attention_rs::nvfp4_online_scale()
+            && attention_rs::cuda_utils::sm_version(input.device().as_cuda_device()?) == Some(121)
+            && sorted.is_some_and(|(token_ids, expert_ids)| {
+                token_ids.is_contiguous()
+                    && expert_ids.is_contiguous()
+                    && token_ids.storage_and_layout().1.start_offset() == 0
+                    && expert_ids.storage_and_layout().1.start_offset() == 0
+            })
+        {
+            let (sorted_ids, expert_ids) = sorted.ok_or_else(|| {
+                candle_core::Error::Msg("fused expert quant requires grouped routes".into())
+            })?;
+            return super::expert_gemm::moe_gemm_nvfp4_fused_quant(
+                input,
+                &self.blocks,
+                &self.scales,
+                &self.global_scales,
+                Some(&self.input_scales),
+                &None,
+                sorted_ids,
+                expert_ids,
+                ids.dim(1)?,
+                is_prefill,
+                self.swizzled_scales.as_ref(),
+            );
+        }
         attention_rs::moe::moe_gemm_nvfp4(
             input,
             &self.blocks,

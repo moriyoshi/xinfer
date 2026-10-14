@@ -5,6 +5,8 @@
 pub(crate) mod attention_gemm;
 mod compact_state;
 mod expert_cache;
+#[cfg(feature = "nemotron-expert-fused-quant")]
+mod expert_gemm;
 mod expert_snapshot;
 #[cfg(all(feature = "cuda", feature = "cutlass"))]
 mod grouped_moe;
