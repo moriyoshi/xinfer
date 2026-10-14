@@ -176,3 +176,75 @@ named vLLM SSD/conv kernels. Grouped expert GEMM is 228.4 vs 197.8 ms,
 and main attention is 123.9 vs 62.8 ms. This makes the remaining recurrent
 path the largest measured opportunity. The Xinfer one-call trace is
 `/tmp/xinfer-vector-scatter/finalize-onecall-9538.nsys-rep`.
+
+## Why the one-call prefill still trails vLLM
+
+The one-call comparison above removes the 8,192-token Xinfer call boundary.
+It leaves 1,613.7 ms for Xinfer versus 1,020.3 ms for vLLM on the same
+9,538-token prompt. The Xinfer trace has 1,976 kernels totaling 1,537.5 ms;
+the vLLM `BENCH_PREFILL_9538` range has 1,207 kernels totaling 1,003.7 ms.
+Both runs are therefore predominantly GPU-bound. Including copies and memsets,
+the GPU activity union spans 1,575.4 of Xinfer's 1,617.7 ms captured window
+and 1,017.1 of vLLM's 1,020.3 ms range. Xinfer's 569 GPU memsets take
+37.3 ms; vLLM's 47 take 5.4 ms. Eliminating host gaps and zeroing alone
+cannot close the roughly 0.59-second one-call wall gap.
+
+| Named kernel work, one 9,538-token call | Xinfer | vLLM | Observation |
+| --- | ---: | ---: | --- |
+| Mamba prepare, chunk summary/prefix/scan vs. SSD/conv | 437.0 ms | 139.7 ms | Largest named difference; **not** complete layer time on either side |
+| Main attention prefill | 123.9 ms | 62.8 ms | Six launches on each side |
+| Grouped NVFP4 expert GEMMs | 228.4 ms | 197.8 ms | Same 46 up/down launches; 30.6 ms difference |
+| Dense NVFP4 GEMMs | 74.7 ms | 78.4 ms | Xinfer is already comparable |
+| BF16/FP32 CUTLASS GEMMs | 60.8 ms | 62.8 ms | Xinfer is already comparable |
+
+The Mamba difference follows from the algorithms in the exact benchmarked
+sources. Xinfer's [`prefill/scan.cu`](../src/models/nemotron_h/prefill/scan.cu)
+summarizes each 256-token chunk by a scalar recurrent pass from zero, passes
+its final state to the next chunk, and then performs a second scalar recurrent
+pass to produce every output. Its 23 `nemotron_mamba_chunk_scan` launches take
+313.8 ms (13.6 ms per layer); summary adds 63.9 ms, prefix 20.9 ms, and
+prepare 38.4 ms. vLLM's `mamba_chunk_scan_combined_varlen` uses a chunk-state
+kernel, inter-chunk state passing, a C×B matrix product, and an intra-chunk
+scan that consumes that product. Its named SSD/conv kernels total 139.7 ms.
+Each implementation also has pointwise and projection work outside these
+names, so 297.3 ms is a comparison of named kernels, not a measured net
+benefit from replacing Xinfer's Mamba path. A chunked SSD matrix path is
+the leading candidate; the previously tried scalar output-correction kernel
+was slower and was discarded.
+
+The attention kernels launch the same 4,800 thread blocks per layer. Xinfer's
+[`flash_prefill_paged.cuh`](../src/models/nemotron_h/attention_gemm/flash_prefill_paged.cuh)
+uses a 64-query by 32-KV tile, 8 warps, and explicit per-row paged loads into
+shared memory. vLLM uses a FlashAttention-2 kernel with a 128×64×128 template
+and 4 warps. The larger KV tile and different load/softmax pipeline are
+plausible reasons for the 61.1 ms difference; the trace alone cannot assign
+the gain to either one. vLLM logs 2,096-token attention pages, whereas the
+Xinfer benchmark used 16-token pages. To isolate page size, the real-checkpoint
+benchmark now accepts `XINFER_NEMOTRON_BENCH_KV_BLOCK` (power of two). With
+the same one-call 9,538-token prompt and optimized flags, unprofiled prefill
+was 1,681.6 and 1,687.5 ms with 16-token pages (bracketing controls),
+1,678.8 ms with 256-token pages, and 1,664.7 ms with 2,048-token pages.
+All prefix and next-step logit bytes matched. The separate 256-page Nsight
+capture recorded 127.7 ms of attention versus 123.9 ms in the earlier
+16-page capture; this small reversed difference is within run variation.
+Larger pages alone did not materially improve this attention implementation.
+
+The custom grouped expert GEMM hypothesis has limited remaining scope: both
+engines already use packed FP4, block-scaled sm_120 CUTLASS grouped tensor-core
+GEMMs. Their difference is about 31 ms of the 594 ms wall gap. Xinfer still
+spends 63.6 ms on expert up-scatter, 68.8 ms on finalization, 62.4 ms on fused
+activation quantization, and 57.0 ms on ReLU²; vLLM fuses some corresponding
+work differently, so these are not direct savings estimates. Xinfer also has
+75.6 ms of BF16→FP32 casts, 47.5 ms of FP32→BF16 casts, and 53.3 ms of FP32
+RMSNorm kernels. vLLM has its own pointwise operations. Reducing redundant
+format changes and routed-row traffic is the next area to measure after SSD
+and attention, with exact output controls.
+
+Nsight Compute could not collect hardware counters on this host:
+`ERR_NVGPUCTRPERM`. The analysis is based on Nsight Systems timing, launch
+geometry, source inspection, and the page-size A/B checks. The page-size
+results are single runs on a shared host, not a serving latency distribution.
+The 2,048-page trace is not available, and the vLLM attention page size is
+2,096 rather than exactly 2,048. Decode was not profiled in this follow-up.
+The page-size run artifacts are `/tmp/xinfer-kvblock{16,256,2048}-logits.bin`
+and `/tmp/xinfer-kvblock256-profile.nsys-rep` on this host.

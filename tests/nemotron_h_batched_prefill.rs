@@ -2,6 +2,7 @@
 //! XINFER_NEMOTRON_PREFILL_CHECKPOINT points at the 30B NVFP4 checkpoint.
 //! XINFER_NEMOTRON_PREFILL_TOKENS selects 2048 (default) or 32768 tokens.
 //! XINFER_NEMOTRON_BENCH_CHUNK overrides the default 8192-token call boundary.
+//! XINFER_NEMOTRON_BENCH_KV_BLOCK overrides the default 16-token KV page size.
 #![cfg(feature = "cuda")]
 
 use anyhow::{ensure, Context, Result};
@@ -19,9 +20,21 @@ use xinfer::{
     utils::{config::Config, downloader::ModelPaths, progress::ProgressReporter},
 };
 
-const BLOCK: usize = 16;
 const CHUNK: usize = 8192;
 type Cache = Vec<(Tensor, Tensor)>;
+
+fn block_size() -> Result<usize> {
+    let size = std::env::var("XINFER_NEMOTRON_BENCH_KV_BLOCK")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(16);
+    ensure!(
+        size.is_power_of_two(),
+        "benchmark KV block must be a power of two"
+    );
+    Ok(size)
+}
 
 #[link(name = "cudart")]
 unsafe extern "C" {
@@ -63,6 +76,7 @@ fn load(directory: &Path, device: &Device) -> Result<(NemotronHForCausalLM, Conf
 }
 
 fn cache(config: &Config, capacity: usize, device: &Device) -> Result<Cache> {
+    let block = block_size()?;
     let raw: serde_json::Value = serde_json::from_str(
         config
             .extra_config_json
@@ -76,8 +90,8 @@ fn cache(config: &Config, capacity: usize, device: &Device) -> Result<Cache> {
         .filter(|&kind| kind == b'*')
         .count();
     let shape = (
-        capacity.div_ceil(BLOCK),
-        BLOCK,
+        capacity.div_ceil(block),
+        block,
         config.num_key_value_heads,
         config.head_dim.context("missing head_dim")?,
     );
@@ -99,11 +113,12 @@ fn forward(
     tokens: &[u32],
     start: usize,
 ) -> Result<Vec<f32>> {
+    let block = block_size()?;
     let prefill = start == 0 || tokens.len() > 1;
     let _guard = xinfer::models::layers::linear::set_linear_is_prefill(prefill);
     let end = start + tokens.len();
     let positions = (start..end).map(|i| i as i64).collect::<Vec<_>>();
-    let block_ids = (0..end.div_ceil(BLOCK) as u32).collect::<Vec<_>>();
+    let block_ids = (0..end.div_ceil(block) as u32).collect::<Vec<_>>();
     let metadata = InputMetadata {
         is_prefill: prefill,
         is_mla: false,
