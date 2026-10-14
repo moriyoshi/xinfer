@@ -10,6 +10,9 @@ extern "C" {
         q: *const std::ffi::c_void,
         k_cache: *const std::ffi::c_void,
         v_cache: *const std::ffi::c_void,
+        k_direct: *const std::ffi::c_void,
+        v_direct: *const std::ffi::c_void,
+        direct_current: bool,
         output: *mut std::ffi::c_void,
         block_tables: *const i32,
         block_table_stride: u32,
@@ -23,6 +26,27 @@ extern "C" {
         scale: f32,
         stream: i64,
     ) -> i32;
+}
+
+fn valid_current_lengths(metadata: &InputMetadata, sequences: usize, rows: usize) -> bool {
+    let (Some(contexts), Some(cumulative)) = (
+        metadata.context_lens_host.as_ref(),
+        metadata.seqlens.as_ref(),
+    ) else {
+        return false;
+    };
+    if contexts.len() != sequences || cumulative.len() != sequences {
+        return false;
+    }
+    let mut previous = 0usize;
+    for (&context, &end) in contexts.iter().zip(cumulative.iter()) {
+        let end = end as usize;
+        if end <= previous || (context as usize) < end - previous {
+            return false;
+        }
+        previous = end;
+    }
+    previous == rows
 }
 
 fn ptr(t: &Tensor, dtype: DType) -> Result<u64> {
@@ -116,13 +140,24 @@ pub(crate) fn try_prefill(
         None,
         &slots,
     )?;
-    let output = Tensor::zeros_like(query)?;
+    // The grid covers every (sequence, query tile, query head), and each
+    // thread writes disjoint BF16 pairs for all valid rows and channels.
+    let output = unsafe { Tensor::empty_(query.shape(), DType::BF16, query.device())? };
+    // Prefix rows already in the cache keep their paged lookup. Rows in this
+    // prefill call are contiguous and can skip the page-table lookup. Missing
+    // host lengths conservatively retain the paged path.
+    let direct_kv = std::env::var_os("XINFER_NEMOTRON_DIRECT_PREFILL_KV").as_deref()
+        != Some(std::ffi::OsStr::new("0"))
+        && valid_current_lengths(metadata, num_sequences, rows);
     let stream = *dev.cu_stream() as i64;
     let result = unsafe {
         xinfer_nemotron_flash_prefill_bf16(
             ptr(query, DType::BF16)? as *const _,
             ptr(key_cache, DType::BF16)? as *const _,
             ptr(value_cache, DType::BF16)? as *const _,
+            ptr(key, DType::BF16)? as *const _,
+            ptr(value, DType::BF16)? as *const _,
+            direct_kv,
             ptr(&output, DType::BF16)? as *mut _,
             ptr(block_tables, DType::U32)? as *const i32,
             table_stride as u32,
@@ -165,29 +200,38 @@ mod tests {
         } else {
             vec![rows]
         };
+        let prefix = std::env::var("XINFER_NEMOTRON_ATTN_PREFIX")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()?
+            .unwrap_or(0);
         let table_stride = sequence_lengths
             .iter()
-            .map(|length| length.div_ceil(block_size))
+            .map(|length| (length + prefix).div_ceil(block_size))
             .max()
             .unwrap();
         let pages = sequence_lengths
             .iter()
-            .map(|length| length.div_ceil(block_size))
+            .map(|length| (length + prefix).div_ceil(block_size))
             .sum::<usize>();
         let mut slots_host = Vec::with_capacity(rows);
+        let mut prefix_slots_host = Vec::with_capacity(prefix * sequence_lengths.len());
         let mut tables_host = vec![0u32; sequence_lengths.len() * table_stride];
         let mut cu_host = vec![0u32];
         let mut page_base = 0usize;
         for (sequence, &length) in sequence_lengths.iter().enumerate() {
-            let page_count = length.div_ceil(block_size);
+            let page_count = (length + prefix).div_ceil(block_size);
             for page in 0..page_count {
                 tables_host[sequence * table_stride + page] = (page_base + page) as u32;
             }
-            for position in 0..length {
-                slots_host.push(
-                    ((page_base + position / block_size) * block_size + position % block_size)
-                        as i64,
-                );
+            for position in 0..length + prefix {
+                let slot = ((page_base + position / block_size) * block_size
+                    + position % block_size) as i64;
+                if position < prefix {
+                    prefix_slots_host.push(slot);
+                } else {
+                    slots_host.push(slot);
+                }
             }
             page_base += page_count;
             cu_host.push(cu_host.last().unwrap() + length as u32);
@@ -205,19 +249,44 @@ mod tests {
             .to_dtype(DType::BF16)?;
         let kc = Tensor::zeros((pages, block_size, 2, 128), DType::BF16, &device)?;
         let vc = Tensor::zeros((pages, block_size, 2, 128), DType::BF16, &device)?;
+        if prefix > 0 {
+            let prefix_rows = prefix * sequence_lengths.len();
+            let prefix_k = Tensor::from_vec(
+                values(prefix_rows * 2 * 128, 17),
+                (prefix_rows, 2, 128),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let prefix_v = Tensor::from_vec(
+                values(prefix_rows * 2 * 128, 53),
+                (prefix_rows, 2, 128),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let prefix_slots = Tensor::from_vec(prefix_slots_host, prefix_rows, &device)?;
+            attention_rs::flash::flash_reshape_and_cache(
+                &prefix_k,
+                &prefix_v,
+                &kc,
+                &vc,
+                None,
+                None,
+                &prefix_slots,
+            )?;
+        }
         let slots = Tensor::from_vec(slots_host, rows, &device)?;
         let blocks =
             Tensor::from_vec(tables_host, (sequence_lengths.len(), table_stride), &device)?;
         let contexts = Tensor::from_vec(
             sequence_lengths
                 .iter()
-                .map(|length| *length as u32)
+                .map(|length| (length + prefix) as u32)
                 .collect(),
             sequence_lengths.len(),
             &device,
         )?;
-        let cu = Tensor::from_vec(cu_host, sequence_lengths.len() + 1, &device)?;
-        let metadata = InputMetadata {
+        let cu = Tensor::from_vec(cu_host.clone(), sequence_lengths.len() + 1, &device)?;
+        let mut metadata = InputMetadata {
             is_prefill: true,
             is_mla: false,
             sequence_ids: None,
@@ -225,14 +294,19 @@ mod tests {
             slot_mapping: slots,
             block_tables: Some(blocks.clone()),
             block_tables_host: None,
-            context_lens_host: None,
+            context_lens_host: Some(
+                sequence_lengths
+                    .iter()
+                    .map(|&n| (n + prefix) as u32)
+                    .collect(),
+            ),
             context_lens: Some(contexts.clone()),
             cu_seqlens_q: Some(cu.clone()),
             cu_seqlens_k: None,
             max_seqlen_q: *sequence_lengths.iter().max().unwrap(),
-            max_seqlen_k: *sequence_lengths.iter().max().unwrap(),
-            max_context_len: *sequence_lengths.iter().max().unwrap(),
-            seqlens: None,
+            max_seqlen_k: sequence_lengths.iter().max().unwrap() + prefix,
+            max_context_len: sequence_lengths.iter().max().unwrap() + prefix,
+            seqlens: Some(cu_host[1..].to_vec()),
             flashinfer_metadata: None,
             is_mtp_verify: false,
         };
@@ -331,6 +405,23 @@ mod tests {
             }
             eprintln!("attention_prefill_ms_baseline={baseline:?} custom={custom:?}");
         }
+        assert!(valid_current_lengths(
+            &metadata,
+            sequence_lengths.len(),
+            rows
+        ));
+        metadata.context_lens_host.as_mut().unwrap()[0] += 1;
+        assert!(valid_current_lengths(
+            &metadata,
+            sequence_lengths.len(),
+            rows
+        ));
+        metadata.context_lens_host.as_mut().unwrap()[0] = 0;
+        assert!(!valid_current_lengths(
+            &metadata,
+            sequence_lengths.len(),
+            rows
+        ));
         Ok(())
     }
 }

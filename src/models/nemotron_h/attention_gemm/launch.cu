@@ -4,7 +4,8 @@
 #include "flash_prefill_paged.cuh"
 
 extern "C" int xinfer_nemotron_flash_prefill_bf16(
-    const void* q, const void* k_cache, const void* v_cache, void* output,
+    const void* q, const void* k_cache, const void* v_cache,
+    const void* k_direct, const void* v_direct, bool direct_current, void* output,
     const int* block_tables, unsigned int block_table_stride,
     const unsigned int* cu_seqlens_q, const unsigned int* context_lens,
     unsigned int num_seqs, unsigned int max_seqlen_q,
@@ -22,7 +23,8 @@ extern "C" int xinfer_nemotron_flash_prefill_bf16(
   kernel<<<grid, NUM_THREADS, shared_bytes,
            reinterpret_cast<cudaStream_t>(stream_raw)>>>(
       static_cast<const Half*>(q), static_cast<const Half*>(k_cache),
-      static_cast<const Half*>(v_cache), static_cast<Half*>(output),
+      static_cast<const Half*>(v_cache), static_cast<const Half*>(k_direct),
+      static_cast<const Half*>(v_direct), direct_current, static_cast<Half*>(output),
       block_tables, block_table_stride, cu_seqlens_q, context_lens,
       num_q_heads, num_kv_heads, FLASH_HDIM, cache_block_size,
       0, 1, scale, 0.0f);

@@ -214,12 +214,16 @@ pub(super) fn moe_gemm_nvfp4_fused_quant(
         metadata_bytes,
     )?;
 
-    let expert_counts_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
-    let expert_offsets_t = Tensor::zeros((num_experts + 1,), DType::U32, dev)?;
-    let sf_offsets_t = Tensor::zeros((num_experts,), DType::U32, dev)?;
-    let problem_sizes_t = Tensor::zeros((num_experts * 3,), DType::U32, dev)?;
-    let alphas_t = Tensor::zeros((num_experts,), DType::F32, dev)?;
-    let input_scale_invs_t = Tensor::zeros((num_experts,), DType::F32, dev)?;
+    // calculate_expert_offsets initializes counts itself and writes every
+    // offset. nvfp4_moe_build_metadata then writes every word of the remaining
+    // buffers on this stream. Zero-filling here adds six device memsets per
+    // expert GEMM without providing any initialized data to a consumer.
+    let expert_counts_t = unsafe { Tensor::empty_((num_experts,), DType::U32, dev)? };
+    let expert_offsets_t = unsafe { Tensor::empty_((num_experts + 1,), DType::U32, dev)? };
+    let sf_offsets_t = unsafe { Tensor::empty_((num_experts,), DType::U32, dev)? };
+    let problem_sizes_t = unsafe { Tensor::empty_((num_experts * 3,), DType::U32, dev)? };
+    let alphas_t = unsafe { Tensor::empty_((num_experts,), DType::F32, dev)? };
+    let input_scale_invs_t = unsafe { Tensor::empty_((num_experts,), DType::F32, dev)? };
 
     {
         let (experts_ids_s, _) = experts_ids.storage_and_layout();
