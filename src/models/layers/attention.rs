@@ -77,6 +77,7 @@ pub struct Attention {
     qk_l2_norm: bool,
     promote_qk_to_f32: bool,
     v_norm_eps: Option<f64>,
+    nemotron_attention_gemm: bool,
 }
 
 impl Attention {
@@ -659,7 +660,15 @@ impl Attention {
             qk_l2_norm,
             promote_qk_to_f32: is_qvar_builder || config.higher_precision_required() || qk_l2_norm,
             v_norm_eps,
+            nemotron_attention_gemm: false,
         })
+    }
+
+    /// Enables the experimental Nemotron-only BF16 paged prefill backend.
+    /// The runtime opt-in remains `XINFER_NEMOTRON_ATTENTION_GEMM=1`.
+    pub fn with_nemotron_attention_gemm(mut self) -> Self {
+        self.nemotron_attention_gemm = true;
+        self
     }
 
     /// Promote Q/K to F32 when needed and apply per-token or per-head RMSNorm before RoPE.
@@ -938,16 +947,45 @@ impl Attention {
                 .to_dtype(q.dtype())?;
         }
 
-        let native_context = self.attn.forward(
-            &q,
-            &k,
-            &v,
-            attention_mask,
-            cache.map(|(k_, _)| k_.clone()),
-            cache.map(|(_, v_)| v_.clone()),
-            input_metadata,
-            self.softcapping,
-        )?;
+        #[cfg(feature = "nemotron-attention-gemm")]
+        let specialized = if self.nemotron_attention_gemm
+            && std::env::var_os("XINFER_NEMOTRON_ATTENTION_GEMM").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            && self.sliding_window.is_none()
+            && self.softcapping.is_none()
+            && input_metadata.max_context_len >= 4096
+            && q.dim(0)? >= 1024
+        {
+            crate::models::nemotron_h::attention_gemm::try_prefill(
+                &q,
+                &k,
+                &v,
+                cache,
+                input_metadata,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                self.score_scale,
+            )?
+        } else {
+            None
+        };
+        #[cfg(not(feature = "nemotron-attention-gemm"))]
+        let specialized: Option<Tensor> = None;
+        let native_context = if let Some(context) = specialized {
+            context
+        } else {
+            self.attn.forward(
+                &q,
+                &k,
+                &v,
+                attention_mask,
+                cache.map(|(k_, _)| k_.clone()),
+                cache.map(|(_, v_)| v_.clone()),
+                input_metadata,
+                self.softcapping,
+            )?
+        };
         let mut context = native_context.clone();
         if let Some(hooks) = hooks {
             let mut probe = AttentionProbe {

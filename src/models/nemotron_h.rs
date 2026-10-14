@@ -1,6 +1,8 @@
 //! Nemotron-H: a sequence of Mamba2, MLP, and unrotated attention blocks.
 //! The recurrent path is deliberately expressed in Candle operations so the
 //! checkpoint can run without the optional mamba-ssm CUDA extension.
+#[cfg(feature = "nemotron-attention-gemm")]
+pub(crate) mod attention_gemm;
 mod compact_state;
 mod expert_cache;
 mod expert_snapshot;
@@ -757,14 +759,10 @@ impl NemotronHForCausalLM {
             let mvb = lvb.pp("mixer");
             let mixer = match kind {
                 b'M' => Mixer::Mamba(Mamba2::new(mvb, &config, &c, dtype)?),
-                b'*' => Mixer::Attention(Attention::new(
-                    mvb,
-                    comm.clone(),
-                    &config,
-                    None,
-                    None,
-                    dtype,
-                )?),
+                b'*' => Mixer::Attention(
+                    Attention::new(mvb, comm.clone(), &config, None, None, dtype)?
+                        .with_nemotron_attention_gemm(),
+                ),
                 b'-' => Mixer::Mlp(NemotronMlp::new(
                     mvb,
                     &config,
