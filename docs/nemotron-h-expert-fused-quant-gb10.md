@@ -248,3 +248,52 @@ The 2,048-page trace is not available, and the vLLM attention page size is
 2,096 rather than exactly 2,048. Decode was not profiled in this follow-up.
 The page-size run artifacts are `/tmp/xinfer-kvblock{16,256,2048}-logits.bin`
 and `/tmp/xinfer-kvblock256-profile.nsys-rep` on this host.
+
+## Follow-up: direct current-chunk K/V reads
+
+The Nemotron custom attention prefill now reads the current call's contiguous
+post-transform K/V tensors directly. It still writes those tensors to the
+paged cache for later calls, and reads earlier prefix positions from that
+cache during continued prefill. The direct path requires matching host context
+and cumulative query lengths; otherwise it uses the original paged lookup.
+`XINFER_NEMOTRON_DIRECT_PREFILL_KV=0` disables the direct reads for an A/B
+control. The specialization itself still requires
+`XINFER_NEMOTRON_ATTENTION_GEMM=1` and its existing shape/length gates.
+
+On the 30B NVFP4 checkpoint, the same 9,538-token prompt in one prefill call
+measured 1,700.3 and 1,726.2 ms with direct K/V around a 1,773.1 ms paged
+control; a later default-on smoke measured 1,755.5 ms. With 32,768 tokens in
+four 8,192-token calls, direct K/V measured
+7,200.6 ms and paged K/V 7,294.7 ms. The complete prefix plus next-token
+logit buffers were byte-identical within each comparison. These are small
+single-run wins on a shared host, not stable serving latency estimates.
+The 2,048-token real benchmark does not enter this custom attention path
+because its existing gate requires `max_context_len >= 4096`.
+
+The expert GEMM path also skips six caller-side metadata zero fills per GEMM.
+The expert-count kernel initializes its own count buffer, the offset kernel
+writes every offset, and metadata construction writes every remaining word.
+Real-checkpoint logits remained byte-identical. The 9,538-token prefill was
+1,639.7 ms after this change versus a nearby 1,633.8 ms control, so a wall
+gain from zero-fill removal was not established. The 2,048-token checkpoint
+smoke measured 389.2 ms prefill and 42.9 ms for one decode step; this length
+does not enter the custom attention specialization.
+
+Other trials did not justify changing the default path. Mamba scan chunks of
+64, 128, 256, and 512 tokens measured 1,716.6, 1,670.7, 1,642.9, and
+1,827.9 ms respectively on the same 9,538-token case. A ten-warp scan took
+1,648.2 ms versus 1,633.8 ms for eight warps. A CUBLAS-based SSD scan passed
+focused state/continuation parity but took 3,686 ms versus about 1,614 ms on
+the full checkpoint, so it was discarded. The pinned FlashAttention varlen
+wrapper returned incorrect BF16 context on SM121 (maximum absolute error
+about 4.8 in a small CUDA fixture). FlashInfer ragged reduced isolated
+9,538-row attention from about 29 to 13 ms per layer, but the real checkpoint
+measured 1,780.5 ms with it versus 1,778.8 ms in the same feature-enabled
+binary without it; its prefix/next-token logits differed by up to 3.02, with
+the same top choice at both measured positions. That trial was discarded.
+
+This change narrows the attention portion modestly and does not establish
+parity with vLLM. The prior matched Nsight result still points to Mamba's
+two scalar state passes (437 ms here versus 140 ms of named SSD/conv kernels
+in vLLM) as the largest algorithmic gap. A fused tensor-core SSD path with
+bounded intermediate storage remains the next substantial prefill task.

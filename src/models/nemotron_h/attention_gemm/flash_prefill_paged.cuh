@@ -73,7 +73,7 @@
 
 // Paged KV tile loader: cp.async from scattered pages to contiguous smem.
 // block_size is always power-of-2 in practice; __ffs gives bit position for shift.
-#define LOAD_KV_TILE_BF16(cache, bt, smem, kv_s, kv_l, kvh, t, stride) \
+#define LOAD_KV_TILE_BF16(cache, direct, direct_current, seq_start, q_offset, bt, smem, kv_s, kv_l, kvh, t, stride) \
     do { \
         const unsigned int _cpr = HDIM / 8; \
         const unsigned long long _ps = (unsigned long long)cache_block_size * num_kv_heads * head_dim; \
@@ -85,12 +85,17 @@
             unsigned int _pos = (kv_s) + _row; \
             unsigned int _sa = __cvta_generic_to_shared(&(smem)[_row * HDIM_PAD + _col]); \
             if (_pos < (kv_l)) { \
-                unsigned int _lb = _pos >> _bs_shift; \
-                unsigned int _bo = _pos & _bs_mask; \
-                unsigned int _pb = __ldg(&(bt)[_lb]); \
-                const void* _gm = (const void*)( \
-                    (cache) + (unsigned long long)_pb * _ps + (unsigned long long)_bo * _rs \
-                    + (unsigned long long)(kvh) * head_dim + _col); \
+                const void* _gm; \
+                if (direct_current && _pos >= (q_offset)) { \
+                    _gm = (const void*)((direct) + ((unsigned long long)(seq_start) + _pos - (q_offset)) * _rs \
+                        + (unsigned long long)(kvh) * head_dim + _col); \
+                } else { \
+                    unsigned int _lb = _pos >> _bs_shift; \
+                    unsigned int _bo = _pos & _bs_mask; \
+                    unsigned int _pb = __ldg(&(bt)[_lb]); \
+                    _gm = (const void*)((cache) + (unsigned long long)_pb * _ps + (unsigned long long)_bo * _rs \
+                        + (unsigned long long)(kvh) * head_dim + _col); \
+                } \
                 FLASH_CP_ASYNC(_sa, _gm); \
             } else { \
                 *((uint4*)&(smem)[_row * HDIM_PAD + _col]) = make_uint4(0,0,0,0); \
@@ -128,6 +133,9 @@ flash_prefill_paged(
     const HalfT* __restrict__ Q,
     const HalfT* __restrict__ K_cache,
     const HalfT* __restrict__ V_cache,
+    const HalfT* __restrict__ K_direct,
+    const HalfT* __restrict__ V_direct,
+    const bool direct_current,
     HalfT* __restrict__ O,
     const int* __restrict__ block_tables,
     const unsigned int block_table_stride,
@@ -227,11 +235,11 @@ flash_prefill_paged(
             }
         }
         if (kv_block_start < num_kv_blocks) {
-            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(0, 0)), kv_block_start * BC, kv_len, kv_head, tid, NUM_THREADS);
+            LOAD_KV_TILE_BF16(K_cache, K_direct, direct_current, q_seq_start, q_offset, block_table, (&SMEM_K_PAGED(0, 0)), kv_block_start * BC, kv_len, kv_head, tid, NUM_THREADS);
         }
         FLASH_ASYNC_COMMIT(); // group 0: Q + K[0]
         if (kv_block_start + 1 < num_kv_blocks) {
-            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(1, 0)), (kv_block_start + 1) * BC, kv_len, kv_head, tid, NUM_THREADS);
+            LOAD_KV_TILE_BF16(K_cache, K_direct, direct_current, q_seq_start, q_offset, block_table, (&SMEM_K_PAGED(1, 0)), (kv_block_start + 1) * BC, kv_len, kv_head, tid, NUM_THREADS);
             FLASH_ASYNC_COMMIT(); // group 1: K[1]
         }
         FLASH_ASYNC_WAIT();
@@ -245,7 +253,7 @@ flash_prefill_paged(
         unsigned int buf = kv_block & 1;
 
         // Async V load (overlaps with QK^T)
-        LOAD_KV_TILE_BF16(V_cache, block_table, smem_V, kv_start, kv_len, kv_head, tid, NUM_THREADS);
+        LOAD_KV_TILE_BF16(V_cache, V_direct, direct_current, q_seq_start, q_offset, block_table, smem_V, kv_start, kv_len, kv_head, tid, NUM_THREADS);
         FLASH_ASYNC_COMMIT();
 
         // QK^T: eight warps, four M groups and two N halves
@@ -397,7 +405,7 @@ flash_prefill_paged(
 
         // Preload K[i+2] into the next-next buffer (overlaps with PV compute)
         if (kv_block + 2 < num_kv_blocks) {
-            LOAD_KV_TILE_BF16(K_cache, block_table, (&SMEM_K_PAGED(kv_block & 1, 0)),
+            LOAD_KV_TILE_BF16(K_cache, K_direct, direct_current, q_seq_start, q_offset, block_table, (&SMEM_K_PAGED(kv_block & 1, 0)),
                 (kv_block + 2) * BC, kv_len, kv_head, tid, NUM_THREADS);
             FLASH_ASYNC_COMMIT();
         }
