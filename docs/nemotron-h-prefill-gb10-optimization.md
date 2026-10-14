@@ -113,3 +113,33 @@ recurrent and grouped-expert kernels, plus a better attention prefill path.
 
 Raw paired logs, output logits, and the final `.nsys-rep`/SQLite trace are in
 `/tmp/xinfer-nemotron-gap-results/` on the measurement host.
+
+## Mamba scratch allocation follow-up
+
+The chunk prefix now overwrites each chunk summary with its starting state
+after reading the summary. This removes one FP32 scratch buffer: 64 MiB for
+each 8,192-token Mamba span on this checkpoint. Mamba CUDA outputs also use
+uninitialized allocations where the immediately following kernels write every
+element on the same stream. This removes zero fills of convolution, decay,
+scan, state, and normalized-output scratch; decode uses the same rule for its
+single-token scratch. The carried state shape, snapshot bytes, chunk size, and
+arithmetic order are unchanged.
+
+A paired 9,538-token run with the same release binary settings and prompt
+generator measured 2,201.228 ms before and 2,120.871 ms after (3.7% less).
+The complete prefix-plus-one-step logit files were byte-identical. Additional
+real-checkpoint runs measured 475.873 ms at 2,048 tokens and 8,566.769 ms at
+32,768 tokens; the previous final-build runs recorded 487.226 and 8,810.901
+ms. All 257 logit rows in the 2,048-token/256-step test and all 33 rows in the
+32,768-token/32-step test were byte-identical to saved pre-change outputs.
+Decode p50 was 23.773 and 28.241 ms, respectively, within the prior run-to-run
+range. These are single-process samples on a shared host, so the small timing
+differences are indicative rather than a controlled throughput distribution.
+
+Nsight captures of the same 9,538-token input recorded 1,575 GPU memset
+operations totaling 34.17 GB before, versus 1,207 totaling 20.69 GB after.
+The captures used separate processes and profiler overhead inflated wall time;
+their memset counts and bytes verify the intended traffic reduction. The new
+profile and test logs are in `/tmp/xinfer-chunk-tuning/` on this host. Focused
+CUDA tests cover sequential-scan parity, nonzero-state continued prefill,
+single-token decode parity, and deterministic repeats.

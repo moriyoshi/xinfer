@@ -133,7 +133,7 @@ fn module(mixer: &Mamba2) -> Result<String> {
     let device = mixer.device.as_cuda_device()?.cuda_device();
     let sm = attention_rs::cuda_utils::sm_version(mixer.device.as_cuda_device()?)
         .ok_or_else(|| candle_core::Error::Msg("unknown Mamba CUDA compute capability".into()))?;
-    let module = format!("xinfer_nemotron_mamba_h{}_sm{}_v5", mixer.head_dim, sm);
+    let module = format!("xinfer_nemotron_mamba_h{}_sm{}_v6", mixer.head_dim, sm);
     let _guard = COMPILE_LOCK.lock().unwrap();
     if !device.has_func(&module, PREPARE) {
         let capture = capture_status(*device.cu_stream())
@@ -203,19 +203,25 @@ fn run_with_options(
     }
     let module = module(mixer)?;
     let projected = projected.contiguous()?;
-    let conv = Tensor::zeros((tokens, mixer.conv_dim), DType::F32, &mixer.device)?;
-    let next_conv = Tensor::zeros(
-        (mixer.kernel - 1, mixer.conv_dim),
-        DType::F32,
-        &mixer.device,
-    )?;
-    let dt_decay = Tensor::zeros((tokens, mixer.heads, 2), DType::F32, &mixer.device)?;
-    let y = Tensor::zeros((tokens, inner), DType::F32, &mixer.device)?;
-    let next_ssm = Tensor::zeros(
-        (mixer.heads, mixer.head_dim, mixer.state_dim),
-        DType::F32,
-        &mixer.device,
-    )?;
+    // Every element of these buffers is written by prepare/scan before the
+    // next kernel reads it. All launches use the same CUDA stream.
+    let conv = unsafe { Tensor::empty_((tokens, mixer.conv_dim), DType::F32, &mixer.device)? };
+    let next_conv = unsafe {
+        Tensor::empty_(
+            (mixer.kernel - 1, mixer.conv_dim),
+            DType::F32,
+            &mixer.device,
+        )?
+    };
+    let dt_decay = unsafe { Tensor::empty_((tokens, mixer.heads, 2), DType::F32, &mixer.device)? };
+    let y = unsafe { Tensor::empty_((tokens, inner), DType::F32, &mixer.device)? };
+    let next_ssm = unsafe {
+        Tensor::empty_(
+            (mixer.heads, mixer.head_dim, mixer.state_dim),
+            DType::F32,
+            &mixer.device,
+        )?
+    };
     let params = Params {
         tokens: as_i32(tokens)?,
         heads: as_i32(mixer.heads)?,
@@ -271,17 +277,16 @@ fn run_with_options(
     .map_err(|e| candle_core::Error::Msg(format!("launch Mamba prepare: {e}")))?;
     if chunked_scan && tokens >= CHUNK_TOKENS * 2 {
         let chunks = tokens.div_ceil(CHUNK_TOKENS);
-        let alphas = Tensor::zeros((chunks, mixer.heads), DType::F32, &mixer.device)?;
-        let summaries = Tensor::zeros(
-            (chunks, mixer.heads, mixer.head_dim, mixer.state_dim),
-            DType::F32,
-            &mixer.device,
-        )?;
-        let starts = Tensor::zeros(
-            (chunks, mixer.heads, mixer.head_dim, mixer.state_dim),
-            DType::F32,
-            &mixer.device,
-        )?;
+        let alphas = unsafe { Tensor::empty_((chunks, mixer.heads), DType::F32, &mixer.device)? };
+        // The prefix kernel replaces each summary with that chunk's starting
+        // state after reading its summary. The scan reads those starts later.
+        let summaries = unsafe {
+            Tensor::empty_(
+                (chunks, mixer.heads, mixer.head_dim, mixer.state_dim),
+                DType::F32,
+                &mixer.device,
+            )?
+        };
         let summary = device
             .get_func(&module, CHUNK_SUMMARY)
             .ok_or_else(|| candle_core::Error::Msg("missing Mamba chunk summary kernel".into()))?;
@@ -317,7 +322,6 @@ fn run_with_options(
                     pointer(&state.ssm)?,
                     pointer(&alphas)?,
                     pointer(&summaries)?,
-                    pointer(&starts)?,
                     as_i32(chunks)?,
                     params,
                 ),
@@ -337,7 +341,7 @@ fn run_with_options(
                 (
                     pointer(&conv)?,
                     pointer(&dt_decay)?,
-                    pointer(&starts)?,
+                    pointer(&summaries)?,
                     pointer(&mixer.d)?,
                     pointer(&y)?,
                     pointer(&next_ssm)?,
@@ -385,7 +389,7 @@ fn run_with_options(
     let threads = group_rows.min(1024).next_power_of_two();
     let shared_bytes = (group_rows + 32) * std::mem::size_of::<f32>();
     if fused_gate_norm && group_rows.is_multiple_of(4) && shared_bytes <= 48 * 1024 {
-        let normalized = Tensor::zeros((tokens, inner), mixer.dtype, &mixer.device)?;
+        let normalized = unsafe { Tensor::empty_((tokens, inner), mixer.dtype, &mixer.device)? };
         let kernel = device
             .get_func(&module, GATE_NORM)
             .ok_or_else(|| candle_core::Error::Msg("missing Mamba gate norm kernel".into()))?;
@@ -438,17 +442,23 @@ pub(super) fn run_step(
     }
     let module = module(mixer)?;
     let device = mixer.device.as_cuda_device()?.cuda_device();
-    let normalized = Tensor::zeros((1, inner), mixer.dtype, &mixer.device)?;
-    let next_conv = Tensor::zeros(
-        (mixer.kernel - 1, mixer.conv_dim),
-        DType::F32,
-        &mixer.device,
-    )?;
-    let next_ssm = Tensor::zeros(
-        (mixer.heads, mixer.head_dim, mixer.state_dim),
-        DType::F32,
-        &mixer.device,
-    )?;
+    // The step kernel writes every group row of normalized, every conv
+    // channel of next_conv, and every SSM state element before either is read.
+    let normalized = unsafe { Tensor::empty_((1, inner), mixer.dtype, &mixer.device)? };
+    let next_conv = unsafe {
+        Tensor::empty_(
+            (mixer.kernel - 1, mixer.conv_dim),
+            DType::F32,
+            &mixer.device,
+        )?
+    };
+    let next_ssm = unsafe {
+        Tensor::empty_(
+            (mixer.heads, mixer.head_dim, mixer.state_dim),
+            DType::F32,
+            &mixer.device,
+        )?
+    };
     let params = Params {
         tokens: 1,
         heads: as_i32(mixer.heads)?,
