@@ -297,3 +297,51 @@ parity with vLLM. The prior matched Nsight result still points to Mamba's
 two scalar state passes (437 ms here versus 140 ms of named SSD/conv kernels
 in vLLM) as the largest algorithmic gap. A fused tensor-core SSD path with
 bounded intermediate storage remains the next substantial prefill task.
+
+## vLLM Mamba kernel and GB10 binary inspection
+
+The profiled NVIDIA vLLM 26.05 image contains vLLM
+`0.20.1+7124b12a.dev`. Its `ssd_combined.py` calls five Triton stages:
+chunk cumulative decay, chunk state, state passing, C×B chunk product, and
+chunk output scan. The checkpoint sets `chunk_size=128`, 64 Mamba heads,
+64 channels per head, eight B/C groups, and 128 state channels. For each
+128-token chunk, the state and output stages use `tl.dot` matrix products;
+only the much smaller inter-chunk state passing is sequential. In contrast,
+Xinfer's `nemotron_mamba_chunk_summary` and `nemotron_mamba_chunk_scan` both
+iterate through every token in each 256-token chunk with scalar FP32 state
+updates. Changing Xinfer's chunk size alone did not help, as measured above.
+
+The vLLM image's Triton sources are under
+`/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/ops/`.
+We compiled those sources on the GB10 with synthetic tensors matching the
+checkpoint's Mamba dimensions, BF16 X/B/C, FP32 delta and carried state,
+and two 128-token chunks. Triton's autotune cache selected the following
+tiles in this small synthetic run; these are **not** a measurement of the
+9,538-token production specialization:
+
+| Stage | Selected tile | Warps | Pipeline stages |
+| --- | --- | ---: | ---: |
+| Chunk state, X×scaled B | 64×128×64 | 4 | 2 |
+| C×B | 128×256×64 | 8 | 3 |
+| Chunk output scan | 64×64×64 | 4 | 1 |
+
+`nvdisasm` of a compiled chunk-output-scan cubin showed
+`HMMA.16816.F32.BF16` instructions. Compiled chunk-state and C×B variants
+also contained BF16 HMMA instructions. This establishes that vLLM's matrix
+work reaches the GB10 tensor cores; it does not establish achieved occupancy
+or bandwidth because Nsight Compute counters are unavailable on this host.
+The scalar FP32 state updates in Xinfer's current CUDA scan cannot use those
+matrix instructions. The earlier Xinfer SSD attempt used FP32 CUBLAS GEMMs,
+large FP32 intermediates, and extra conversions, so its slowdown does not
+test this BF16 tensor-core design.
+
+At 9,538 tokens, a 128-token vLLM layout has 75 chunks. A full FP32 chunk
+state tensor would be about 157 MB and a full FP32 C×B tensor about 39 MB
+per Mamba layer. A Xinfer implementation should reuse bounded per-layer
+scratch and avoid host synchronization, preserving FP32 carried state and
+the existing state envelope. The first useful gate is an isolated 128-token
+SSD layer benchmark with nonzero carried state, partial final chunks, and
+BF16 output parity measurements. Only then should it be tested on the 30B
+checkpoint for deterministic repeated prefill and decode, continuation
+logits, and 2K/32K end-to-end latency. The source and synthetic cubins used
+for this inspection are under `/tmp/xinfer-vllm-mamba-source/` on this host.
