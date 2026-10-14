@@ -345,3 +345,46 @@ BF16 output parity measurements. Only then should it be tested on the 30B
 checkpoint for deterministic repeated prefill and decode, continuation
 logits, and 2K/32K end-to-end latency. The source and synthetic cubins used
 for this inspection are under `/tmp/xinfer-vllm-mamba-source/` on this host.
+
+## BF16 CUBLAS SSD and scratch reuse trials
+
+An opt-in prototype reused the existing FP32 chunk-summary and inter-chunk
+prefix kernels, then computed C×B, weighted C×B times X, and C times the
+carried state using three batched CUBLAS GEMMs with BF16 inputs and FP32
+outputs. The 128-token chunk path passed the focused CUDA test for nonzero
+carried state, partial final chunks, and continued prefill. On the 30B
+checkpoint, its two measured 2,048-token logits kept the scalar path's top
+choices but differed by up to 1.6875; the state snapshot bytes also differed
+because the prototype used 128-token rather than 256-token chunks. The
+snapshot envelope format was unchanged.
+
+| Real-checkpoint prefill | Scalar scan | BF16 CUBLAS SSD |
+| --- | ---: | ---: |
+| 2,048 tokens, uncached SSD | 411.6 ms | 505.4 ms |
+| 2,048 tokens, reused SSD scratch | 411.6 / 386.8 ms controls | 379.1 / 394.0 ms |
+| 9,538 tokens, one call, reused SSD scratch | 2,124.4 / 1,991.3 ms controls | 2,302.5 ms |
+
+The 2K scratch-reuse timings overlap the controls, and the 9.5K SSD run is
+slower than both surrounding scalar runs. A profiled 2K pair recorded
+368.5 ms of all GPU kernels for scalar versus 354.7 ms for SSD, but SSD
+launched 2,114 rather than 1,976 kernels and called `cuMemAllocAsync`
+1,660 rather than 1,430 times. Nsight itself substantially inflated wall
+times in both runs; those kernel totals are useful only for the stage
+comparison. BF16 arithmetic alone did not make this multi-buffer CUBLAS
+orchestration competitive with the current scan.
+
+A separate opt-in attempt cached only the existing scalar scan's transient
+conv, delta, output, chunk-alpha, and chunk-summary tensors per host thread.
+The per-sequence conv and SSM state remained separately owned. Real 2K and
+9.5K logits and serialized state matched the uncached path byte for byte.
+The 2K run measured 389.4 ms within a 386.8–411.6 ms control range; the
+9.5K run measured 1,729.8 ms versus a nearby 1,653.7 ms disabled control.
+No reliable wall gain justified retaining that memory cache.
+
+Both prototypes were discarded. Their source diffs, run logs, logits, state
+snapshots, and the 2K Nsight traces are preserved under
+`/tmp/xinfer-ssd-bf16/` on this host. A viable implementation needs to
+combine the BF16 tensor-core products and per-token decay/output in fewer
+launches with bounded scratch, as vLLM's Triton chunk-output kernel does.
+It must retain Xinfer's FP32 carried-state envelope and be checked against
+the current scan at identical chunk boundaries before any default change.
