@@ -12,11 +12,12 @@ use candle_core::{DType, Device, Result, Storage, Tensor};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-const MODULE: &str = "xinfer_nemotron_route_grouping_v2";
+const MODULE: &str = "xinfer_nemotron_route_grouping_v3";
 const COUNT: &str = "nemotron_route_count";
 const PREFIX: &str = "nemotron_route_prefix";
 const SCATTER: &str = "nemotron_route_scatter";
 const COMBINE: &str = "nemotron_route_combine";
+const RELU2: &str = "nemotron_relu_squared";
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 static ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_ROUTE_GROUPING").as_deref() != Some(std::ffi::OsStr::new("0"))
@@ -24,6 +25,9 @@ static ENABLED: LazyLock<bool> = LazyLock::new(|| {
 static COMBINE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_FUSED_MOE_COMBINE").as_deref()
         != Some(std::ffi::OsStr::new("0"))
+});
+static RELU2_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_FUSED_RELU2").as_deref() != Some(std::ffi::OsStr::new("0"))
 });
 
 #[repr(C)]
@@ -67,7 +71,7 @@ fn ensure_module(device: &Device) -> Result<()> {
         )
         .map_err(|e| candle_core::Error::Msg(format!("compile Nemotron routes: {e}")))?;
         driver
-            .load_ptx(ptx, MODULE, &[COUNT, PREFIX, SCATTER, COMBINE])
+            .load_ptx(ptx, MODULE, &[COUNT, PREFIX, SCATTER, COMBINE, RELU2])
             .map_err(|e| candle_core::Error::Msg(format!("load Nemotron routes: {e}")))?;
     }
     Ok(())
@@ -249,6 +253,58 @@ pub(super) fn combine_routed(
     Ok(Some(output))
 }
 
+/// Fuse the two elementwise passes of ReLU-squared on CUDA. Returns `None`
+/// when the original Candle operations should be used.
+pub(super) fn relu_squared(input: &Tensor) -> Result<Option<Tensor>> {
+    let elements = input.elem_count();
+    if !*RELU2_ENABLED
+        || elements == 0
+        || elements > i32::MAX as usize
+        || !input.is_contiguous()
+        || !matches!(input.dtype(), DType::BF16 | DType::F16 | DType::F32)
+        || !input.device().is_cuda()
+    {
+        return Ok(None);
+    }
+    let driver = input.device().as_cuda_device()?.cuda_device();
+    if !driver.has_func(MODULE, RELU2)
+        && capture_status(*driver.cu_stream())
+            .map_err(|e| candle_core::Error::Msg(format!("check Nemotron CUDA capture: {e}")))?
+            == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+    {
+        return Ok(None);
+    }
+    ensure_module(input.device())?;
+    // The kernel writes each output element exactly once before any consumer.
+    let output = unsafe { Tensor::empty_(input.shape(), input.dtype(), input.device())? };
+    let kernel = driver
+        .get_func(MODULE, RELU2)
+        .ok_or_else(|| candle_core::Error::Msg("missing Nemotron ReLU-squared kernel".into()))?;
+    let dtype = match input.dtype() {
+        DType::BF16 => 0,
+        DType::F16 => 1,
+        DType::F32 => 2,
+        _ => unreachable!(),
+    };
+    unsafe {
+        kernel.launch(
+            LaunchConfig {
+                grid_dim: (elements.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            (
+                float_pointer(input)?,
+                float_pointer(&output)?,
+                elements as i32,
+                dtype,
+            ),
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("launch Nemotron ReLU-squared: {e}")))?;
+    Ok(Some(output))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +395,40 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_relu_squared_matches_candle_for_expert_shapes() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        for shape in [(17, 1, 257), (9, 6, 97)] {
+            let elements = shape.0 * shape.1 * shape.2;
+            let values = (0..elements)
+                .map(|i| ((i * 37 % 113) as f32 - 56.0) / 29.0)
+                .collect::<Vec<_>>();
+            let base = Tensor::from_vec(values, shape, &device)?;
+            for dtype in [DType::BF16, DType::F16, DType::F32] {
+                let input = base.to_dtype(dtype)?;
+                let expected = input.relu()?.sqr()?.flatten_all()?;
+                let actual = relu_squared(&input)?.unwrap().flatten_all()?;
+                match dtype {
+                    DType::BF16 => assert_eq!(
+                        expected.to_vec1::<half::bf16>()?,
+                        actual.to_vec1::<half::bf16>()?
+                    ),
+                    DType::F16 => assert_eq!(
+                        expected.to_vec1::<half::f16>()?,
+                        actual.to_vec1::<half::f16>()?
+                    ),
+                    DType::F32 => assert_eq!(expected.to_vec1::<f32>()?, actual.to_vec1::<f32>()?),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let noncontiguous = Tensor::zeros((3, 5), DType::BF16, &device)?.transpose(0, 1)?;
+        assert!(relu_squared(&noncontiguous)?.is_none());
         Ok(())
     }
 }

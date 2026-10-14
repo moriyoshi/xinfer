@@ -143,7 +143,7 @@ impl GroupedNvfp4Experts {
         };
         let sorted_ref = sorted.as_ref().map(|(token, expert)| (token, expert));
         let up = self.up.forward(xs, ids, sorted_ref, is_prefill)?;
-        let activated = up.relu()?.sqr()?;
+        let activated = super::relu_squared(&up)?;
         let down = self.down.forward(&activated, ids, sorted_ref, is_prefill)?;
         let down = down.reshape((rows, topk, hidden))?;
         let shared_output = shared.forward(xs)?;

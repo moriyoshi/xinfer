@@ -143,3 +143,26 @@ their memset counts and bytes verify the intended traffic reduction. The new
 profile and test logs are in `/tmp/xinfer-chunk-tuning/` on this host. Focused
 CUDA tests cover sequential-scan parity, nonzero-state continued prefill,
 single-token decode parity, and deterministic repeats.
+
+## Fused expert activation follow-up
+
+Nemotron-H now applies ReLU-squared to routed and shared expert activations in
+one CUDA pass for contiguous BF16, F16, and F32 tensors. Unsupported layouts
+and devices retain the Candle path. Set `XINFER_NEMOTRON_FUSED_RELU2=0` to use
+the two original passes for a same-build comparison. A focused CUDA test checks
+the output against Candle for routed and shared expert shapes at all three
+dtypes.
+
+For the exact 9,538-token checkpoint input, Nsight recorded 92 ReLU and 92
+square launches totaling 136.16 ms before the fusion. The fused kernel used 92
+launches totaling 60.90 ms, a 75.26 ms reduction in this kernel category. Two
+interleaved same-build whole-model runs per setting were noisy: the original
+path took 2,538/2,367 ms and the fused path 2,272/2,410 ms. Their medians are
+2,452 and 2,341 ms, but the second pair reversed, so these samples do not
+establish a precise end-to-end speedup. GPU activity from the expert gather
+and scatter kernels also varied between traces. The two paths'
+9,538-token prefix-plus-one-step logits matched byte for byte, as did all 257
+logit rows of a 2,048-token prefix plus 256 decode steps. Decode latency did
+not show a repeatable change. The new kernel removes an intermediate
+activation tensor but does not address the larger Mamba scan, grouped GEMM,
+attention, or expert gather/scatter costs.

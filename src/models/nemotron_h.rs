@@ -367,6 +367,14 @@ struct NemotronMlp {
     down: ReplicatedLinear,
 }
 
+fn relu_squared(input: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if let Some(output) = route_grouping::relu_squared(input)? {
+        return Ok(output);
+    }
+    input.relu()?.sqr()
+}
+
 impl NemotronMlp {
     fn new(vb: VarBuilderX, config: &Config, intermediate: usize, dtype: DType) -> Result<Self> {
         Ok(Self {
@@ -390,7 +398,7 @@ impl NemotronMlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        self.down.forward(&self.up.forward(xs)?.relu()?.sqr()?)
+        self.down.forward(&relu_squared(&self.up.forward(xs)?)?)
     }
 
     fn resident_bytes(&self) -> Result<usize> {

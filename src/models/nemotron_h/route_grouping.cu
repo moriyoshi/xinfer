@@ -131,3 +131,22 @@ extern "C" __global__ void nemotron_route_combine(
     const float combined = __fadd_rn(sum, moe_load(shared, index, p.dtype));
     moe_store(output, index, combined, p.dtype);
 }
+
+// The original path rounds ReLU to the input dtype, then rounds its square.
+// ReLU does not change a finite nonnegative input, so one launch preserves
+// that rounding while avoiding a full intermediate tensor and memory pass.
+extern "C" __global__ void nemotron_relu_squared(
+    const void* input, void* output, int elements, int dtype) {
+    const int index = int(blockIdx.x * blockDim.x + threadIdx.x);
+    if (index >= elements) return;
+    if (dtype == 2) {
+        const float value = static_cast<const float*>(input)[index];
+        const float positive = fmaxf(value, 0.0f);
+        static_cast<float*>(output)[index] = __fmul_rn(positive, positive);
+    } else {
+        const float value = moe_load(static_cast<const unsigned short*>(input), index, dtype);
+        const float positive = value < 0.0f ? 0.0f : value;
+        moe_store(static_cast<unsigned short*>(output), index,
+            __fmul_rn(positive, positive), dtype);
+    }
+}
