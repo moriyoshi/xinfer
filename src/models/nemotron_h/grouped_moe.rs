@@ -100,7 +100,7 @@ impl GroupedNvfp4Experts {
     pub(super) fn from_experts(experts: &[NemotronMlp]) -> Result<Option<Self>> {
         let hardware_shape = |projection: &crate::models::layers::linear::LnNvfp4| {
             let shape = projection.blocks.dims();
-            shape.len() == 2 && shape[0] % 32 == 0 && shape[1] % 16 == 0
+            shape.len() == 2 && shape[0].is_multiple_of(32) && shape[1].is_multiple_of(16)
         };
         if experts.is_empty()
             || experts.iter().any(|expert| {
@@ -136,7 +136,7 @@ impl GroupedNvfp4Experts {
         let hidden = xs.dim(1)?;
         let sorted = if is_prefill {
             let (expert_ids, token_ids) =
-                crate::models::layers::moe::sort_expert_assignments(ids, true)?;
+                super::route_grouping::sort_expert_assignments(ids, self.up.blocks.dim(0)?)?;
             Some((token_ids, expert_ids))
         } else {
             None
@@ -145,15 +145,21 @@ impl GroupedNvfp4Experts {
         let up = self.up.forward(xs, ids, sorted_ref, is_prefill)?;
         let activated = up.relu()?.sqr()?;
         let down = self.down.forward(&activated, ids, sorted_ref, is_prefill)?;
+        let down = down.reshape((rows, topk, hidden))?;
+        let shared_output = shared.forward(xs)?;
+        if let Some(combined) =
+            super::route_grouping::combine_routed(&down, &shared_output, weights)?
+        {
+            return Ok(combined);
+        }
         // Match the original path's F32 route scaling after the BF16 expert
         // output. The sum is entirely device-side and uses no host routing.
         let routed = down
-            .reshape((rows, topk, hidden))?
             .to_dtype(DType::F32)?
             .broadcast_mul(&weights.unsqueeze(2)?)?
             .sum(1)?;
         routed
-            .broadcast_add(&shared.forward(xs)?.to_dtype(DType::F32)?)?
+            .broadcast_add(&shared_output.to_dtype(DType::F32)?)?
             .to_dtype(xs.dtype())
     }
 }

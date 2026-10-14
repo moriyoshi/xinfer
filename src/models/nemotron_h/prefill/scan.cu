@@ -169,6 +169,213 @@ extern "C" __global__ void nemotron_mamba_scan(
     }
 }
 
+// Each block summarizes one short, independent head/chunk interval as an
+// affine recurrence: final_state = alpha * initial_state + summary. The
+// summary starts from zero; a second pass supplies the true chunk inputs.
+extern "C" __global__ void nemotron_mamba_chunk_summary(
+    const float* conv, const float* dt_decay, float* alphas,
+    float* summaries, int chunk_size, Params p) {
+    const int head = int(blockIdx.x);
+    const int chunk = int(blockIdx.y);
+    const int warp = int(threadIdx.x) >> 5;
+    const int lane = int(threadIdx.x) & 31;
+    const int channel = lane * 4;
+    const int rows = HEAD_DIM / 8;
+    const int start = chunk * chunk_size;
+    const int end = min(start + chunk_size, p.tokens);
+    const int inner = p.heads * HEAD_DIM;
+    const int group = head / (p.heads / p.groups);
+    const int group_base = inner + group * 128 + channel;
+    float state[HEAD_DIM / 8][4];
+    float alpha = 1.0f;
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) state[r][j] = 0.0f;
+    }
+    for (int t = start; t < end; ++t) {
+        const float dt = dt_decay[(t * p.heads + head) * 2];
+        const float decay = dt_decay[(t * p.heads + head) * 2 + 1];
+        alpha *= decay;
+        const int conv_base = t * p.conv_dim;
+        float b[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) b[j] = conv[conv_base + group_base + j];
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const int row = r * 8 + warp;
+            const float x = conv[conv_base + head * HEAD_DIM + row];
+            const float scaled_x = dt * x;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                state[r][j] = decay * state[r][j] + scaled_x * b[j];
+            }
+        }
+    }
+    const int block_state = (chunk * p.heads + head) * HEAD_DIM * 128;
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const int row = r * 8 + warp;
+        const int offset = block_state + row * 128 + channel;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) summaries[offset + j] = state[r][j];
+    }
+    if (threadIdx.x == 0) alphas[chunk * p.heads + head] = alpha;
+}
+
+// Only chunk boundaries are sequential. The work within every chunk runs in
+// parallel in the next kernel, and no host synchronization is needed.
+extern "C" __global__ void nemotron_mamba_chunk_prefix(
+    const float* initial_state, const float* alphas,
+    const float* summaries, float* starts, int chunks, Params p) {
+    const int head = int(blockIdx.x);
+    const int warp = int(threadIdx.x) >> 5;
+    const int lane = int(threadIdx.x) & 31;
+    const int channel = lane * 4;
+    const int rows = HEAD_DIM / 8;
+    float state[HEAD_DIM / 8][4];
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const int row = r * 8 + warp;
+        const int offset = (head * HEAD_DIM + row) * 128 + channel;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) state[r][j] = initial_state[offset + j];
+    }
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const float alpha = alphas[chunk * p.heads + head];
+        const int block_state = (chunk * p.heads + head) * HEAD_DIM * 128;
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const int row = r * 8 + warp;
+            const int offset = block_state + row * 128 + channel;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                starts[offset + j] = state[r][j];
+                state[r][j] = alpha * state[r][j] + summaries[offset + j];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void nemotron_mamba_chunk_scan(
+    const float* conv, const float* dt_decay, const float* starts,
+    const float* d, float* y, float* final_state, int chunk_size, Params p) {
+    const int head = int(blockIdx.x);
+    const int chunk = int(blockIdx.y);
+    const int warp = int(threadIdx.x) >> 5;
+    const int lane = int(threadIdx.x) & 31;
+    const int channel = lane * 4;
+    const int rows = HEAD_DIM / 8;
+    const int start = chunk * chunk_size;
+    const int end = min(start + chunk_size, p.tokens);
+    const int chunks = (p.tokens + chunk_size - 1) / chunk_size;
+    const int group = head / (p.heads / p.groups);
+    const int inner = p.heads * HEAD_DIM;
+    const int group_base = inner + group * 128 + channel;
+    const int block_state = (chunk * p.heads + head) * HEAD_DIM * 128;
+    float state[HEAD_DIM / 8][4];
+    #pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const int row = r * 8 + warp;
+        const int offset = block_state + row * 128 + channel;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) state[r][j] = starts[offset + j];
+    }
+    for (int t = start; t < end; ++t) {
+        const float dt = dt_decay[(t * p.heads + head) * 2];
+        const float decay = dt_decay[(t * p.heads + head) * 2 + 1];
+        const int conv_base = t * p.conv_dim;
+        float b[4], c[4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            b[j] = conv[conv_base + group_base + j];
+            c[j] = conv[conv_base + group_base + p.groups * 128 + j];
+        }
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const int row = r * 8 + warp;
+            const float x = conv[conv_base + head * HEAD_DIM + row];
+            const float scaled_x = dt * x;
+            float sum = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                state[r][j] = decay * state[r][j] + scaled_x * b[j];
+                sum += state[r][j] * c[j];
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                sum += __shfl_down_sync(0xffffffffu, sum, offset);
+            }
+            if (lane == 0) y[t * inner + head * HEAD_DIM + row] = sum + x * d[head];
+        }
+    }
+    if (chunk == chunks - 1) {
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const int row = r * 8 + warp;
+            const int offset = (head * HEAD_DIM + row) * 128 + channel;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) final_state[offset + j] = state[r][j];
+        }
+    }
+}
+
+// Prefill epilogue: gate, grouped RMSNorm and output conversion in one pass.
+// Each block owns one token/group, so reductions are deterministic and no
+// intermediate BF16/F32 tensors or additional device round trips are needed.
+extern "C" __global__ void nemotron_mamba_gate_norm(
+    const void* projected, const float* y, const float* norm_weight,
+    void* normalized, Params p) {
+    const int group = int(blockIdx.x);
+    const int token = int(blockIdx.y);
+    const int lane = int(threadIdx.x);
+    const int inner = p.heads * p.head_dim;
+    const int group_rows = inner / p.groups;
+    const int row_base = group * group_rows;
+    extern __shared__ float scratch[];
+    float* gated = scratch;
+    float* warp_sums = scratch + group_rows;
+    for (int row = lane; row < group_rows; row += blockDim.x) {
+        const int index = row_base + row;
+        const float gate = projected_at(
+            projected, token * p.in_dim + index, p.projected_dtype);
+        const float value = y[token * inner + index]
+            * (gate / (1.0f + expf(-gate)));
+        gated[row] = value;
+    }
+    __syncthreads();
+    // Match Candle fast_sum_f32's vectorized float4 and xor-warp reduction
+    // order. The gate values live in shared memory rather than an F32 tensor.
+    float local_sum = 0.0f;
+    for (int vec = lane; vec < group_rows / 4; vec += blockDim.x) {
+        const int i = vec * 4;
+        const float a = __fmul_rn(gated[i], gated[i]);
+        const float b = __fmul_rn(gated[i + 1], gated[i + 1]);
+        const float c = __fmul_rn(gated[i + 2], gated[i + 2]);
+        const float d = __fmul_rn(gated[i + 3], gated[i + 3]);
+        local_sum += a + b + c + d;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+    const int warp = lane >> 5;
+    if ((lane & 31) == 0) warp_sums[warp] = local_sum;
+    __syncthreads();
+    if (lane < 32) {
+        local_sum = lane < blockDim.x / 32 ? warp_sums[lane] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+        if (lane == 0) warp_sums[0] = local_sum;
+    }
+    __syncthreads();
+    const float variance = warp_sums[0] * (1.0f / float(group_rows));
+    const float denom = sqrtf(variance + p.eps);
+    for (int row = lane; row < group_rows; row += blockDim.x) {
+        const int index = row_base + row;
+        store_projected(normalized, token * inner + index,
+            (gated[row] / denom) * norm_weight[index], p.output_dtype);
+    }
+}
+
 // Single-token decode. A block owns one Mamba group and writes its disjoint
 // conv/SSM state to fresh buffers. The block also reduces its grouped RMSNorm, so the
 // only subsequent operation is out_proj's GEMV. No atomics or host reads.

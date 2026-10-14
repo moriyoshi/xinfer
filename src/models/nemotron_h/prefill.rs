@@ -8,12 +8,29 @@ use candle_core::cuda_backend::cudarc::driver::{capture_status, sys::CUstreamCap
 use candle_core::cuda_backend::cudarc::driver::{DevicePtr, DeviceRepr, LaunchAsync, LaunchConfig};
 use candle_core::cuda_backend::cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use candle_core::{DType, Result, Storage, Tensor};
+use std::sync::LazyLock;
 use std::sync::Mutex;
 
 const PREPARE: &str = "nemotron_mamba_prepare";
 const SCAN: &str = "nemotron_mamba_scan";
+const CHUNK_SUMMARY: &str = "nemotron_mamba_chunk_summary";
+const CHUNK_PREFIX: &str = "nemotron_mamba_chunk_prefix";
+const CHUNK_SCAN: &str = "nemotron_mamba_chunk_scan";
+const GATE_NORM: &str = "nemotron_mamba_gate_norm";
 const STEP: &str = "nemotron_mamba_step";
+const CHUNK_TOKENS: usize = 256;
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
+static CHUNKED_SCAN: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_CHUNKED_SCAN").as_deref() != Some(std::ffi::OsStr::new("0"))
+});
+static FUSED_GATE_NORM: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_FUSED_GATE_NORM").as_deref()
+        != Some(std::ffi::OsStr::new("0"))
+});
+static SYNC_SCAN: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_PREFILL_SCAN_SYNC").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -116,7 +133,7 @@ fn module(mixer: &Mamba2) -> Result<String> {
     let device = mixer.device.as_cuda_device()?.cuda_device();
     let sm = attention_rs::cuda_utils::sm_version(mixer.device.as_cuda_device()?)
         .ok_or_else(|| candle_core::Error::Msg("unknown Mamba CUDA compute capability".into()))?;
-    let module = format!("xinfer_nemotron_mamba_h{}_sm{}_v3", mixer.head_dim, sm);
+    let module = format!("xinfer_nemotron_mamba_h{}_sm{}_v5", mixer.head_dim, sm);
     let _guard = COMPILE_LOCK.lock().unwrap();
     if !device.has_func(&module, PREPARE) {
         let capture = capture_status(*device.cu_stream())
@@ -138,13 +155,35 @@ fn module(mixer: &Mamba2) -> Result<String> {
         )
         .map_err(|e| candle_core::Error::Msg(format!("compile Mamba CUDA: {e}")))?;
         device
-            .load_ptx(ptx, &module, &[PREPARE, SCAN, STEP])
+            .load_ptx(
+                ptx,
+                &module,
+                &[
+                    PREPARE,
+                    SCAN,
+                    CHUNK_SUMMARY,
+                    CHUNK_PREFIX,
+                    CHUNK_SCAN,
+                    GATE_NORM,
+                    STEP,
+                ],
+            )
             .map_err(|e| candle_core::Error::Msg(format!("load Mamba CUDA PTX: {e}")))?;
     }
     Ok(module)
 }
 
 pub(super) fn run(mixer: &Mamba2, projected: &Tensor, state: &mut MambaState) -> Result<Tensor> {
+    run_with_options(mixer, projected, state, *CHUNKED_SCAN, *FUSED_GATE_NORM)
+}
+
+fn run_with_options(
+    mixer: &Mamba2,
+    projected: &Tensor,
+    state: &mut MambaState,
+    chunked_scan: bool,
+    fused_gate_norm: bool,
+) -> Result<Tensor> {
     let tokens = projected.dim(0)?;
     let inner = mixer.heads * mixer.head_dim;
     let in_dim = inner + mixer.conv_dim + mixer.heads;
@@ -230,33 +269,145 @@ pub(super) fn run(mixer: &Mamba2, projected: &Tensor, state: &mut MambaState) ->
         )
     }
     .map_err(|e| candle_core::Error::Msg(format!("launch Mamba prepare: {e}")))?;
-    let scan = device
-        .get_func(&module, SCAN)
-        .ok_or_else(|| candle_core::Error::Msg("missing Mamba scan kernel".into()))?;
-    unsafe {
-        scan.launch(
-            LaunchConfig {
-                grid_dim: (as_u32(mixer.heads)?, 1, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            },
-            (
-                pointer(&conv)?,
-                pointer(&dt_decay)?,
-                pointer(&state.ssm)?,
-                pointer(&mixer.d)?,
-                pointer(&y)?,
-                pointer(&next_ssm)?,
-                params,
-            ),
-        )
+    if chunked_scan && tokens >= CHUNK_TOKENS * 2 {
+        let chunks = tokens.div_ceil(CHUNK_TOKENS);
+        let alphas = Tensor::zeros((chunks, mixer.heads), DType::F32, &mixer.device)?;
+        let summaries = Tensor::zeros(
+            (chunks, mixer.heads, mixer.head_dim, mixer.state_dim),
+            DType::F32,
+            &mixer.device,
+        )?;
+        let starts = Tensor::zeros(
+            (chunks, mixer.heads, mixer.head_dim, mixer.state_dim),
+            DType::F32,
+            &mixer.device,
+        )?;
+        let summary = device
+            .get_func(&module, CHUNK_SUMMARY)
+            .ok_or_else(|| candle_core::Error::Msg("missing Mamba chunk summary kernel".into()))?;
+        unsafe {
+            summary.launch(
+                LaunchConfig {
+                    grid_dim: (as_u32(mixer.heads)?, as_u32(chunks)?, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    pointer(&conv)?,
+                    pointer(&dt_decay)?,
+                    pointer(&alphas)?,
+                    pointer(&summaries)?,
+                    as_i32(CHUNK_TOKENS)?,
+                    params,
+                ),
+            )
+        }
+        .map_err(|e| candle_core::Error::Msg(format!("launch Mamba chunk summary: {e}")))?;
+        let prefix = device
+            .get_func(&module, CHUNK_PREFIX)
+            .ok_or_else(|| candle_core::Error::Msg("missing Mamba chunk prefix kernel".into()))?;
+        unsafe {
+            prefix.launch(
+                LaunchConfig {
+                    grid_dim: (as_u32(mixer.heads)?, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    pointer(&state.ssm)?,
+                    pointer(&alphas)?,
+                    pointer(&summaries)?,
+                    pointer(&starts)?,
+                    as_i32(chunks)?,
+                    params,
+                ),
+            )
+        }
+        .map_err(|e| candle_core::Error::Msg(format!("launch Mamba chunk prefix: {e}")))?;
+        let scan = device
+            .get_func(&module, CHUNK_SCAN)
+            .ok_or_else(|| candle_core::Error::Msg("missing Mamba chunk scan kernel".into()))?;
+        unsafe {
+            scan.launch(
+                LaunchConfig {
+                    grid_dim: (as_u32(mixer.heads)?, as_u32(chunks)?, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    pointer(&conv)?,
+                    pointer(&dt_decay)?,
+                    pointer(&starts)?,
+                    pointer(&mixer.d)?,
+                    pointer(&y)?,
+                    pointer(&next_ssm)?,
+                    as_i32(CHUNK_TOKENS)?,
+                    params,
+                ),
+            )
+        }
+        .map_err(|e| candle_core::Error::Msg(format!("launch Mamba chunk scan: {e}")))?;
+    } else {
+        let scan = device
+            .get_func(&module, SCAN)
+            .ok_or_else(|| candle_core::Error::Msg("missing Mamba scan kernel".into()))?;
+        unsafe {
+            scan.launch(
+                LaunchConfig {
+                    grid_dim: (as_u32(mixer.heads)?, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                (
+                    pointer(&conv)?,
+                    pointer(&dt_decay)?,
+                    pointer(&state.ssm)?,
+                    pointer(&mixer.d)?,
+                    pointer(&y)?,
+                    pointer(&next_ssm)?,
+                    params,
+                ),
+            )
+        }
+        .map_err(|e| candle_core::Error::Msg(format!("launch Mamba scan: {e}")))?;
     }
-    .map_err(|e| candle_core::Error::Msg(format!("launch Mamba scan: {e}")))?;
-    device
-        .synchronize()
-        .map_err(|e| candle_core::Error::Msg(format!("synchronize Mamba scan: {e}")))?;
+    // The subsequent Candle operations and async frees use this CUDA stream.
+    // Ordering is preserved without blocking the host once per Mamba layer.
+    if *SYNC_SCAN {
+        device
+            .synchronize()
+            .map_err(|e| candle_core::Error::Msg(format!("synchronize Mamba scan: {e}")))?;
+    }
     state.conv = next_conv;
     state.ssm = next_ssm;
+
+    let group_rows = inner / mixer.groups;
+    let threads = group_rows.min(1024).next_power_of_two();
+    let shared_bytes = (group_rows + 32) * std::mem::size_of::<f32>();
+    if fused_gate_norm && group_rows.is_multiple_of(4) && shared_bytes <= 48 * 1024 {
+        let normalized = Tensor::zeros((tokens, inner), mixer.dtype, &mixer.device)?;
+        let kernel = device
+            .get_func(&module, GATE_NORM)
+            .ok_or_else(|| candle_core::Error::Msg("missing Mamba gate norm kernel".into()))?;
+        unsafe {
+            kernel.launch(
+                LaunchConfig {
+                    grid_dim: (as_u32(mixer.groups)?, as_u32(tokens)?, 1),
+                    block_dim: (as_u32(threads)?, 1, 1),
+                    shared_mem_bytes: as_u32(shared_bytes)?,
+                },
+                (
+                    pointer(&projected)?,
+                    pointer(&y)?,
+                    pointer(&mixer.norm_weight)?,
+                    pointer(&normalized)?,
+                    params,
+                ),
+            )
+        }
+        .map_err(|e| candle_core::Error::Msg(format!("launch Mamba gate norm: {e}")))?;
+        return mixer.out_proj.forward(&normalized);
+    }
 
     let gate = projected.narrow(1, 0, inner)?.to_dtype(DType::F32)?;
     let gated = y.broadcast_mul(&candle_nn::ops::silu(&gate)?)?;

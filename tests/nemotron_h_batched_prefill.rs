@@ -22,6 +22,12 @@ const BLOCK: usize = 16;
 const CHUNK: usize = 8192;
 type Cache = Vec<(Tensor, Tensor)>;
 
+#[link(name = "cudart")]
+unsafe extern "C" {
+    fn cudaProfilerStart() -> i32;
+    fn cudaProfilerStop() -> i32;
+}
+
 fn load(directory: &Path, device: &Device) -> Result<(NemotronHForCausalLM, Config)> {
     let raw = std::fs::read_to_string(directory.join("config.json"))?;
     let mut config: Config = serde_json::from_str(&raw)?;
@@ -145,10 +151,23 @@ fn prefill(
 ) -> Result<(Vec<f32>, f64)> {
     model.set_mamba_prefill_fast_enabled(fast);
     let began = Instant::now();
+    let profile = std::env::var_os("XINFER_NEMOTRON_CUDA_PROFILE").is_some();
+    if profile {
+        ensure!(
+            unsafe { cudaProfilerStart() } == 0,
+            "CUDA profiler start failed"
+        );
+    }
     let mut last = Vec::new();
     for start in (0..tokens.len()).step_by(CHUNK) {
         let end = (start + CHUNK).min(tokens.len());
         last = forward(model, device, kv, seq_id, &tokens[start..end], start)?;
+    }
+    if profile {
+        ensure!(
+            unsafe { cudaProfilerStop() } == 0,
+            "CUDA profiler stop failed"
+        );
     }
     Ok((last, began.elapsed().as_secs_f64() * 1000.0))
 }
@@ -183,7 +202,12 @@ fn real_30b_moe_prefill_and_decode_benchmark() -> Result<()> {
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(2048);
-    let steps = 256;
+    let steps = std::env::var("XINFER_NEMOTRON_MOE_BENCH_STEPS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(256);
+    ensure!(steps > 0, "benchmark requires at least one decode step");
     if let Some(path) = std::env::var_os("XINFER_NEMOTRON_ROUTING_TRACE") {
         std::fs::File::create(path)?;
     }
@@ -215,12 +239,25 @@ fn real_30b_moe_prefill_and_decode_benchmark() -> Result<()> {
         .map_err(anyhow::Error::msg)?
         .get_ids()
         .to_vec();
-    let tokens = sample
+    let mut tokens = sample
         .iter()
         .copied()
         .cycle()
         .take(length + steps)
         .collect::<Vec<_>>();
+    if let Some(path) = std::env::var_os("XINFER_NEMOTRON_INPUT_IDS_FILE") {
+        let prefix: Vec<u32> = serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(
+            prefix.len() == length,
+            "benchmark input IDs length {} differs from requested {length}",
+            prefix.len()
+        );
+        tokens[..length].copy_from_slice(&prefix);
+    }
+    let warmup_len = length.min(512);
+    let warmup_kv = cache(&config, warmup_len, &device)?;
+    forward(&model, &device, &warmup_kv, 999, &tokens[..warmup_len], 0)?;
+    model.release_sequence_state(999);
     let kv = cache(&config, length + steps, &device)?;
     let (prefix_logits, prefill_ms) = prefill(&model, &device, &kv, 0, &tokens[..length], true)?;
     eprintln!(

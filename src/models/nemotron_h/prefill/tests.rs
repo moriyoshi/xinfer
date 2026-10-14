@@ -3,6 +3,14 @@ use crate::models::layers::distributed::ReplicatedLinear;
 use candle_core::Device;
 
 fn fixture(device: &Device, head_dim: usize) -> Result<(Mamba2, Tensor)> {
+    fixture_with_tokens(device, head_dim, 6)
+}
+
+fn fixture_with_tokens(
+    device: &Device,
+    head_dim: usize,
+    tokens: usize,
+) -> Result<(Mamba2, Tensor)> {
     let heads = 8;
     let groups = 2;
     let state_dim = 128;
@@ -49,7 +57,6 @@ fn fixture(device: &Device, head_dim: usize) -> Result<(Mamba2, Tensor)> {
         device: device.clone(),
         dtype: DType::F32,
     };
-    let tokens = 6;
     let mut projected = vec![0f32; tokens * in_dim];
     for t in 0..tokens {
         for i in 0..inner {
@@ -142,6 +149,132 @@ fn span_scan_matches_steps_and_keeps_continued_state() -> Result<()> {
     assert_eq!(
         fast_state.ssm.flatten_all()?.to_vec1::<f32>()?,
         repeated.ssm.flatten_all()?.to_vec1::<f32>()?
+    );
+    Ok(())
+}
+
+#[test]
+fn chunked_scan_matches_sequential_scan_and_continues() -> Result<()> {
+    let Ok(device) = Device::new_cuda(0) else {
+        return Ok(());
+    };
+    // Four chunks, including a partial final chunk. Nonzero initial state and
+    // conv history exercise both the affine prefix and continued prefill.
+    let (mixer, projected) = fixture_with_tokens(&device, 8, 769)?;
+    let mut initial = mixer.zero_state()?;
+    initial.conv = Tensor::from_vec(
+        (0..(mixer.kernel - 1) * mixer.conv_dim)
+            .map(|i| (i % 23) as f32 * 0.003)
+            .collect::<Vec<_>>(),
+        (mixer.kernel - 1, mixer.conv_dim),
+        &device,
+    )?;
+    initial.ssm = Tensor::from_vec(
+        (0..mixer.heads * mixer.head_dim * mixer.state_dim)
+            .map(|i| (i % 31) as f32 * 0.001)
+            .collect::<Vec<_>>(),
+        (mixer.heads, mixer.head_dim, mixer.state_dim),
+        &device,
+    )?;
+    let mut sequential = initial.clone();
+    let expected = run_with_options(&mixer, &projected, &mut sequential, false, true)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let mut chunked = initial.clone();
+    let actual = run_with_options(&mixer, &projected, &mut chunked, true, true)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let max_output = expected
+        .iter()
+        .zip(&actual)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    let expected_state = sequential.ssm.flatten_all()?.to_vec1::<f32>()?;
+    let actual_state = chunked.ssm.flatten_all()?.to_vec1::<f32>()?;
+    let max_state = expected_state
+        .iter()
+        .zip(&actual_state)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_output < 5e-3, "chunked output max abs {max_output}");
+    assert!(max_state < 5e-4, "chunked state max abs {max_state}");
+    assert_eq!(
+        sequential.conv.flatten_all()?.to_vec1::<f32>()?,
+        chunked.conv.flatten_all()?.to_vec1::<f32>()?
+    );
+
+    let mut continued = initial.clone();
+    run_with_options(
+        &mixer,
+        &projected.narrow(0, 0, 513)?,
+        &mut continued,
+        true,
+        true,
+    )?;
+    let continued_output = run_with_options(
+        &mixer,
+        &projected.narrow(0, 513, 256)?,
+        &mut continued,
+        true,
+        true,
+    )?
+    .flatten_all()?
+    .to_vec1::<f32>()?;
+    let suffix = &expected[513 * mixer.heads * mixer.head_dim..];
+    let continued_max = suffix
+        .iter()
+        .zip(&continued_output)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        continued_max < 5e-3,
+        "continued output max abs {continued_max}"
+    );
+    let continued_state = continued.ssm.flatten_all()?.to_vec1::<f32>()?;
+    let continued_state_max = expected_state
+        .iter()
+        .zip(&continued_state)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        continued_state_max < 5e-4,
+        "continued state max abs {continued_state_max}"
+    );
+
+    let mut repeated = initial;
+    let repeat_output = run_with_options(&mixer, &projected, &mut repeated, true, true)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    assert_eq!(actual, repeat_output);
+    assert_eq!(actual_state, repeated.ssm.flatten_all()?.to_vec1::<f32>()?);
+    Ok(())
+}
+
+#[test]
+fn fused_gate_norm_matches_candle_epilogue() -> Result<()> {
+    let Ok(device) = Device::new_cuda(0) else {
+        return Ok(());
+    };
+    // Group width 512 exercises Candle's vectorized FP32 reduction, including
+    // the same warp reduction order used by the fused kernel.
+    let (mixer, projected) = fixture_with_tokens(&device, 64, 513)?;
+    let mut old_state = mixer.zero_state()?;
+    let mut fused_state = old_state.clone();
+    let expected = run_with_options(&mixer, &projected, &mut old_state, true, false)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let actual = run_with_options(&mixer, &projected, &mut fused_state, true, true)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let max_abs = expected
+        .iter()
+        .zip(&actual)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_abs <= 1e-5, "fused gate/norm max abs {max_abs}");
+    assert_eq!(
+        old_state.ssm.flatten_all()?.to_vec1::<f32>()?,
+        fused_state.ssm.flatten_all()?.to_vec1::<f32>()?
     );
     Ok(())
 }

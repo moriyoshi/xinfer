@@ -8,6 +8,8 @@ mod expert_snapshot;
 mod grouped_moe;
 #[cfg(feature = "cuda")]
 mod prefill;
+#[cfg(feature = "cuda")]
+mod route_grouping;
 mod state;
 
 pub use expert_cache::NemotronExpertCacheStats;

@@ -2,6 +2,9 @@
 
 This document contains detailed performance benchmarks for xInfer across different hardware platforms.
 
+See [Nemotron-3-Nano NVFP4 prefill on GB10](nemotron-3-nano-gb10-prefill.md) for a matched Xinfer/vLLM comparison and Nsight kernel breakdown.
+The [Nemotron-H prefill optimization results](nemotron-h-prefill-gb10-optimization.md) report the subsequent Xinfer changes, real-checkpoint parity, and remaining GPU work.
+
 ## 🚀 CUDA Performance
 
 > Tested on **V100-32G**, **A100-40G**, **Hopper-80G** and **RTX 5090**
