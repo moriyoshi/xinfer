@@ -1,6 +1,11 @@
 typedef unsigned short uint16_t;
 typedef unsigned int uint32_t;
 
+#ifndef SUMMARY_WARPS
+#define SUMMARY_WARPS 4
+#endif
+#define SCAN_WARPS 8
+
 struct Params {
     int tokens;
     int heads;
@@ -180,13 +185,13 @@ extern "C" __global__ void nemotron_mamba_chunk_summary(
     const int warp = int(threadIdx.x) >> 5;
     const int lane = int(threadIdx.x) & 31;
     const int channel = lane * 4;
-    const int rows = HEAD_DIM / 8;
+    const int rows = HEAD_DIM / SUMMARY_WARPS;
     const int start = chunk * chunk_size;
     const int end = min(start + chunk_size, p.tokens);
     const int inner = p.heads * HEAD_DIM;
     const int group = head / (p.heads / p.groups);
     const int group_base = inner + group * 128 + channel;
-    float state[HEAD_DIM / 8][4];
+    float state[HEAD_DIM / SUMMARY_WARPS][4];
     float alpha = 1.0f;
     #pragma unroll
     for (int r = 0; r < rows; ++r) {
@@ -203,7 +208,7 @@ extern "C" __global__ void nemotron_mamba_chunk_summary(
         for (int j = 0; j < 4; ++j) b[j] = conv[conv_base + group_base + j];
         #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            const int row = r * 8 + warp;
+            const int row = r * SUMMARY_WARPS + warp;
             const float x = conv[conv_base + head * HEAD_DIM + row];
             const float scaled_x = dt * x;
             #pragma unroll
@@ -215,7 +220,7 @@ extern "C" __global__ void nemotron_mamba_chunk_summary(
     const int block_state = (chunk * p.heads + head) * HEAD_DIM * 128;
     #pragma unroll
     for (int r = 0; r < rows; ++r) {
-        const int row = r * 8 + warp;
+        const int row = r * SUMMARY_WARPS + warp;
         const int offset = block_state + row * 128 + channel;
         #pragma unroll
         for (int j = 0; j < 4; ++j) summaries[offset + j] = state[r][j];
@@ -232,11 +237,11 @@ extern "C" __global__ void nemotron_mamba_chunk_prefix(
     const int warp = int(threadIdx.x) >> 5;
     const int lane = int(threadIdx.x) & 31;
     const int channel = lane * 4;
-    const int rows = HEAD_DIM / 8;
-    float state[HEAD_DIM / 8][4];
+    const int rows = HEAD_DIM / SUMMARY_WARPS;
+    float state[HEAD_DIM / SUMMARY_WARPS][4];
     #pragma unroll
     for (int r = 0; r < rows; ++r) {
-        const int row = r * 8 + warp;
+        const int row = r * SUMMARY_WARPS + warp;
         const int offset = (head * HEAD_DIM + row) * 128 + channel;
         #pragma unroll
         for (int j = 0; j < 4; ++j) state[r][j] = initial_state[offset + j];
@@ -246,7 +251,7 @@ extern "C" __global__ void nemotron_mamba_chunk_prefix(
         const int block_state = (chunk * p.heads + head) * HEAD_DIM * 128;
         #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            const int row = r * 8 + warp;
+            const int row = r * SUMMARY_WARPS + warp;
             const int offset = block_state + row * 128 + channel;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -266,7 +271,7 @@ extern "C" __global__ void nemotron_mamba_chunk_scan(
     const int warp = int(threadIdx.x) >> 5;
     const int lane = int(threadIdx.x) & 31;
     const int channel = lane * 4;
-    const int rows = HEAD_DIM / 8;
+    const int rows = HEAD_DIM / SCAN_WARPS;
     const int start = chunk * chunk_size;
     const int end = min(start + chunk_size, p.tokens);
     const int chunks = (p.tokens + chunk_size - 1) / chunk_size;
@@ -274,10 +279,10 @@ extern "C" __global__ void nemotron_mamba_chunk_scan(
     const int inner = p.heads * HEAD_DIM;
     const int group_base = inner + group * 128 + channel;
     const int block_state = (chunk * p.heads + head) * HEAD_DIM * 128;
-    float state[HEAD_DIM / 8][4];
+    float state[HEAD_DIM / SCAN_WARPS][4];
     #pragma unroll
     for (int r = 0; r < rows; ++r) {
-        const int row = r * 8 + warp;
+        const int row = r * SCAN_WARPS + warp;
         const int offset = block_state + row * 128 + channel;
         #pragma unroll
         for (int j = 0; j < 4; ++j) state[r][j] = starts[offset + j];
@@ -294,7 +299,7 @@ extern "C" __global__ void nemotron_mamba_chunk_scan(
         }
         #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            const int row = r * 8 + warp;
+            const int row = r * SCAN_WARPS + warp;
             const float x = conv[conv_base + head * HEAD_DIM + row];
             const float scaled_x = dt * x;
             float sum = 0.0f;
@@ -313,7 +318,7 @@ extern "C" __global__ void nemotron_mamba_chunk_scan(
     if (chunk == chunks - 1) {
         #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            const int row = r * 8 + warp;
+            const int row = r * SCAN_WARPS + warp;
             const int offset = (head * HEAD_DIM + row) * 128 + channel;
             #pragma unroll
             for (int j = 0; j < 4; ++j) final_state[offset + j] = state[r][j];

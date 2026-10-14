@@ -166,3 +166,43 @@ logit rows of a 2,048-token prefix plus 256 decode steps. Decode latency did
 not show a repeatable change. The new kernel removes an intermediate
 activation tensor but does not address the larger Mamba scan, grouped GEMM,
 attention, or expert gather/scatter costs.
+
+## Mamba summary warp tuning
+
+The 256-token chunk summary and chunk-boundary propagation now use four
+warps per head; the state scan keeps eight. This reduces duplicate per-warp
+loads in the summary without slowing the scan. Set
+`XINFER_NEMOTRON_SUMMARY_WARPS=8` to select the former geometry. No recurrence
+formula, chunk boundary, or state envelope changed.
+
+Paired same-binary real-checkpoint prefill measurements on GB10, with the
+same CUDA/CUTLASS release build and a 16 GiB `MemAvailable` watchdog:
+
+| Prefix | Eight-warp summary | Four-warp summary | Difference |
+| --- | ---: | ---: | ---: |
+| 2,048 repeated sample IDs | 460.305 ms | 456.101 ms | 4.204 ms (0.9%) |
+| 9,538 exact chat IDs | 2,077.599 ms | 2,038.209 ms | 39.390 ms (1.9%) |
+| 32,768 repeated sample IDs | 8,272.938 ms | 8,142.517 ms | 130.421 ms (1.6%) |
+
+Each row is one process per setting. A paired Nsight capture of the 9,538
+IDs measured 104.263 to 66.764 ms for 46 chunk-summary launches and
+21.780 to 19.708 ms for 46 prefix launches. The unchanged eight-warp scan
+avoids the ten-millisecond regression seen when all three kernels used four
+warps. The 9,538 and 32,768 runs' prefix-plus-one-step logits were byte
+identical; the 2,048 runs' prefix plus 32 continuation logit rows were also
+byte identical. Cross-setting exported 2,048-token Mamba state snapshots had
+the same SHA-256 (`5374d6f751a87a408f029400e70f1c21cf8f4cf4842746dbcd7e5a4997d45dcf`).
+Both settings passed repeated prefill, decode-logit, and state determinism
+checks. The CUDA/CUTLASS library suite passed (373 passed, 2 ignored), as did
+formatting and Clippy with the two existing unrelated deny-level lints
+suppressed. Raw logs and profiles are in `/tmp/xinfer-chunk-tuning/` on the
+measurement host. The end-to-end reduction is small and these are isolated
+single-process samples, not a throughput distribution.
+
+An experimental build with the existing `flashattn` feature was faster at
+2,048 tokens (398.560 versus 464.269 ms), but every real-checkpoint logit
+was NaN. A minimal paged BF16 probe wrote valid one-valued V-cache entries
+yet returned a zero attention context. Nemotron-H construction now rejects
+that feature on SM121 before loading model weights. The feature needs a
+dependency fix and a real-checkpoint parity test before it can be used for
+this model on GB10.

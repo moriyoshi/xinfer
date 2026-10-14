@@ -265,9 +265,13 @@ fn real_30b_moe_prefill_and_decode_benchmark() -> Result<()> {
         prefill_ms / length as f64
     );
     let check_repeat = std::env::var_os("XINFER_NEMOTRON_CHECK_DETERMINISM").is_some();
-    let prefix_state = check_repeat
+    let state_file = std::env::var_os("XINFER_NEMOTRON_STATE_FILE");
+    let prefix_state = (check_repeat || state_file.is_some())
         .then(|| model.export_mamba_state_bytes(0, length as u64, [0; 32]))
         .transpose()?;
+    if let Some(path) = state_file {
+        std::fs::write(path, prefix_state.as_ref().unwrap())?;
+    }
     let mut output = std::env::var_os("XINFER_NEMOTRON_LOGITS_FILE")
         .map(std::fs::File::create)
         .transpose()?

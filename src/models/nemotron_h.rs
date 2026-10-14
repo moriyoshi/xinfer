@@ -695,6 +695,18 @@ impl NemotronHForCausalLM {
             candle_core::bail!("Nemotron expert cache capacity must be positive")
         }
         let c = NemotronConfig::from_config(config)?;
+        #[cfg(feature = "flashattn")]
+        if c.hybrid_override_pattern.contains('*')
+            && device
+                .as_cuda_device()
+                .ok()
+                .and_then(|cuda| attention_rs::cuda_utils::sm_version(&cuda.cuda_device()))
+                == Some(121)
+        {
+            candle_core::bail!(
+                "Nemotron-H paged prefill with flashattn returns invalid context on SM121; build without flashattn"
+            )
+        }
         // ModelOpt publishes its quantization recipe in hf_quant_config.json,
         // outside config.json. The packed weight and scale tensors identify the
         // native NVFP4 projections; the shared linear loader also detects BF16
