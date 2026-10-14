@@ -7,6 +7,12 @@ use attention_rs::workspace::{get_moe_activation_pool, get_moe_cutlass_workspace
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
 use candle_core::{Result, Tensor};
 use kernels::ffi;
+use std::sync::LazyLock;
+
+static VECTOR_SCATTER: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_EXPERT_VECTOR_SCATTER").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
 
 fn pad_to(value: usize, align: usize) -> usize {
     value.div_ceil(align) * align
@@ -43,6 +49,27 @@ unsafe extern "C" {
         k_scale_padded: i32,
         stream: i64,
     );
+    fn xinfer_nvfp4_scatter_f32_to_bf16_vec(
+        input: *const f32,
+        sorted_ids: *const i32,
+        output: *mut std::ffi::c_void,
+        weights: *const f32,
+        rows: i32,
+        columns: i32,
+        stream: i64,
+    ) -> i32;
+    fn xinfer_nvfp4_finalize_bf16(
+        routed: *const f32,
+        sorted_ids: *const i32,
+        inverse: *mut i32,
+        shared: *const std::ffi::c_void,
+        weights: *const f32,
+        output: *mut std::ffi::c_void,
+        rows: i32,
+        topk: i32,
+        hidden: i32,
+        stream: i64,
+    ) -> i32;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -58,6 +85,7 @@ pub(super) fn moe_gemm_nvfp4_fused_quant(
     topk: usize,
     _is_prefill: bool,
     pre_swizzled_weight_scales: Option<&Tensor>,
+    finalize: Option<(&Tensor, &Tensor)>,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -345,7 +373,67 @@ pub(super) fn moe_gemm_nvfp4_fused_quant(
         }
     }
 
-    let output = Tensor::zeros((size_m, n), dtype, dev)?;
+    if let Some((shared, route_weights)) = finalize {
+        if topk == 0 || size_m % topk != 0 {
+            candle_core::bail!("Nemotron fused expert finalizer requires complete routes")
+        }
+        let rows = size_m / topk;
+        if topk > 8
+            || size_m > i32::MAX as usize
+            || n > i32::MAX as usize
+            || rows
+                .checked_mul(n)
+                .is_none_or(|count| count > i32::MAX as usize)
+            || shared.dims() != [rows, n]
+            || shared.dtype() != DType::BF16
+            || !shared.is_contiguous()
+            || shared.storage_and_layout().1.start_offset() != 0
+            || route_weights.dims() != [rows, topk]
+            || route_weights.dtype() != DType::F32
+            || !route_weights.is_contiguous()
+            || route_weights.storage_and_layout().1.start_offset() != 0
+            || dtype != DType::BF16
+        {
+            candle_core::bail!("Nemotron fused expert finalizer shape or dtype mismatch")
+        }
+        // The private route sorter produces a permutation of every assignment.
+        // Inversion and finalization run on the same stream, so no zero fill is
+        // needed for either buffer.
+        let inverse = unsafe { Tensor::empty_((size_m,), DType::U32, dev)? };
+        let output = unsafe { Tensor::empty_((rows, n), DType::BF16, dev)? };
+        let code = unsafe {
+            xinfer_nvfp4_finalize_bf16(
+                rep_out_ptr as *const f32,
+                cuda_ptr(&sorted_token_ids.storage_and_layout().0, DType::U32)? as *const i32,
+                cuda_ptr(&inverse.storage_and_layout().0, DType::U32)? as *mut i32,
+                cuda_ptr(&shared.storage_and_layout().0, DType::BF16)? as *const _,
+                cuda_ptr(&route_weights.storage_and_layout().0, DType::F32)? as *const f32,
+                cuda_ptr(&output.storage_and_layout().0, DType::BF16)? as *mut _,
+                rows as i32,
+                topk as i32,
+                n as i32,
+                stream,
+            )
+        };
+        if code != 0 {
+            candle_core::bail!("Nemotron fused expert finalizer launch failed: {code}")
+        }
+        return Ok(output);
+    }
+
+    // The grouped route IDs are a permutation of all assignment rows. Every
+    // output word is written once, so the vector path can skip a full zero
+    // fill. Keep the old initialized allocation on the fallback path.
+    let vector_scatter = *VECTOR_SCATTER
+        && dtype == DType::BF16
+        && n.is_multiple_of(4)
+        && n <= i32::MAX as usize
+        && size_m <= i32::MAX as usize;
+    let output = if vector_scatter {
+        unsafe { Tensor::empty_((size_m, n), dtype, dev)? }
+    } else {
+        Tensor::zeros((size_m, n), dtype, dev)?
+    };
     {
         let (sorted_s, _) = sorted_token_ids.storage_and_layout();
         let (output_s, _) = output.storage_and_layout();
@@ -356,28 +444,43 @@ pub(super) fn moe_gemm_nvfp4_fused_quant(
             std::ptr::null()
         };
         unsafe {
-            match dtype {
-                DType::F16 => ffi::moe_fp8_scatter_rows_f32_to_f16(
+            if vector_scatter {
+                let code = xinfer_nvfp4_scatter_f32_to_bf16_vec(
                     rep_out_ptr as *const f32,
                     cuda_ptr(&sorted_s, DType::U32)? as *const i32,
                     cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
-                    size_m as i64,
-                    size_m as i64,
-                    n as i64,
                     weights_ffi_ptr,
+                    size_m as i32,
+                    n as i32,
                     stream,
-                ),
-                DType::BF16 => ffi::moe_fp8_scatter_rows_f32_to_bf16(
-                    rep_out_ptr as *const f32,
-                    cuda_ptr(&sorted_s, DType::U32)? as *const i32,
-                    cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
-                    size_m as i64,
-                    size_m as i64,
-                    n as i64,
-                    weights_ffi_ptr,
-                    stream,
-                ),
-                _ => unreachable!(),
+                );
+                if code != 0 {
+                    candle_core::bail!("Nemotron vector expert scatter launch failed: {code}")
+                }
+            } else {
+                match dtype {
+                    DType::F16 => ffi::moe_fp8_scatter_rows_f32_to_f16(
+                        rep_out_ptr as *const f32,
+                        cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                        cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                        size_m as i64,
+                        size_m as i64,
+                        n as i64,
+                        weights_ffi_ptr,
+                        stream,
+                    ),
+                    DType::BF16 => ffi::moe_fp8_scatter_rows_f32_to_bf16(
+                        rep_out_ptr as *const f32,
+                        cuda_ptr(&sorted_s, DType::U32)? as *const i32,
+                        cuda_ptr(&output_s, dtype)? as *mut std::ffi::c_void,
+                        size_m as i64,
+                        size_m as i64,
+                        n as i64,
+                        weights_ffi_ptr,
+                        stream,
+                    ),
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -493,6 +596,165 @@ mod tests {
                 "swizzled scale bytes differ at K={k}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn vector_scatter_matches_reference_bytes_for_permuted_routes() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        if attention_rs::cuda_utils::sm_version(device.as_cuda_device()?) != Some(121) {
+            return Ok(());
+        }
+        let stream = *device.as_cuda_device()?.cu_stream() as i64;
+        let rows = 37usize;
+        let sorted = Tensor::from_vec(
+            (0..rows).map(|i| ((i * 13) % rows) as u32).collect(),
+            rows,
+            &device,
+        )?;
+        let weights = Tensor::from_vec(
+            (0..rows)
+                .map(|i| ((i * 19 % 41) as f32 - 20.0) / 17.0)
+                .collect(),
+            rows,
+            &device,
+        )?;
+        for columns in [1856usize, 2688] {
+            let input = Tensor::from_vec(
+                (0..rows * columns)
+                    .map(|i| ((i * 107 % 401) as f32 - 200.0) / 37.0)
+                    .collect(),
+                (rows, columns),
+                &device,
+            )?;
+            let reference = Tensor::zeros((rows, columns), DType::BF16, &device)?;
+            let actual = Tensor::zeros((rows, columns), DType::BF16, &device)?;
+            unsafe {
+                ffi::moe_fp8_scatter_rows_f32_to_bf16(
+                    ptr(&input)? as *const f32,
+                    ptr(&sorted)? as *const i32,
+                    ptr(&reference)? as *mut _,
+                    rows as i64,
+                    rows as i64,
+                    columns as i64,
+                    ptr(&weights)? as *const f32,
+                    stream,
+                );
+                let code = xinfer_nvfp4_scatter_f32_to_bf16_vec(
+                    ptr(&input)? as *const f32,
+                    ptr(&sorted)? as *const i32,
+                    ptr(&actual)? as *mut _,
+                    ptr(&weights)? as *const f32,
+                    rows as i32,
+                    columns as i32,
+                    stream,
+                );
+                assert_eq!(code, 0);
+            }
+            device.synchronize()?;
+            let bits = |tensor: &Tensor| -> Result<Vec<u16>> {
+                Ok(tensor
+                    .flatten_all()?
+                    .to_vec1::<half::bf16>()?
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect())
+            };
+            assert_eq!(bits(&reference)?, bits(&actual)?, "width {columns}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_finalizer_matches_scatter_and_combine_bytes() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        if attention_rs::cuda_utils::sm_version(device.as_cuda_device()?) != Some(121) {
+            return Ok(());
+        }
+        let rows = 19usize;
+        let topk = 6usize;
+        let hidden = 2688usize;
+        let assignments = rows * topk;
+        let stream = *device.as_cuda_device()?.cu_stream() as i64;
+        let source = Tensor::from_vec(
+            (0..assignments * hidden)
+                .map(|i| ((i * 107 % 401) as f32 - 200.0) / 37.0)
+                .collect(),
+            (assignments, hidden),
+            &device,
+        )?;
+        let sorted = Tensor::from_vec(
+            (0..assignments)
+                .map(|i| ((i * 13) % assignments) as u32)
+                .collect(),
+            assignments,
+            &device,
+        )?;
+        let shared = Tensor::from_vec(
+            (0..rows * hidden)
+                .map(|i| ((i * 31 % 251) as f32 - 125.0) / 43.0)
+                .collect(),
+            (rows, hidden),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let weights = Tensor::from_vec(
+            (0..assignments)
+                .map(|i| ((i * 19 % 41) as f32 - 20.0) / 17.0)
+                .collect(),
+            (rows, topk),
+            &device,
+        )?;
+        let scattered = Tensor::zeros((assignments, hidden), DType::BF16, &device)?;
+        unsafe {
+            ffi::moe_fp8_scatter_rows_f32_to_bf16(
+                ptr(&source)? as *const f32,
+                ptr(&sorted)? as *const i32,
+                ptr(&scattered)? as *mut _,
+                assignments as i64,
+                assignments as i64,
+                hidden as i64,
+                std::ptr::null(),
+                stream,
+            );
+        }
+        let expected = super::super::route_grouping::combine_routed(
+            &scattered.reshape((rows, topk, hidden))?,
+            &shared,
+            &weights,
+        )?
+        .ok_or_else(|| candle_core::Error::Msg("fused route combine unavailable".into()))?;
+        let inverse = unsafe { Tensor::empty_((assignments,), DType::U32, &device)? };
+        let actual = unsafe { Tensor::empty_((rows, hidden), DType::BF16, &device)? };
+        let code = unsafe {
+            xinfer_nvfp4_finalize_bf16(
+                ptr(&source)? as *const f32,
+                ptr(&sorted)? as *const i32,
+                ptr(&inverse)? as *mut i32,
+                ptr(&shared)? as *const _,
+                ptr(&weights)? as *const f32,
+                ptr(&actual)? as *mut _,
+                rows as i32,
+                topk as i32,
+                hidden as i32,
+                stream,
+            )
+        };
+        assert_eq!(code, 0);
+        device.synchronize()?;
+        let bits = |tensor: &Tensor| -> Result<Vec<u16>> {
+            Ok(tensor
+                .flatten_all()?
+                .to_vec1::<half::bf16>()?
+                .iter()
+                .map(|value| value.to_bits())
+                .collect())
+        };
+        assert_eq!(bits(&expected)?, bits(&actual)?);
         Ok(())
     }
 }

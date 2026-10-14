@@ -12,6 +12,13 @@ static FUSED_QUANT: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_EXPERT_FUSED_QUANT").as_deref()
         == Some(std::ffi::OsStr::new("1"))
 });
+#[cfg(feature = "nemotron-expert-fused-quant")]
+static FUSED_FINALIZE: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_EXPERT_FUSED_FINALIZE").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && std::env::var_os("XINFER_NEMOTRON_FUSED_MOE_COMBINE").as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+});
 
 struct Projection {
     blocks: Tensor,
@@ -22,6 +29,27 @@ struct Projection {
 }
 
 impl Projection {
+    #[cfg(feature = "nemotron-expert-fused-quant")]
+    fn fused_quant_eligible(
+        input: &Tensor,
+        sorted: Option<(&Tensor, &Tensor)>,
+        is_prefill: bool,
+    ) -> Result<bool> {
+        Ok(*FUSED_QUANT
+            && is_prefill
+            && input.dtype() == DType::BF16
+            && input.is_contiguous()
+            && input.storage_and_layout().1.start_offset() == 0
+            && !attention_rs::nvfp4_online_scale()
+            && attention_rs::cuda_utils::sm_version(input.device().as_cuda_device()?) == Some(121)
+            && sorted.is_some_and(|(token_ids, expert_ids)| {
+                token_ids.is_contiguous()
+                    && expert_ids.is_contiguous()
+                    && token_ids.storage_and_layout().1.start_offset() == 0
+                    && expert_ids.storage_and_layout().1.start_offset() == 0
+            }))
+    }
+
     fn from_experts<'a>(
         projections: impl Iterator<Item = &'a crate::models::layers::linear::LnNvfp4>,
     ) -> Result<Self> {
@@ -81,22 +109,10 @@ impl Projection {
         ids: &Tensor,
         sorted: Option<(&Tensor, &Tensor)>,
         is_prefill: bool,
+        finalize: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
         #[cfg(feature = "nemotron-expert-fused-quant")]
-        if *FUSED_QUANT
-            && is_prefill
-            && input.dtype() == DType::BF16
-            && input.is_contiguous()
-            && input.storage_and_layout().1.start_offset() == 0
-            && !attention_rs::nvfp4_online_scale()
-            && attention_rs::cuda_utils::sm_version(input.device().as_cuda_device()?) == Some(121)
-            && sorted.is_some_and(|(token_ids, expert_ids)| {
-                token_ids.is_contiguous()
-                    && expert_ids.is_contiguous()
-                    && token_ids.storage_and_layout().1.start_offset() == 0
-                    && expert_ids.storage_and_layout().1.start_offset() == 0
-            })
-        {
+        if Self::fused_quant_eligible(input, sorted, is_prefill)? {
             let (sorted_ids, expert_ids) = sorted.ok_or_else(|| {
                 candle_core::Error::Msg("fused expert quant requires grouped routes".into())
             })?;
@@ -112,7 +128,11 @@ impl Projection {
                 ids.dim(1)?,
                 is_prefill,
                 self.swizzled_scales.as_ref(),
+                finalize,
             );
+        }
+        if finalize.is_some() {
+            candle_core::bail!("Nemotron expert finalizer requires fused quantization")
         }
         attention_rs::moe::moe_gemm_nvfp4(
             input,
@@ -182,11 +202,44 @@ impl GroupedNvfp4Experts {
             None
         };
         let sorted_ref = sorted.as_ref().map(|(token, expert)| (token, expert));
-        let up = self.up.forward(xs, ids, sorted_ref, is_prefill)?;
+        let up = self.up.forward(xs, ids, sorted_ref, is_prefill, None)?;
         let activated = super::relu_squared(&up)?;
-        let down = self.down.forward(&activated, ids, sorted_ref, is_prefill)?;
+        #[cfg(feature = "nemotron-expert-fused-quant")]
+        let want_finalize = *FUSED_FINALIZE
+            && topk <= 8
+            && rows
+                .checked_mul(hidden)
+                .is_some_and(|n| n <= i32::MAX as usize)
+            && weights.dtype() == DType::F32
+            && weights.is_contiguous()
+            && weights.storage_and_layout().1.start_offset() == 0
+            && Projection::fused_quant_eligible(&activated, sorted_ref, is_prefill)?;
+        #[cfg(not(feature = "nemotron-expert-fused-quant"))]
+        let want_finalize = false;
+        let prepared_shared = if want_finalize {
+            Some(shared.forward(xs)?)
+        } else {
+            None
+        };
+        let finalize = prepared_shared.as_ref().and_then(|value| {
+            (value.dtype() == DType::BF16
+                && value.dims() == [rows, hidden]
+                && value.is_contiguous()
+                && value.storage_and_layout().1.start_offset() == 0)
+                .then_some((value, weights))
+        });
+        let down = self
+            .down
+            .forward(&activated, ids, sorted_ref, is_prefill, finalize)?;
+        if finalize.is_some() {
+            return Ok(down);
+        }
         let down = down.reshape((rows, topk, hidden))?;
-        let shared_output = shared.forward(xs)?;
+        let shared_output = if let Some(value) = prepared_shared {
+            value
+        } else {
+            shared.forward(xs)?
+        };
         if let Some(combined) =
             super::route_grouping::combine_routed(&down, &shared_output, weights)?
         {

@@ -199,3 +199,98 @@ extern "C" void xinfer_nvfp4_quantize_gathered_f16(
           input_scale_invs, expert_offsets, sf_offsets,
           rows, experts, K, K_scale_padded);
 }
+
+// The grouped GEMM returns FP32 rows in expert order. Each route owns one
+// distinct destination row, so a whole row can be converted and weighted by
+// one block with coalesced float4 reads and 64-bit BF16 writes. This retains
+// the reference's FP32 route multiplication followed by one BF16 rounding.
+__global__ void xinfer_nvfp4_scatter_f32_to_bf16_vec_kernel(
+    const float* __restrict__ input, const int32_t* __restrict__ sorted_ids,
+    nv_bfloat16* __restrict__ output, const float* __restrict__ weights,
+    int rows, int columns) {
+  const int source_row = blockIdx.x;
+  if (source_row >= rows) return;
+  const int destination_row = sorted_ids[source_row];
+  if (destination_row < 0 || destination_row >= rows) return;
+  const float weight = weights == nullptr ? 1.0f : weights[destination_row];
+  const float4* source = reinterpret_cast<const float4*>(
+      input + static_cast<int64_t>(source_row) * columns);
+  ushort4* destination = reinterpret_cast<ushort4*>(
+      output + static_cast<int64_t>(destination_row) * columns);
+  for (int vector = threadIdx.x; vector < columns / 4; vector += blockDim.x) {
+    const float4 value = source[vector];
+    ushort4 packed;
+    packed.x = __bfloat16_as_ushort(__float2bfloat16_rn(__fmul_rn(value.x, weight)));
+    packed.y = __bfloat16_as_ushort(__float2bfloat16_rn(__fmul_rn(value.y, weight)));
+    packed.z = __bfloat16_as_ushort(__float2bfloat16_rn(__fmul_rn(value.z, weight)));
+    packed.w = __bfloat16_as_ushort(__float2bfloat16_rn(__fmul_rn(value.w, weight)));
+    destination[vector] = packed;
+  }
+}
+
+extern "C" int xinfer_nvfp4_scatter_f32_to_bf16_vec(
+    const float* input, const int32_t* sorted_ids, void* output,
+    const float* weights, int rows, int columns, int64_t stream) {
+  if (rows <= 0 || columns <= 0 || columns % 4 != 0) return -1;
+  xinfer_nvfp4_scatter_f32_to_bf16_vec_kernel<<<rows, 256, 0,
+      reinterpret_cast<cudaStream_t>(stream)>>>(
+          input, sorted_ids, static_cast<nv_bfloat16*>(output), weights,
+          rows, columns);
+  return static_cast<int>(cudaGetLastError());
+}
+
+// sorted_ids maps grouped-GEMM rows to logical route assignments. The native
+// route grouping guarantees a permutation, so every inverse slot is written
+// once and the finalizer may read it on the same stream.
+__global__ void xinfer_nvfp4_invert_routes_kernel(
+    const int32_t* __restrict__ sorted_ids,
+    int32_t* __restrict__ inverse, int assignments) {
+  const int source = blockIdx.x * blockDim.x + threadIdx.x;
+  if (source >= assignments) return;
+  const int destination = sorted_ids[source];
+  if (destination >= 0 && destination < assignments) inverse[destination] = source;
+}
+
+// Match the existing two-kernel path: round each unweighted expert result to
+// BF16, multiply by its FP32 route weight, sum in top-k order, add the shared
+// expert in FP32, then round the combined output to BF16 once.
+__global__ void xinfer_nvfp4_finalize_bf16_kernel(
+    const float* __restrict__ routed,
+    const int32_t* __restrict__ inverse,
+    const nv_bfloat16* __restrict__ shared,
+    const float* __restrict__ weights,
+    nv_bfloat16* __restrict__ output,
+    int rows, int topk, int hidden) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= rows * hidden) return;
+  const int row = index / hidden;
+  const int column = index % hidden;
+  float sum = 0.0f;
+  for (int k = 0; k < topk; ++k) {
+    const int assignment = row * topk + k;
+    const float rounded = __bfloat162float(__float2bfloat16_rn(
+        routed[static_cast<int64_t>(inverse[assignment]) * hidden + column]));
+    sum = __fadd_rn(sum, __fmul_rn(rounded, weights[assignment]));
+  }
+  const float combined = __fadd_rn(sum, __bfloat162float(shared[index]));
+  output[index] = __float2bfloat16_rn(combined);
+}
+
+extern "C" int xinfer_nvfp4_finalize_bf16(
+    const float* routed, const int32_t* sorted_ids, int32_t* inverse,
+    const void* shared, const float* weights, void* output,
+    int rows, int topk, int hidden, int64_t stream) {
+  if (rows <= 0 || topk <= 0 || topk > 8 || hidden <= 0 ||
+      static_cast<int64_t>(rows) * topk > INT32_MAX ||
+      static_cast<int64_t>(rows) * hidden > INT32_MAX) return -1;
+  const int assignments = rows * topk;
+  const cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+  xinfer_nvfp4_invert_routes_kernel<<<(assignments + 255) / 256, 256, 0, cuda_stream>>>(
+      sorted_ids, inverse, assignments);
+  cudaError_t error = cudaGetLastError();
+  if (error != cudaSuccess) return static_cast<int>(error);
+  xinfer_nvfp4_finalize_bf16_kernel<<<(rows * hidden + 255) / 256, 256, 0,
+      cuda_stream>>>(routed, inverse, static_cast<const nv_bfloat16*>(shared),
+          weights, static_cast<nv_bfloat16*>(output), rows, topk, hidden);
+  return static_cast<int>(cudaGetLastError());
+}

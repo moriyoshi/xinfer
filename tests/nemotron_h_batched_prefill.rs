@@ -1,6 +1,7 @@
 //! Opt-in real-checkpoint Mamba prefill benchmark and numerical comparison.
 //! XINFER_NEMOTRON_PREFILL_CHECKPOINT points at the 30B NVFP4 checkpoint.
 //! XINFER_NEMOTRON_PREFILL_TOKENS selects 2048 (default) or 32768 tokens.
+//! XINFER_NEMOTRON_BENCH_CHUNK overrides the default 8192-token call boundary.
 #![cfg(feature = "cuda")]
 
 use anyhow::{ensure, Context, Result};
@@ -150,6 +151,12 @@ fn prefill(
     fast: bool,
 ) -> Result<(Vec<f32>, f64)> {
     model.set_mamba_prefill_fast_enabled(fast);
+    let chunk = std::env::var("XINFER_NEMOTRON_BENCH_CHUNK")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(CHUNK);
+    ensure!(chunk > 0, "benchmark prefill chunk must be positive");
     let began = Instant::now();
     let profile = std::env::var_os("XINFER_NEMOTRON_CUDA_PROFILE").is_some();
     if profile {
@@ -159,8 +166,8 @@ fn prefill(
         );
     }
     let mut last = Vec::new();
-    for start in (0..tokens.len()).step_by(CHUNK) {
-        let end = (start + CHUNK).min(tokens.len());
+    for start in (0..tokens.len()).step_by(chunk) {
+        let end = (start + chunk).min(tokens.len());
         last = forward(model, device, kv, seq_id, &tokens[start..end], start)?;
     }
     if profile {

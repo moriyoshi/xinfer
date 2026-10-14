@@ -104,3 +104,75 @@ Raw trace: `/tmp/xinfer-nemotron-prefill/nsys-vllm-9538-current.nsys-rep`
 and its SQLite export; current Xinfer trace:
 `/tmp/xinfer-expert-tune/fused.sqlite`. These are local artifacts, not files
 tracked by the repository.
+
+## Expert output finalization follow-up
+
+The opt-in `XINFER_NEMOTRON_EXPERT_VECTOR_SCATTER=1` path converts four
+FP32 grouped-GEMM values to BF16 per thread and skips the zero fill of the
+fully overwritten routed output. With
+`XINFER_NEMOTRON_EXPERT_FUSED_FINALIZE=1`, the down projection instead
+inverts the native expert-order permutation on the GPU and directly combines
+the six BF16-rounded expert values, FP32 route weights, and BF16 shared
+expert into the final BF16 output. Both switches require the build feature
+`nemotron-expert-fused-quant` and its existing runtime switch
+`XINFER_NEMOTRON_EXPERT_FUSED_QUANT=1`. The default, decode, unsupported
+dtype/device, and non-grouped paths are unchanged. Packed NVFP4 checkpoint
+weights and scales are unchanged. The finalizer is deliberately limited to
+BF16, sm_121, eager multi-token prefill with complete native routing.
+`XINFER_NEMOTRON_FUSED_MOE_COMBINE=0` also keeps the original combination
+path for comparisons.
+
+On the real 30B checkpoint, the new path matched the old path's logit **bytes**
+for 2,048 prefix + 64 teacher-forced positions, the exact 9,538-token chat
+prefix + one step, and 32,768 prefix + one step. A focused CUDA test matches
+the vector scatter to the original scatter at both expert widths and matches
+the finalizer to original scatter-plus-combine with a permuted six-route
+fixture. Both tests compare BF16 bits, including the rounding boundary.
+
+| Real-checkpoint prefill | Original fused-quant path | Vector scatter + finalizer |
+| --- | ---: | ---: |
+| 2,048 tokens | 423.0 ms | 390.7 ms |
+| 9,538 tokens, three runs | 2,342.1 / 1,832.2 / 1,867.4 ms | 1,702.0 / 1,704.7 / 1,700.8 ms |
+| 32,768 tokens | 7,023.8 ms | 6,523.7 ms |
+
+The first 9,538-token baseline is an outlier; the other two baseline runs
+are 1,832–1,867 ms. The three optimized runs cluster near 1,702 ms.
+These are separate warm model-load processes on a shared host, so they do
+not establish a serving throughput distribution. Their 9,538-token median
+gap against the fresh vLLM profile above falls from 1.83× to 1.67×; the
+new path does **not** reach parity.
+
+Nsight captures of the same 9,538-token input give a more focused comparison:
+
+| Profiled work | Original | Vector + finalizer |
+| --- | ---: | ---: |
+| Expert scatter and route-combine kernels | 165.0 + 40.0 ms | 64.0 ms up-scatter + 69.5 ms finalizer + 0.2 ms route inversion |
+| All GPU kernels | 1,703.7 ms / 3,975 launches | 1,634.9 ms / 3,975 launches |
+| GPU memsets | 100.3 ms / 20.69 GB | 36.2 ms / 7.55 GB |
+
+The kernel count stays constant because each removed down-scatter and combine
+pair is replaced by route inversion and finalization. Kernel and memset times
+exclude host-side work and cannot be added to the unprofiled prefill times.
+The trace and guarded run outputs are in `/tmp/xinfer-vector-scatter/` on the
+measurement host. A 16-warp Mamba scan experiment measured 1,712 ms on the
+same input versus roughly 1,701–1,705 ms with eight warps; it was reverted.
+Mamba scan, grouped GEMM, and attention remain the largest named kernel gaps
+against vLLM.
+
+The real-checkpoint benchmark now accepts `XINFER_NEMOTRON_BENCH_CHUNK` for a
+test-only call-boundary control. With one 9,538-token Xinfer call, original
+fused quantization took 1,743.9 ms and the vector-scatter/finalizer path took
+1,613.7 ms; their prefix and next-step logit bytes matched. This more closely
+matches vLLM's one-call schedule and leaves a **1.58×** wall gap against its
+1,020.3 ms profile. Changing the Xinfer call boundary from 8,192+1,346 to
+9,538 changed logits (maximum absolute difference 3.3125 for prefix logits
+and 2.875 for next-step logits; both top choices stayed the same). It is a
+numerical schedule change, so the one-call result is a diagnostic, not a
+transparent replacement for existing callers.
+
+The one-call optimized trace has 1,537.5 ms of GPU kernels. Its named Mamba
+prepare/summary/prefix/scan kernels total 437.0 ms, versus 139.7 ms for the
+named vLLM SSD/conv kernels. Grouped expert GEMM is 228.4 vs 197.8 ms,
+and main attention is 123.9 vs 62.8 ms. This makes the remaining recurrent
+path the largest measured opportunity. The Xinfer one-call trace is
+`/tmp/xinfer-vector-scatter/finalize-onecall-9538.nsys-rep`.
