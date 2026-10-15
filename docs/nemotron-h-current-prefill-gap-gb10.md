@@ -136,3 +136,90 @@ hardware counters are unavailable here (`ERR_NVGPUCTRPERM`). The raw stable
 Xinfer trace is `/tmp/xinfer-gap-current/full2.nsys-rep` with its SQLite
 export; the vLLM trace is
 `/tmp/xinfer-nemotron-prefill/nsys-vllm-9538-current.nsys-rep`.
+
+## Cause of the remaining gap on the current fork
+
+A subsequent capture used fork `f424ebc15e3724b266c02f2e821991120578848e`
+with K64 SSD staging enabled and direct FP32 chunk starts disabled. It used
+the same 9,538 token IDs, one-call boundary, BF16 KV, resident NVFP4 weights,
+and GB10 as above. The Xinfer prefill range was **1,509.350 ms**, versus
+**1,020.285 ms** in the saved vLLM range: a **489.065 ms** difference. The
+Xinfer trace is `/tmp/xinfer-gap-current/directstarts-baseline-profile.sqlite`;
+the vLLM trace is
+`/tmp/xinfer-nemotron-prefill/nsys-vllm-9538-current.sqlite`. They were
+captured at different times on this shared host. This section attributes the
+recorded ranges; it does not assume their 38 ms difference from the earlier
+Xinfer capture is a code regression.
+
+| Activity within the marked range | Xinfer | vLLM | Difference |
+| --- | ---: | ---: | ---: |
+| GPU activity union | 1,442.619 ms | 1,017.068 ms | 425.551 ms |
+| Kernel durations | 1,401.785 ms / 1,355 launches | 1,003.743 ms / 1,207 launches | 398.042 ms |
+| Memset durations | 35.868 ms / 197 | 5.432 ms / 47 | 30.436 ms |
+| Copy durations | 5.036 ms / 240 | 9.738 ms / 47 | −4.702 ms |
+| No recorded GPU activity | 66.731 ms | 3.217 ms | 63.514 ms |
+
+GPU work explains **87%** of the wall difference. Kernel, copy, and memset
+durations can overlap, so their rows must not be added to reconstruct the
+activity union. CUDA API durations also overlap GPU execution. Of Xinfer's
+66.7 ms inactive time, 49.1 ms falls in the first 160 ms, 4.4 ms in the next
+1,330 ms, and 13.3 ms at the end. The early range contains long
+`cuMemAllocAsync` calls and a first `cuKernelGetFunction`/attribute setup;
+the final gap follows the last GPU cast and precedes the output read. This is
+mostly startup/end-of-range overhead, not a repeated idle interval between
+every model layer. The differing output-read boundaries may account for part
+of the final 13 ms, so that part is not a demonstrated engine-only speedup.
+
+The largest identifiable kernel differences are:
+
+| Work in the marked range | Xinfer | vLLM | Excess |
+| --- | ---: | ---: | ---: |
+| Mamba prepare, SSD summary/prefix/C×B/output/transpose/decay versus vLLM convolution and SSD | 313.37 ms | 139.66 ms | **173.71 ms** |
+| Six main attention launches | 140.99 ms | 62.82 ms | **78.17 ms** |
+| Grouped NVFP4 expert GEMMs | 237.56 ms | 197.84 ms | **39.72 ms** |
+| Dense NVFP4 GEMMs | 78.05 ms | 78.40 ms | −0.35 ms |
+| BF16 CUTLASS GEMMs | 64.64 ms | 62.84 ms | 1.80 ms |
+
+These are corresponding **named kernels**, not full-layer totals. The first
+three rows account for about 292 ms of the 398 ms kernel-duration difference;
+about 106 ms remains spread across pointwise, routing, quantization, and
+other kernels. Xinfer's routed-row `finalize`, scatter, gathered-input
+quantization, and ReLU² alone take 219.5 ms. vLLM partitions equivalent work
+among input expansion, activation, FP4 conversion, and many generic
+elementwise kernels; subtracting just their named times would misattribute
+the residual. A controlled routed-row A/B is still needed to isolate that
+opportunity.
+
+The Mamba difference has a clear implementation basis. Xinfer's
+`nemotron_mamba_chunk_summary` in `src/models/nemotron_h/prefill/scan.cu`
+walks the 128 tokens of each chunk in an FP32
+state-update loop (71.7 ms), while vLLM's Triton SSD forms chunk state using
+tiled `tl.dot` operations. Xinfer's 16-wide WMMA C×B and output kernels,
+including separate state transpose, take 149.3 ms; the corresponding vLLM
+chunk BMM and scan take 49.6 ms. The distinct recurrence order and precision
+mean a replacement needs a numerical and deterministic-continuation check,
+not just a timing check. Xinfer's current paged attention kernel in
+`src/models/nemotron_h/attention_gemm/flash_prefill_paged.cuh` uses a
+64-query × 32-key tile with eight warps; the recorded vLLM FlashAttention 2
+kernel has a 128-query × 64-key trait with four warps. Both traces launch
+4,800 attention CTAs. Tile shape, memory traffic, and scheduling therefore
+deserve investigation; the CTA count alone does not explain the 78 ms gap.
+
+There is also **30.4 ms of excess GPU memset work**. Xinfer zeros 3.342 GB
+in 17 tensors of `9538 × 10304 × BF16`, 1.629 GB in 23 tensors of
+`9538 × 3712 × BF16`, and 2.051 GB in 40 tensors of
+`9538 × 2688 × BF16`. The pinned `attention-rs` NVFP4 linear path allocates
+the output with `Tensor::zeros((m, n), ...)` before the hardware CUTLASS
+GEMM. Its SM121 epilogue declares `ElementC = void`, so successful hardware
+GEMMs do not use the previous output values. These large clears are a
+specific optimization candidate, subject to proving full output coverage,
+error propagation, and parity for all supported paths and shapes. vLLM's
+large zero fills total 1.179 GB and 5.420 ms in this range.
+
+The measured priority is therefore: (1) Mamba chunk summary and output
+tiling, about 174 ms of named excess; (2) paged attention, about 78 ms;
+(3) quantify and fuse remaining routed-row work; (4) remove proven
+unnecessary hardware-FP4 output clears, at most roughly 30 ms of recorded
+memsets; (5) reduce first-use allocation/kernel-setup latency. The grouped
+expert GEMM contributes about 40 ms, and dense FP4/BF16 GEMMs are close to
+vLLM, so a GEMM rewrite alone cannot close the measured gap.
