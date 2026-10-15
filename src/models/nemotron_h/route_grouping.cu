@@ -1,5 +1,38 @@
 typedef unsigned int uint32_t;
 
+// Match attention-rs arg_sort(false)'s 128-column bitonic comparison network,
+// including its ordering of equal values. One CTA owns a token row, so all
+// 28 compare/swap stages remain within one launch and shared memory.
+extern "C" __global__ void nemotron_route_topk128(
+    const float* scores, uint32_t* topk_ids, int rows, int topk) {
+    const int row = int(blockIdx.x);
+    const int lane = int(threadIdx.x);
+    if (row >= rows || lane >= 128) return;
+    __shared__ float values[128];
+    __shared__ uint32_t indices[128];
+    values[lane] = scores[row * 128 + lane];
+    indices[lane] = uint32_t(lane);
+    __syncthreads();
+    for (int k = 2; k <= 128; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const int peer = lane ^ j;
+            if (peer > lane) {
+                const bool direction = (lane & k) == 0;
+                if ((values[lane] > values[peer]) == !direction) {
+                    const float value = values[lane];
+                    values[lane] = values[peer];
+                    values[peer] = value;
+                    const uint32_t index = indices[lane];
+                    indices[lane] = indices[peer];
+                    indices[peer] = index;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (lane < topk) topk_ids[row * topk + lane] = indices[lane];
+}
+
 struct Params {
     int slots;
     int experts;

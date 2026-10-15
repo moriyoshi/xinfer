@@ -12,7 +12,8 @@ use candle_core::{DType, Device, Result, Storage, Tensor};
 use std::sync::LazyLock;
 use std::sync::Mutex;
 
-const MODULE: &str = "xinfer_nemotron_route_grouping_v3";
+const MODULE: &str = "xinfer_nemotron_route_grouping_v4";
+const TOPK128: &str = "nemotron_route_topk128";
 const COUNT: &str = "nemotron_route_count";
 const PREFIX: &str = "nemotron_route_prefix";
 const SCATTER: &str = "nemotron_route_scatter";
@@ -28,6 +29,10 @@ static COMBINE_ENABLED: LazyLock<bool> = LazyLock::new(|| {
 });
 static RELU2_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_FUSED_RELU2").as_deref() != Some(std::ffi::OsStr::new("0"))
+});
+static TOPK128_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_TOPK_ONE_KERNEL").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
 });
 
 #[repr(C)]
@@ -71,7 +76,11 @@ fn ensure_module(device: &Device) -> Result<()> {
         )
         .map_err(|e| candle_core::Error::Msg(format!("compile Nemotron routes: {e}")))?;
         driver
-            .load_ptx(ptx, MODULE, &[COUNT, PREFIX, SCATTER, COMBINE, RELU2])
+            .load_ptx(
+                ptx,
+                MODULE,
+                &[COUNT, PREFIX, SCATTER, COMBINE, RELU2, TOPK128],
+            )
             .map_err(|e| candle_core::Error::Msg(format!("load Nemotron routes: {e}")))?;
     }
     Ok(())
@@ -114,6 +123,58 @@ fn float_pointer(tensor: &Tensor) -> Result<u64> {
         .ok_or_else(|| candle_core::Error::Msg("Nemotron MoE pointer offset overflow".into()))?;
     base.checked_add(offset as u64)
         .ok_or_else(|| candle_core::Error::Msg("Nemotron MoE pointer overflow".into()))
+}
+
+/// Select the same expert IDs as the generic descending bitonic sort for the
+/// fixed 128-expert Nemotron layout. The sigmoid, correction bias, gather and
+/// normalization stay in the shared routing implementation.
+pub(super) fn topk128(scores: &Tensor, topk: usize) -> Result<Option<Tensor>> {
+    if !*TOPK128_ENABLED {
+        return Ok(None);
+    }
+    topk128_kernel(scores, topk)
+}
+
+fn topk128_kernel(scores: &Tensor, topk: usize) -> Result<Option<Tensor>> {
+    if !scores.device().is_cuda() || scores.dtype() != DType::F32 {
+        return Ok(None);
+    }
+    let (rows, experts) = scores.dims2()?;
+    if rows == 0 || rows > i32::MAX as usize || experts != 128 || !(1..=128).contains(&topk) {
+        return Ok(None);
+    }
+    let scores = scores.contiguous()?;
+    let driver = scores.device().as_cuda_device()?.cuda_device();
+    if !driver.has_func(MODULE, TOPK128)
+        && capture_status(*driver.cu_stream())
+            .map_err(|e| candle_core::Error::Msg(format!("check Nemotron CUDA capture: {e}")))?
+            == CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+    {
+        return Ok(None);
+    }
+    ensure_module(scores.device())?;
+    // Every output element is written by one lane before its first consumer.
+    let ids = unsafe { Tensor::empty_((rows, topk), DType::U32, scores.device())? };
+    let kernel = driver
+        .get_func(MODULE, TOPK128)
+        .ok_or_else(|| candle_core::Error::Msg("missing Nemotron top-k kernel".into()))?;
+    unsafe {
+        kernel.launch(
+            LaunchConfig {
+                grid_dim: (rows as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            (
+                float_pointer(&scores)?,
+                pointer(&ids)?,
+                rows as i32,
+                topk as i32,
+            ),
+        )
+    }
+    .map_err(|e| candle_core::Error::Msg(format!("launch Nemotron top-k: {e}")))?;
+    Ok(Some(ids))
 }
 
 /// Returns expert IDs and original flattened assignment indices, grouped by
@@ -308,7 +369,32 @@ pub(super) fn relu_squared(input: &Tensor) -> Result<Option<Tensor>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use attention_rs::sort::ArgSortOp;
     use candle_core::Device;
+
+    #[test]
+    fn one_kernel_topk_matches_generic_bitonic_sort() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        for rows in [1, 17, 257, 8192] {
+            for case in 0..3 {
+                let values = (0..rows * 128)
+                    .map(|i| match case {
+                        0 => ((i * 73 + i / 7 * 19) % 1009) as f32 / 1009.0,
+                        1 => ((i / 9) % 7) as f32,
+                        _ if i % 113 == 0 => f32::NAN,
+                        _ => ((i * 17) % 13) as f32,
+                    })
+                    .collect::<Vec<_>>();
+                let scores = Tensor::from_vec(values, (rows, 128), &device)?;
+                let expected = scores.arg_sort(false)?.narrow(1, 0, 6)?.to_vec2::<u32>()?;
+                let actual = topk128_kernel(&scores, 6)?.unwrap().to_vec2::<u32>()?;
+                assert_eq!(actual, expected, "rows={rows} case={case}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn stable_route_grouping_matches_cpu_oracle() -> Result<()> {

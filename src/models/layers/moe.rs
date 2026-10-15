@@ -71,6 +71,17 @@ impl MoeRouting {
     /// Route tokens to experts, returning `(topk_weights, topk_ids)`.
     /// `router_logits` must be F32 with shape `[num_tokens, num_experts]`.
     pub fn route(&self, router_logits: &Tensor, is_prefill: bool) -> Result<(Tensor, Tensor)> {
+        self.route_with_selector(router_logits, is_prefill, |_, _| Ok(None))
+    }
+
+    /// Permit a model-specific exact top-k selector for the ungrouped sigmoid
+    /// path. Returning `None` retains the generic sort.
+    pub(crate) fn route_with_selector(
+        &self,
+        router_logits: &Tensor,
+        is_prefill: bool,
+        selector: impl FnOnce(&Tensor, usize) -> Result<Option<Tensor>>,
+    ) -> Result<(Tensor, Tensor)> {
         let (mut topk_weights, topk_ids) = if self.use_sigmoid_scoring {
             let scores = candle_nn::ops::sigmoid(router_logits)?;
 
@@ -127,7 +138,14 @@ impl MoeRouting {
                 let masked = scores_for_choice.broadcast_mul(&score_mask)?;
                 select_topk_indices(&masked, self.num_experts_per_tok, is_prefill)?
             } else {
-                select_topk_indices(&scores_for_choice, self.num_experts_per_tok, is_prefill)?
+                match selector(&scores_for_choice, self.num_experts_per_tok)? {
+                    Some(indices) => indices,
+                    None => select_topk_indices(
+                        &scores_for_choice,
+                        self.num_experts_per_tok,
+                        is_prefill,
+                    )?,
+                }
             };
 
             let topk_weights = scores.gather(&topk_indices, D::Minus1)?;
