@@ -103,6 +103,29 @@ gain is consistent with the paired wall results, but leaves most of the
 attention kernel are unchanged. K64's larger shared-memory footprint is
 48 KiB per SSD output block, so other GPU architectures need separate tuning.
 
+## Direct FP32 chunk starts follow-up
+
+The optional `XINFER_NEMOTRON_SSD_DIRECT_STARTS=1` mode reads each carried
+FP32 chunk state directly in the SSD output kernel and converts it into the
+same BF16 shared-memory tile. It skips the separate state-transpose kernel
+and its allocation. For a 9,538-token call this removes a 78,643,200-byte
+(75 MiB) temporary buffer; for each 8,192-token continued call it removes
+64 MiB. The default remains the original transpose path.
+
+The CUDA recurrence oracle matched output bytes with nonzero carried state,
+zero decay, and a partial chunk. On the real 30B checkpoint, final logits
+and exported Mamba state matched the transpose path byte for byte at 2,048,
+9,538, and 32,768 tokens; the 32K test used four continued calls. The
+direct path also repeated its full CUDA output byte for byte.
+
+In nearby 9,538-token Nsight captures, 46 transpose launches cost 28.1 ms.
+The 46 SSD output launches rose from 98.5 to 113.1 ms with coalesced FP32
+reads, leaving about 13.5 ms less combined kernel time. These sums include
+the benchmark's warmup and prefill. Whole-model paired wall times were
+inconclusive while shared-host load averages reached 25–47, so this is a
+measured kernel and scratch reduction, not an established serving-latency
+gain. The underlying FP32 chunk summary and attention costs remain.
+
 There is substantial shared-host variation. Another capture with identical
 flags took 2,274.7 ms, while its unprofiled run took 1,912.1 ms. The stable
 capture above was bracketed by unprofiled 1,450.8 and 1,497.1 ms runs; the

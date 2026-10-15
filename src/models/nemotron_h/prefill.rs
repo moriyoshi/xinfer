@@ -29,6 +29,11 @@ static SSD_K64: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_SSD_K64").as_deref() == Some(std::ffi::OsStr::new("1"))
 });
 #[cfg(feature = "nemotron-mamba-ssd-wmma")]
+static SSD_DIRECT_STARTS: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_SSD_DIRECT_STARTS").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
+#[cfg(feature = "nemotron-mamba-ssd-wmma")]
 unsafe extern "C" {
     fn xinfer_nemotron_ssd_wmma(
         conv: *const f32,
@@ -46,6 +51,7 @@ unsafe extern "C" {
         conv_dim: i32,
         cb64: i32,
         k64: i32,
+        direct_starts: i32,
         stream: i64,
     ) -> i32;
 }
@@ -411,8 +417,12 @@ fn run_with_options(
                     unsafe { Tensor::empty_((tokens, mixer.heads), DType::F32, &mixer.device)? };
                 let reset_at =
                     unsafe { Tensor::empty_((tokens, mixer.heads), DType::F32, &mixer.device)? };
-                let transposed = unsafe {
-                    Tensor::empty_((chunks, mixer.heads, 128, 64), DType::BF16, &mixer.device)?
+                let transposed = if *SSD_DIRECT_STARTS {
+                    None
+                } else {
+                    Some(unsafe {
+                        Tensor::empty_((chunks, mixer.heads, 128, 64), DType::BF16, &mixer.device)?
+                    })
                 };
                 let status = unsafe {
                     xinfer_nemotron_ssd_wmma(
@@ -424,13 +434,18 @@ fn run_with_options(
                         pointer(&cb)? as *mut std::ffi::c_void,
                         pointer(&log_decay)? as *mut f32,
                         pointer(&reset_at)? as *mut f32,
-                        pointer(&transposed)? as *mut std::ffi::c_void,
+                        transposed
+                            .as_ref()
+                            .map(pointer)
+                            .transpose()?
+                            .unwrap_or_default() as *mut std::ffi::c_void,
                         as_i32(tokens)?,
                         as_i32(mixer.heads)?,
                         as_i32(mixer.groups)?,
                         as_i32(mixer.conv_dim)?,
                         i32::from(*SSD_CB64),
                         i32::from(*SSD_K64),
+                        i32::from(*SSD_DIRECT_STARTS),
                         *device.cu_stream() as i64,
                     )
                 };
