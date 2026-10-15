@@ -193,10 +193,13 @@ pub(super) fn sort_expert_assignments(
     }
     ensure_module(flat.device())?;
     let device = flat.device().as_cuda_device()?.cuda_device();
-    let counts = Tensor::zeros((num_experts,), DType::U32, flat.device())?;
-    let offsets = Tensor::zeros((num_experts + 1,), DType::U32, flat.device())?;
-    let expert_ids = Tensor::zeros((slots,), DType::U32, flat.device())?;
-    let assignment_ids = Tensor::zeros((slots,), DType::U32, flat.device())?;
+    // Count and prefix assign every expert entry; stable scatter then writes
+    // every assignment exactly once. Zero-filling these buffers would add four
+    // GPU memsets to every MoE layer without supplying any input values.
+    let counts = unsafe { Tensor::empty_((num_experts,), DType::U32, flat.device())? };
+    let offsets = unsafe { Tensor::empty_((num_experts + 1,), DType::U32, flat.device())? };
+    let expert_ids = unsafe { Tensor::empty_((slots,), DType::U32, flat.device())? };
+    let assignment_ids = unsafe { Tensor::empty_((slots,), DType::U32, flat.device())? };
     let params = Params {
         slots: slots as i32,
         experts: num_experts as i32,
@@ -284,7 +287,9 @@ pub(super) fn combine_routed(
     }
     ensure_module(routed.device())?;
     let device = cuda;
-    let output = Tensor::zeros((rows, hidden), routed.dtype(), routed.device())?;
+    // The combine kernel assigns every output element, including rows with no
+    // routed contribution, from the routed and shared expert inputs.
+    let output = unsafe { Tensor::empty_((rows, hidden), routed.dtype(), routed.device())? };
     let params = CombineParams {
         rows: rows as i32,
         topk: topk as i32,
