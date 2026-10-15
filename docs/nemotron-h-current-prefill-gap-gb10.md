@@ -70,6 +70,39 @@ kernel's 125.2 vs. 62.8 ms is a directly measured gap, but a previous
 16/256/2,048-token KV-page A/B did not materially change its time. Reduce
 the remaining GPU idle intervals and zero fills after those larger kernels.
 
+## K64 WMMA staging follow-up
+
+The optional `XINFER_NEMOTRON_SSD_K64=1` mode stages 64 reduction values per
+shared-memory load in both the 64×64 C×B kernel and the SSD output kernel.
+It still performs the same ordered sequence of 16-wide WMMA operations, so
+this changes synchronization and memory staging without changing the math.
+It requires the `nemotron-mamba-ssd-wmma` build feature; these measurements
+also enable `XINFER_NEMOTRON_SSD_WMMA=1` and
+`XINFER_NEMOTRON_SSD_CB64=1`. The mode is disabled by default.
+
+On the real NVFP4 30B checkpoint, the CUDA recurrence oracle matched the
+K16 path byte for byte, including a partial chunk, zero decay, and nonzero
+carried starts. The final logits and exported FP32 Mamba state also matched
+byte for byte at 2,048, 9,538, and 32,768 tokens. The 32K run used four
+continued 8,192-token prefill calls. These are one-pair wall measurements on
+a shared host, so their small differences are indicative rather than a
+service latency distribution.
+
+| Prefill workload | K16 | K64 | Difference |
+| --- | ---: | ---: | ---: |
+| 2,048 synthetic tokens | 357.1 ms | 350.8 ms | 6.3 ms (1.8%) |
+| 9,538 fixed chat tokens, first pair | 1,497.2 ms | 1,471.1 ms | 26.1 ms (1.7%) |
+| 9,538 fixed chat tokens, reverse pair | 1,456.3 ms | 1,441.3 ms | 15.0 ms (1.0%) |
+| 32,768 synthetic tokens, 8,192-token calls | 6,137.3 ms | 6,088.3 ms | 49.0 ms (0.8%) |
+
+In separate Nsight captures of the same 9,538-token ID stream, the 46
+`ssd_output` launches totaled 113.3 ms at K16 and 96.2 ms at K64; the 46
+`cb_gemm64` launches totaled 31.5 and 25.6 ms. This roughly 23 ms kernel
+gain is consistent with the paired wall results, but leaves most of the
+451 ms matched-profile gap to vLLM. The scalar FP32 chunk summary and the
+attention kernel are unchanged. K64's larger shared-memory footprint is
+48 KiB per SSD output block, so other GPU architectures need separate tuning.
+
 There is substantial shared-host variation. Another capture with identical
 flags took 2,274.7 ms, while its unprofiled run took 1,912.1 ms. The stable
 capture above was bracketed by unprofiled 1,450.8 and 1,497.1 ms runs; the
