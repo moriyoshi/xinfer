@@ -553,6 +553,19 @@ impl NemotronMoe {
     fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
         let rows = xs.dim(0)?;
         let logits = self.gate.forward(&xs.to_dtype(DType::F32)?)?;
+        #[cfg(feature = "cuda")]
+        let (weights, ids) =
+            self.routing
+                .route_with_selector(&logits, is_prefill, |scores, topk| {
+                    if is_prefill {
+                        route_grouping::topk128(scores, topk)
+                    } else {
+                        // Single-token decode uses Candle's different last-dim
+                        // sorter, whose equal-score ordering must remain intact.
+                        Ok(None)
+                    }
+                })?;
+        #[cfg(not(feature = "cuda"))]
         let (weights, ids) = self.routing.route(&logits, is_prefill)?;
         let traced_ids = trace_nemotron_routes(self.layer, &ids)?;
         #[cfg(all(feature = "cuda", feature = "cutlass"))]

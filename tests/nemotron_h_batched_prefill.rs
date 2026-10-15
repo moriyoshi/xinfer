@@ -281,7 +281,11 @@ fn real_30b_moe_prefill_and_decode_benchmark() -> Result<()> {
     forward(&model, &device, &warmup_kv, 999, &tokens[..warmup_len], 0)?;
     model.release_sequence_state(999);
     let kv = cache(&config, length + steps, &device)?;
+    #[cfg(feature = "nvtx")]
+    nvtx::range_push!("BENCH_PREFILL_NEMOTRON");
     let (prefix_logits, prefill_ms) = prefill(&model, &device, &kv, 0, &tokens[..length], true)?;
+    #[cfg(feature = "nvtx")]
+    nvtx::range_pop!();
     eprintln!(
         "prefill_tokens={length} prefill_ms={prefill_ms:.3} prefill_ms_per_token={:.6}",
         prefill_ms / length as f64
