@@ -3,6 +3,36 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/models/nemotron_h/prefill/ssd_wmma.cu");
+    if env::var_os("CARGO_FEATURE_NEMOTRON_MAMBA_SSD_WMMA").is_some() {
+        let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+        let object = out.join("nemotron_mamba_ssd_wmma.o");
+        let library = out.join("libxinfer_nemotron_mamba_ssd_wmma.a");
+        let nvcc = env::var_os("CUDACXX").unwrap_or_else(|| "nvcc".into());
+        let status = Command::new(nvcc)
+            .arg("-std=c++17")
+            .arg("-O3")
+            .arg("-arch=sm_121")
+            .arg("-Xcompiler=-fPIC")
+            .arg("-c")
+            .arg("src/models/nemotron_h/prefill/ssd_wmma.cu")
+            .arg("-o")
+            .arg(&object)
+            .status()
+            .expect("launch nvcc for Nemotron Mamba SSD WMMA");
+        assert!(status.success(), "compile Nemotron Mamba SSD WMMA");
+        let status = Command::new("ar")
+            .arg("crus")
+            .arg(&library)
+            .arg(&object)
+            .status()
+            .expect("archive Nemotron Mamba SSD WMMA");
+        assert!(status.success(), "archive Nemotron Mamba SSD WMMA");
+        println!("cargo:rustc-link-search=native={}", out.display());
+        println!("cargo:rustc-link-lib=static=xinfer_nemotron_mamba_ssd_wmma");
+        println!("cargo:rustc-link-lib=dylib=cudart");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
     println!("cargo:rerun-if-changed=src/models/nemotron_h/expert_gemm/quant_gather.cu");
     if env::var_os("CARGO_FEATURE_NEMOTRON_EXPERT_FUSED_QUANT").is_some() {
         let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));

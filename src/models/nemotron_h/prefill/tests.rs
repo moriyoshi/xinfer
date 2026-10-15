@@ -2,6 +2,110 @@ use super::*;
 use crate::models::layers::distributed::ReplicatedLinear;
 use candle_core::Device;
 
+#[cfg(feature = "nemotron-mamba-ssd-wmma")]
+#[test]
+fn ssd_wmma_matches_recurrence_with_nonzero_starts_and_partial_chunk() -> Result<()> {
+    let Ok(device) = Device::new_cuda(0) else {
+        return Ok(());
+    };
+    if attention_rs::cuda_utils::sm_version(device.as_cuda_device()?) != Some(121) {
+        return Ok(());
+    }
+    const TOKENS: usize = 257;
+    const HEADS: usize = 64;
+    const GROUPS: usize = 8;
+    const HD: usize = 64;
+    const SD: usize = 128;
+    const CT: usize = 128;
+    const CONV: usize = HEADS * HD + 2 * GROUPS * SD;
+    let chunks = TOKENS.div_ceil(CT);
+    let mut conv = vec![0f32; TOKENS * CONV];
+    for t in 0..TOKENS {
+        for i in 0..CONV {
+            conv[t * CONV + i] = ((t * 17 + i * 11) % 37) as f32 * 0.002 - 0.035;
+        }
+    }
+    let mut dt_decay = vec![0f32; TOKENS * HEADS * 2];
+    for t in 0..TOKENS {
+        for h in 0..HEADS {
+            dt_decay[(t * HEADS + h) * 2] = 0.18 + ((t + h) % 9) as f32 * 0.01;
+            dt_decay[(t * HEADS + h) * 2 + 1] = if t % CT == 49 && h % 3 == 0 {
+                0.0
+            } else {
+                0.91 + (h % 7) as f32 * 0.003
+            };
+        }
+    }
+    let starts = (0..chunks * HEADS * HD * SD)
+        .map(|i| ((i * 13) % 19) as f32 * 0.0003 - 0.002)
+        .collect::<Vec<_>>();
+    let d = (0..HEADS)
+        .map(|h| 0.1 + h as f32 * 0.001)
+        .collect::<Vec<_>>();
+    let mut expected = vec![0f32; TOKENS * HEADS * HD];
+    for chunk in 0..chunks {
+        for head in 0..HEADS {
+            let group = head / (HEADS / GROUPS);
+            for dim in 0..HD {
+                let start_offset = ((chunk * HEADS + head) * HD + dim) * SD;
+                let mut state = starts[start_offset..start_offset + SD].to_vec();
+                for t in chunk * CT..((chunk + 1) * CT).min(TOKENS) {
+                    let dt = dt_decay[(t * HEADS + head) * 2];
+                    let decay = dt_decay[(t * HEADS + head) * 2 + 1];
+                    let x = conv[t * CONV + head * HD + dim];
+                    let mut sum = 0f32;
+                    for s in 0..SD {
+                        let b = conv[t * CONV + HEADS * HD + group * SD + s];
+                        let c = conv[t * CONV + HEADS * HD + GROUPS * SD + group * SD + s];
+                        state[s] = decay * state[s] + dt * x * b;
+                        sum += state[s] * c;
+                    }
+                    expected[t * HEADS * HD + head * HD + dim] = sum + x * d[head];
+                }
+            }
+        }
+    }
+    let conv = Tensor::from_vec(conv, (TOKENS, CONV), &device)?;
+    let dt_decay = Tensor::from_vec(dt_decay, (TOKENS, HEADS, 2), &device)?;
+    let starts = Tensor::from_vec(starts, (chunks, HEADS, HD, SD), &device)?;
+    let d = Tensor::from_vec(d, HEADS, &device)?;
+    let cb = unsafe { Tensor::empty_((chunks, GROUPS, CT, CT), DType::BF16, &device)? };
+    let log_decay = unsafe { Tensor::empty_((TOKENS, HEADS), DType::F32, &device)? };
+    let reset_at = unsafe { Tensor::empty_((TOKENS, HEADS), DType::F32, &device)? };
+    let transposed = unsafe { Tensor::empty_((chunks, HEADS, SD, HD), DType::BF16, &device)? };
+    let output = unsafe { Tensor::empty_((TOKENS, HEADS * HD), DType::F32, &device)? };
+    let cuda = device.as_cuda_device()?.cuda_device();
+    let launch = || unsafe {
+        xinfer_nemotron_ssd_wmma(
+            pointer(&conv).unwrap() as *const f32,
+            pointer(&dt_decay).unwrap() as *const f32,
+            pointer(&starts).unwrap() as *const f32,
+            pointer(&d).unwrap() as *const f32,
+            pointer(&output).unwrap() as *mut f32,
+            pointer(&cb).unwrap() as *mut std::ffi::c_void,
+            pointer(&log_decay).unwrap() as *mut f32,
+            pointer(&reset_at).unwrap() as *mut f32,
+            pointer(&transposed).unwrap() as *mut std::ffi::c_void,
+            TOKENS as i32,
+            HEADS as i32,
+            GROUPS as i32,
+            CONV as i32,
+            *cuda.cu_stream() as i64,
+        )
+    };
+    assert_eq!(launch(), 0);
+    let actual = output.flatten_all()?.to_vec1::<f32>()?;
+    let max_abs = expected
+        .iter()
+        .zip(&actual)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_abs < 0.003, "SSD WMMA max abs {max_abs}");
+    assert_eq!(launch(), 0);
+    assert_eq!(actual, output.flatten_all()?.to_vec1::<f32>()?);
+    Ok(())
+}
+
 fn fixture(device: &Device, head_dim: usize) -> Result<(Mamba2, Tensor)> {
     fixture_with_tokens(device, head_dim, 6)
 }

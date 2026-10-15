@@ -232,7 +232,7 @@ extern "C" __global__ void nemotron_mamba_chunk_summary(
 // parallel in the next kernel, and no host synchronization is needed.
 extern "C" __global__ void nemotron_mamba_chunk_prefix(
     const float* initial_state, const float* alphas,
-    float* summaries_and_starts, int chunks, Params p) {
+    float* summaries_and_starts, float* final_state, int chunks, Params p) {
     const int head = int(blockIdx.x);
     const int warp = int(threadIdx.x) >> 5;
     const int lane = int(threadIdx.x) & 31;
@@ -259,6 +259,15 @@ extern "C" __global__ void nemotron_mamba_chunk_prefix(
                 summaries_and_starts[offset + j] = state[r][j];
                 state[r][j] = alpha * state[r][j] + summary;
             }
+        }
+    }
+    if (final_state != nullptr) {
+        #pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            const int row = r * SUMMARY_WARPS + warp;
+            const int offset = (head * HEAD_DIM + row) * 128 + channel;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) final_state[offset + j] = state[r][j];
         }
     }
 }
