@@ -19,6 +19,26 @@ const CHUNK_SCAN: &str = "nemotron_mamba_chunk_scan";
 const GATE_NORM: &str = "nemotron_mamba_gate_norm";
 const STEP: &str = "nemotron_mamba_step";
 const CHUNK_TOKENS: usize = 256;
+const SSD_CHUNK_TOKENS: usize = 128;
+#[cfg(feature = "nemotron-mamba-ssd-wmma")]
+unsafe extern "C" {
+    fn xinfer_nemotron_ssd_wmma(
+        conv: *const f32,
+        dt_decay: *const f32,
+        starts: *const f32,
+        d: *const f32,
+        y: *mut f32,
+        cb: *mut std::ffi::c_void,
+        log_decay: *mut f32,
+        reset_at: *mut f32,
+        transposed: *mut std::ffi::c_void,
+        tokens: i32,
+        heads: i32,
+        groups: i32,
+        conv_dim: i32,
+        stream: i64,
+    ) -> i32;
+}
 static SUMMARY_WARPS: LazyLock<usize> = LazyLock::new(|| {
     if std::env::var_os("XINFER_NEMOTRON_SUMMARY_WARPS").as_deref()
         == Some(std::ffi::OsStr::new("8"))
@@ -143,7 +163,7 @@ fn module(mixer: &Mamba2) -> Result<String> {
     let sm = attention_rs::cuda_utils::sm_version(mixer.device.as_cuda_device()?)
         .ok_or_else(|| candle_core::Error::Msg("unknown Mamba CUDA compute capability".into()))?;
     let module = format!(
-        "xinfer_nemotron_mamba_h{}_sm{}_sw{}_v7",
+        "xinfer_nemotron_mamba_h{}_sm{}_sw{}_v8",
         mixer.head_dim, sm, *SUMMARY_WARPS
     );
     let _guard = COMPILE_LOCK.lock().unwrap();
@@ -288,8 +308,35 @@ fn run_with_options(
         )
     }
     .map_err(|e| candle_core::Error::Msg(format!("launch Mamba prepare: {e}")))?;
-    if chunked_scan && tokens >= CHUNK_TOKENS * 2 {
-        let chunks = tokens.div_ceil(CHUNK_TOKENS);
+    #[cfg(feature = "nemotron-mamba-ssd-wmma")]
+    let ssd_wmma = std::env::var_os("XINFER_NEMOTRON_SSD_WMMA").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && mixer.heads == 64
+        && mixer.head_dim == 64
+        && mixer.groups == 8
+        && attention_rs::cuda_utils::sm_version(mixer.device.as_cuda_device()?) == Some(121);
+    #[cfg(not(feature = "nemotron-mamba-ssd-wmma"))]
+    let ssd_wmma = false;
+    let chunk_tokens = if ssd_wmma {
+        SSD_CHUNK_TOKENS
+    } else {
+        CHUNK_TOKENS
+    };
+    if chunked_scan && tokens >= chunk_tokens * 2 {
+        let chunks = tokens.div_ceil(chunk_tokens);
+        #[cfg(feature = "nemotron-mamba-ssd-wmma")]
+        if ssd_wmma {
+            // The native transpose kernel uses a signed 32-bit linear index.
+            // Reject spans exceeding that grid before scratch allocation.
+            let transpose_elements = chunks
+                .checked_mul(mixer.heads)
+                .and_then(|n| n.checked_mul(mixer.state_dim))
+                .and_then(|n| n.checked_mul(mixer.head_dim))
+                .ok_or_else(|| candle_core::Error::Msg("SSD scratch shape overflow".into()))?;
+            if transpose_elements > i32::MAX as usize - 255 || chunks > 65_535 {
+                candle_core::bail!("Nemotron SSD span exceeds CUDA kernel grid limits")
+            }
+        }
         let alphas = unsafe { Tensor::empty_((chunks, mixer.heads), DType::F32, &mixer.device)? };
         // The prefix kernel replaces each summary with that chunk's starting
         // state after reading its summary. The scan reads those starts later.
@@ -315,7 +362,7 @@ fn run_with_options(
                     pointer(&dt_decay)?,
                     pointer(&alphas)?,
                     pointer(&summaries)?,
-                    as_i32(CHUNK_TOKENS)?,
+                    as_i32(chunk_tokens)?,
                     params,
                 ),
             )
@@ -335,35 +382,75 @@ fn run_with_options(
                     pointer(&state.ssm)?,
                     pointer(&alphas)?,
                     pointer(&summaries)?,
+                    if ssd_wmma { pointer(&next_ssm)? } else { 0u64 },
                     as_i32(chunks)?,
                     params,
                 ),
             )
         }
         .map_err(|e| candle_core::Error::Msg(format!("launch Mamba chunk prefix: {e}")))?;
-        let scan = device
-            .get_func(&module, CHUNK_SCAN)
-            .ok_or_else(|| candle_core::Error::Msg("missing Mamba chunk scan kernel".into()))?;
-        unsafe {
-            scan.launch(
-                LaunchConfig {
-                    grid_dim: (as_u32(mixer.heads)?, as_u32(chunks)?, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                (
-                    pointer(&conv)?,
-                    pointer(&dt_decay)?,
-                    pointer(&summaries)?,
-                    pointer(&mixer.d)?,
-                    pointer(&y)?,
-                    pointer(&next_ssm)?,
-                    as_i32(CHUNK_TOKENS)?,
-                    params,
-                ),
-            )
+        if ssd_wmma {
+            #[cfg(feature = "nemotron-mamba-ssd-wmma")]
+            {
+                // The bounded C.B tile scratch is shared by all heads of a
+                // Mamba group. Prefix also wrote the final FP32 state.
+                let cb = unsafe {
+                    Tensor::empty_((chunks, mixer.groups, 128, 128), DType::BF16, &mixer.device)?
+                };
+                let log_decay =
+                    unsafe { Tensor::empty_((tokens, mixer.heads), DType::F32, &mixer.device)? };
+                let reset_at =
+                    unsafe { Tensor::empty_((tokens, mixer.heads), DType::F32, &mixer.device)? };
+                let transposed = unsafe {
+                    Tensor::empty_((chunks, mixer.heads, 128, 64), DType::BF16, &mixer.device)?
+                };
+                let status = unsafe {
+                    xinfer_nemotron_ssd_wmma(
+                        pointer(&conv)? as *const f32,
+                        pointer(&dt_decay)? as *const f32,
+                        pointer(&summaries)? as *const f32,
+                        pointer(&mixer.d)? as *const f32,
+                        pointer(&y)? as *mut f32,
+                        pointer(&cb)? as *mut std::ffi::c_void,
+                        pointer(&log_decay)? as *mut f32,
+                        pointer(&reset_at)? as *mut f32,
+                        pointer(&transposed)? as *mut std::ffi::c_void,
+                        as_i32(tokens)?,
+                        as_i32(mixer.heads)?,
+                        as_i32(mixer.groups)?,
+                        as_i32(mixer.conv_dim)?,
+                        *device.cu_stream() as i64,
+                    )
+                };
+                if status != 0 {
+                    candle_core::bail!("launch Nemotron SSD WMMA: CUDA error {status}")
+                }
+            }
+        } else {
+            let scan = device
+                .get_func(&module, CHUNK_SCAN)
+                .ok_or_else(|| candle_core::Error::Msg("missing Mamba chunk scan kernel".into()))?;
+            unsafe {
+                scan.launch(
+                    LaunchConfig {
+                        grid_dim: (as_u32(mixer.heads)?, as_u32(chunks)?, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    (
+                        pointer(&conv)?,
+                        pointer(&dt_decay)?,
+                        pointer(&summaries)?,
+                        pointer(&mixer.d)?,
+                        pointer(&y)?,
+                        pointer(&next_ssm)?,
+                        as_i32(chunk_tokens)?,
+                        params,
+                    ),
+                )
+            }
+            .map_err(|e| candle_core::Error::Msg(format!("launch Mamba chunk scan: {e}")))?;
         }
-        .map_err(|e| candle_core::Error::Msg(format!("launch Mamba chunk scan: {e}")))?;
     } else {
         let scan = device
             .get_func(&module, SCAN)

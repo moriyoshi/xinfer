@@ -1,0 +1,194 @@
+// Experimental BF16 tensor-core SSD output for the 64x64x128 Nemotron-3
+// Mamba mixer. The FP32 chunk summaries and carried-state prefix remain in
+// scan.cu; this kernel only replaces the second recurrent output pass.
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <mma.h>
+
+namespace wmma = nvcuda::wmma;
+using bf16 = __nv_bfloat16;
+constexpr int CT = 128;
+constexpr int TILE = 16;
+constexpr int HD = 64;
+constexpr int SD = 128;
+constexpr int OUT_ROWS = 64;
+
+__global__ void cb_gemm(const float* conv, bf16* cb, int tokens, int heads,
+                        int groups, int conv_dim) {
+  const int group = blockIdx.x;
+  const int chunk = blockIdx.y;
+  const int tm = blockIdx.z / 8;
+  const int tn = blockIdx.z % 8;
+  const int start = chunk * CT;
+  const int inner = heads * HD;
+  __shared__ bf16 a[TILE * TILE], b[TILE * TILE];
+  __shared__ float result[TILE * TILE];
+  wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> acc;
+  wmma::fill_fragment(acc, 0.0f);
+  for (int sk = 0; sk < SD; sk += TILE) {
+    for (int j = threadIdx.x; j < TILE * TILE; j += blockDim.x) {
+      const int r = j / TILE, c = j % TILE;
+      const int tr = start + tm * TILE + r;
+      const int tc = start + tn * TILE + c;
+      a[j] = __float2bfloat16_rn(tr < tokens
+          ? conv[tr * conv_dim + inner + groups * SD + group * SD + sk + c]
+          : 0.0f);
+      b[j] = __float2bfloat16_rn(tc < tokens
+          ? conv[tc * conv_dim + inner + group * SD + sk + r]
+          : 0.0f);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16, wmma::row_major> af;
+    wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16, wmma::row_major> bf;
+    wmma::load_matrix_sync(af, a, TILE);
+    wmma::load_matrix_sync(bf, b, TILE);
+    wmma::mma_sync(acc, af, bf, acc);
+    __syncthreads();
+  }
+  wmma::store_matrix_sync(result, acc, TILE, wmma::mem_row_major);
+  __syncwarp();
+  for (int j = threadIdx.x; j < TILE * TILE; j += blockDim.x) {
+    cb[(((chunk * groups + group) * CT + tm * TILE + j / TILE) * CT)
+       + tn * TILE + j % TILE] = __float2bfloat16_rn(result[j]);
+  }
+}
+
+__global__ void decay_prefix(const float* dt_decay, float* log_decay,
+                             float* reset_at, int tokens, int heads) {
+  const int head = blockIdx.x, chunk = blockIdx.y;
+  if (threadIdx.x != 0) return;
+  float sum = 0.0f;
+  int reset = -1;
+  for (int t = chunk * CT; t < min((chunk + 1) * CT, tokens); ++t) {
+    const float decay = dt_decay[(t * heads + head) * 2 + 1];
+    if (decay == 0.0f) {
+      sum = 0.0f;
+      reset = t - chunk * CT;
+    } else {
+      sum += logf(decay);
+    }
+    log_decay[t * heads + head] = sum;
+    reset_at[t * heads + head] = float(reset);
+  }
+}
+
+__global__ void transpose_starts(const float* starts, bf16* transposed,
+                                 int chunks, int heads) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = chunks * heads * SD * HD;
+  if (index >= total) return;
+  const int dim = index % HD;
+  const int state = (index / HD) % SD;
+  const int head_chunk = index / (SD * HD);
+  transposed[index] = __float2bfloat16_rn(
+      starts[(head_chunk * HD + dim) * SD + state]);
+}
+
+__global__ void ssd_output(const float* conv, const float* dt_decay,
+                           const float* log_decay, const float* reset_at,
+                           const bf16* cb,
+                           const bf16* starts, const float* d, float* y,
+                           int tokens, int heads, int groups, int conv_dim) {
+  const int head = blockIdx.x, chunk = blockIdx.y, tile = blockIdx.z;
+  const int warp = threadIdx.x / 32;
+  const int warp_row = warp / 4, warp_col = warp % 4;
+  const int group = head / (heads / groups);
+  const int chunk_start = chunk * CT;
+  const int inner = heads * HD;
+  __shared__ bf16 lhs[OUT_ROWS * TILE], rhs[TILE * HD];
+  __shared__ float main_out[OUT_ROWS * HD], state_out[OUT_ROWS * HD];
+  wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> main_acc;
+  wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> state_acc;
+  wmma::fill_fragment(main_acc, 0.0f);
+  wmma::fill_fragment(state_acc, 0.0f);
+
+  for (int k = 0; k < CT; k += TILE) {
+    for (int j = threadIdx.x; j < OUT_ROWS * TILE; j += blockDim.x) {
+      const int row = j / TILE, col = j % TILE;
+      const int t = chunk_start + tile * OUT_ROWS + row;
+      const int i = chunk_start + k + col;
+      float value = 0.0f;
+      if (t < tokens && i < tokens && i <= t
+          && i - chunk_start >= int(reset_at[t * heads + head])) {
+        const float dot = __bfloat162float(
+            cb[(((chunk * groups + group) * CT + tile * OUT_ROWS + row) * CT)
+               + k + col]);
+        const float dt = dt_decay[(i * heads + head) * 2];
+        const float lag = log_decay[t * heads + head]
+                        - log_decay[i * heads + head];
+        value = dot * dt * expf(lag);
+      }
+      lhs[j] = __float2bfloat16_rn(value);
+    }
+    for (int j = threadIdx.x; j < TILE * HD; j += blockDim.x) {
+      const int i = chunk_start + k + j / HD;
+      rhs[j] = __float2bfloat16_rn(i < tokens
+          ? conv[i * conv_dim + head * HD + j % HD] : 0.0f);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16, wmma::row_major> af;
+    wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16, wmma::row_major> bf;
+    wmma::load_matrix_sync(af, lhs + warp_row * TILE * TILE, TILE);
+    wmma::load_matrix_sync(bf, rhs + warp_col * TILE, HD);
+    wmma::mma_sync(main_acc, af, bf, main_acc);
+    __syncthreads();
+  }
+  for (int k = 0; k < SD; k += TILE) {
+    for (int j = threadIdx.x; j < OUT_ROWS * TILE; j += blockDim.x) {
+      const int t = chunk_start + tile * OUT_ROWS + j / TILE;
+      lhs[j] = __float2bfloat16_rn(t < tokens
+          ? conv[t * conv_dim + inner + groups * SD + group * SD + k + j % TILE]
+          : 0.0f);
+    }
+    for (int j = threadIdx.x; j < TILE * HD; j += blockDim.x) {
+      const int s = k + j / HD, dim = j % HD;
+      rhs[j] = starts[(((chunk * heads + head) * SD + s) * HD) + dim];
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16, wmma::row_major> af;
+    wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16, wmma::row_major> bf;
+    wmma::load_matrix_sync(af, lhs + warp_row * TILE * TILE, TILE);
+    wmma::load_matrix_sync(bf, rhs + warp_col * TILE, HD);
+    wmma::mma_sync(state_acc, af, bf, state_acc);
+    __syncthreads();
+  }
+  wmma::store_matrix_sync(main_out + warp_row * TILE * HD + warp_col * TILE,
+                          main_acc, HD,
+                          wmma::mem_row_major);
+  wmma::store_matrix_sync(state_out + warp_row * TILE * HD + warp_col * TILE,
+                          state_acc, HD,
+                          wmma::mem_row_major);
+  __syncthreads();
+  for (int j = threadIdx.x; j < OUT_ROWS * HD; j += blockDim.x) {
+    const int t = chunk_start + tile * OUT_ROWS + j / HD;
+    const int dim = j % HD;
+    if (t < tokens) {
+      const float x = conv[t * conv_dim + head * HD + dim];
+      const float initial = reset_at[t * heads + head] < 0.0f
+          ? expf(log_decay[t * heads + head]) * state_out[j] : 0.0f;
+      y[t * inner + head * HD + dim] = main_out[j] + initial + x * d[head];
+    }
+  }
+}
+
+extern "C" int xinfer_nemotron_ssd_wmma(
+    const float* conv, const float* dt_decay, const float* starts,
+    const float* d, float* y, void* cb_raw, float* log_decay,
+    float* reset_at, void* transposed_raw,
+    int tokens, int heads, int groups, int conv_dim, long long stream_raw) {
+  if (heads != 64 || groups != 8 || tokens <= 0) return cudaErrorInvalidValue;
+  const int chunks = (tokens + CT - 1) / CT;
+  auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+  auto cb = static_cast<bf16*>(cb_raw);
+  auto transposed = static_cast<bf16*>(transposed_raw);
+  cb_gemm<<<dim3(groups, chunks, 64), 32, 0, stream>>>(
+      conv, cb, tokens, heads, groups, conv_dim);
+  decay_prefix<<<dim3(heads, chunks), 32, 0, stream>>>(
+      dt_decay, log_decay, reset_at, tokens, heads);
+  transpose_starts<<<(chunks * heads * SD * HD + 255) / 256, 256, 0, stream>>>(
+      starts, transposed, chunks, heads);
+  ssd_output<<<dim3(heads, chunks, CT / OUT_ROWS), 512, 0, stream>>>(
+      conv, dt_decay, log_decay, reset_at, cb, transposed, d, y,
+      tokens, heads, groups, conv_dim);
+  return static_cast<int>(cudaPeekAtLastError());
+}
