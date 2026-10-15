@@ -19,10 +19,13 @@ compared directly with the separately measured vLLM chat prompt.
 | --- | ---: | ---: | --- |
 | 2,048 / 256 tokens | 372.480 ms | 370.175 ms | All 257 logit rows and exported prefix Mamba state byte-identical |
 | 9,538 / 1 tokens | 1,638.602 ms | 1,614.340 ms | Both logit rows and exported prefix Mamba state byte-identical |
+| 32,768 / 1 tokens | 7,146.604 ms | 6,964.136 ms | Both logit rows and exported prefix Mamba state byte-identical |
 
 For the 2,048-token run, decode p50 was 24.206 ms with generic top-k and
 24.108 ms with the prefill-only kernel. That difference is run noise; decode
 routing is unchanged. The local timings are single pairs on a shared host.
+The 32,768-token pair ran on the published epic after the route scratch
+zero-fill cleanup, with identical input and checkpoint in both runs.
 The focused CUDA test compares selected IDs against generic bitonic sort for
 1, 17, 257, and 8,192 rows using pseudo-random values, many ties, and NaNs.
 
