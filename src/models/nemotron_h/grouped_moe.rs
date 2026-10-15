@@ -19,6 +19,11 @@ static FUSED_FINALIZE: LazyLock<bool> = LazyLock::new(|| {
         && std::env::var_os("XINFER_NEMOTRON_FUSED_MOE_COMBINE").as_deref()
             != Some(std::ffi::OsStr::new("0"))
 });
+#[cfg(feature = "nemotron-expert-fused-quant")]
+static FUSED_RELU_QUANT: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_EXPERT_FUSED_RELU_QUANT").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
 
 struct Projection {
     blocks: Tensor,
@@ -110,6 +115,7 @@ impl Projection {
         sorted: Option<(&Tensor, &Tensor)>,
         is_prefill: bool,
         finalize: Option<(&Tensor, &Tensor)>,
+        relu_squared: bool,
     ) -> Result<Tensor> {
         #[cfg(feature = "nemotron-expert-fused-quant")]
         if Self::fused_quant_eligible(input, sorted, is_prefill)? {
@@ -129,7 +135,13 @@ impl Projection {
                 is_prefill,
                 self.swizzled_scales.as_ref(),
                 finalize,
+                relu_squared,
             );
+        }
+        if relu_squared {
+            candle_core::bail!(
+                "Nemotron fused ReLU quantization requires fused expert quantization"
+            )
         }
         if finalize.is_some() {
             candle_core::bail!("Nemotron expert finalizer requires fused quantization")
@@ -202,8 +214,20 @@ impl GroupedNvfp4Experts {
             None
         };
         let sorted_ref = sorted.as_ref().map(|(token, expert)| (token, expert));
-        let up = self.up.forward(xs, ids, sorted_ref, is_prefill, None)?;
-        let activated = super::relu_squared(&up)?;
+        let up = self
+            .up
+            .forward(xs, ids, sorted_ref, is_prefill, None, false)?;
+        #[cfg(feature = "nemotron-expert-fused-quant")]
+        let fuse_relu =
+            *FUSED_RELU_QUANT && Projection::fused_quant_eligible(&up, sorted_ref, is_prefill)?;
+        #[cfg(not(feature = "nemotron-expert-fused-quant"))]
+        let fuse_relu = false;
+        let activated = if fuse_relu {
+            None
+        } else {
+            Some(super::relu_squared(&up)?)
+        };
+        let down_input = activated.as_ref().unwrap_or(&up);
         #[cfg(feature = "nemotron-expert-fused-quant")]
         let want_finalize = *FUSED_FINALIZE
             && topk <= 8
@@ -213,7 +237,7 @@ impl GroupedNvfp4Experts {
             && weights.dtype() == DType::F32
             && weights.is_contiguous()
             && weights.storage_and_layout().1.start_offset() == 0
-            && Projection::fused_quant_eligible(&activated, sorted_ref, is_prefill)?;
+            && Projection::fused_quant_eligible(down_input, sorted_ref, is_prefill)?;
         #[cfg(not(feature = "nemotron-expert-fused-quant"))]
         let want_finalize = false;
         let prepared_shared = if want_finalize {
@@ -230,7 +254,7 @@ impl GroupedNvfp4Experts {
         });
         let down = self
             .down
-            .forward(&activated, ids, sorted_ref, is_prefill, finalize)?;
+            .forward(down_input, ids, sorted_ref, is_prefill, finalize, fuse_relu)?;
         if finalize.is_some() {
             return Ok(down);
         }
