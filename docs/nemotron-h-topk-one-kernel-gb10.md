@@ -31,3 +31,16 @@ The earlier one-call Nsight trace showed 644 bitonic sort launches across
 kernel time. This change collapses them to 23 launches. It removes a small
 part of the remaining full-model gap; expert GEMM, attention, and Mamba SSD
 remain larger contributors.
+
+## Route scratch follow-up
+
+The route count, prefix, scatter, and combine kernels each write their full
+output buffers. Allocating those five buffers without zero-filling avoids five
+unnecessary memsets per MoE layer. CUDA tests cover one-row, mixed, and
+single-expert assignments through 8,192 rows, plus routed-combine parity.
+
+On the same real 30B checkpoint, a paired 9,538-token run took 1,640.366 ms
+before and 1,638.998 ms after the change. The prefix and next-step logits and
+Mamba state were byte-identical. A separate 2,048-token run matched all 257
+logit rows and the exported prefix state. The wall-time change is within
+normal run variation and does not establish a material speedup.
