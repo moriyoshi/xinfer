@@ -56,8 +56,9 @@ __global__ void cb_gemm(const float* conv, bf16* cb, int tokens, int heads,
 // Reuse each C and B tile across a 4x4 warp array. The WMMA instruction and
 // eight state-reduction steps are identical to cb_gemm; only the block's
 // output footprint changes from 16x16 to 64x64.
-__global__ void cb_gemm64(const float* conv, bf16* cb, int tokens, int heads,
-                          int groups, int conv_dim) {
+template<int REDUCTION_TILE>
+__global__ void cb_gemm64(const float* conv, bf16* cb, int tokens,
+                          int heads, int groups, int conv_dim) {
   const int group = blockIdx.x;
   const int chunk = blockIdx.y;
   const int tile_m = blockIdx.z / 2;
@@ -67,19 +68,19 @@ __global__ void cb_gemm64(const float* conv, bf16* cb, int tokens, int heads,
   const int warp_n = warp % 4;
   const int start = chunk * CT;
   const int inner = heads * HD;
-  __shared__ bf16 a[64 * TILE], b[TILE * 64];
+  __shared__ bf16 a[64 * REDUCTION_TILE], b[REDUCTION_TILE * 64];
   __shared__ float result[64 * 64];
   wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> acc;
   wmma::fill_fragment(acc, 0.0f);
-  for (int sk = 0; sk < SD; sk += TILE) {
-    for (int j = threadIdx.x; j < 64 * TILE; j += blockDim.x) {
-      const int r = j / TILE, c = j % TILE;
+  for (int sk = 0; sk < SD; sk += REDUCTION_TILE) {
+    for (int j = threadIdx.x; j < 64 * REDUCTION_TILE; j += blockDim.x) {
+      const int r = j / REDUCTION_TILE, c = j % REDUCTION_TILE;
       const int t = start + tile_m * 64 + r;
       a[j] = __float2bfloat16_rn(t < tokens
           ? conv[t * conv_dim + inner + groups * SD + group * SD + sk + c]
           : 0.0f);
     }
-    for (int j = threadIdx.x; j < TILE * 64; j += blockDim.x) {
+    for (int j = threadIdx.x; j < REDUCTION_TILE * 64; j += blockDim.x) {
       const int r = j / 64, c = j % 64;
       const int t = start + tile_n * 64 + c;
       b[j] = __float2bfloat16_rn(t < tokens
@@ -87,11 +88,16 @@ __global__ void cb_gemm64(const float* conv, bf16* cb, int tokens, int heads,
           : 0.0f);
     }
     __syncthreads();
-    wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16, wmma::row_major> af;
-    wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16, wmma::row_major> bf;
-    wmma::load_matrix_sync(af, a + warp_m * TILE * TILE, TILE);
-    wmma::load_matrix_sync(bf, b + warp_n * TILE, 64);
-    wmma::mma_sync(acc, af, bf, acc);
+    for (int sub = 0; sub < REDUCTION_TILE; sub += TILE) {
+      wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16,
+                     wmma::row_major> af;
+      wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16,
+                     wmma::row_major> bf;
+      wmma::load_matrix_sync(
+          af, a + warp_m * TILE * REDUCTION_TILE + sub, REDUCTION_TILE);
+      wmma::load_matrix_sync(bf, b + sub * 64 + warp_n * TILE, 64);
+      wmma::mma_sync(acc, af, bf, acc);
+    }
     __syncthreads();
   }
   wmma::store_matrix_sync(result + warp_m * TILE * 64 + warp_n * TILE,
@@ -134,6 +140,7 @@ __global__ void transpose_starts(const float* starts, bf16* transposed,
       starts[(head_chunk * HD + dim) * SD + state]);
 }
 
+template<int REDUCTION_TILE>
 __global__ void ssd_output(const float* conv, const float* dt_decay,
                            const float* log_decay, const float* reset_at,
                            const bf16* cb,
@@ -145,16 +152,18 @@ __global__ void ssd_output(const float* conv, const float* dt_decay,
   const int group = head / (heads / groups);
   const int chunk_start = chunk * CT;
   const int inner = heads * HD;
-  __shared__ bf16 lhs[OUT_ROWS * TILE], rhs[TILE * HD];
+  __shared__ bf16 lhs[OUT_ROWS * REDUCTION_TILE];
+  __shared__ bf16 rhs[REDUCTION_TILE * HD];
   __shared__ float main_out[OUT_ROWS * HD], state_out[OUT_ROWS * HD];
   wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> main_acc;
   wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> state_acc;
   wmma::fill_fragment(main_acc, 0.0f);
   wmma::fill_fragment(state_acc, 0.0f);
 
-  for (int k = 0; k < CT; k += TILE) {
-    for (int j = threadIdx.x; j < OUT_ROWS * TILE; j += blockDim.x) {
-      const int row = j / TILE, col = j % TILE;
+  for (int k = 0; k < CT; k += REDUCTION_TILE) {
+    for (int j = threadIdx.x; j < OUT_ROWS * REDUCTION_TILE;
+         j += blockDim.x) {
+      const int row = j / REDUCTION_TILE, col = j % REDUCTION_TILE;
       const int t = chunk_start + tile * OUT_ROWS + row;
       const int i = chunk_start + k + col;
       float value = 0.0f;
@@ -170,36 +179,51 @@ __global__ void ssd_output(const float* conv, const float* dt_decay,
       }
       lhs[j] = __float2bfloat16_rn(value);
     }
-    for (int j = threadIdx.x; j < TILE * HD; j += blockDim.x) {
+    for (int j = threadIdx.x; j < REDUCTION_TILE * HD;
+         j += blockDim.x) {
       const int i = chunk_start + k + j / HD;
       rhs[j] = __float2bfloat16_rn(i < tokens
           ? conv[i * conv_dim + head * HD + j % HD] : 0.0f);
     }
     __syncthreads();
-    wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16, wmma::row_major> af;
-    wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16, wmma::row_major> bf;
-    wmma::load_matrix_sync(af, lhs + warp_row * TILE * TILE, TILE);
-    wmma::load_matrix_sync(bf, rhs + warp_col * TILE, HD);
-    wmma::mma_sync(main_acc, af, bf, main_acc);
+    for (int sub = 0; sub < REDUCTION_TILE; sub += TILE) {
+      wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16,
+                     wmma::row_major> af;
+      wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16,
+                     wmma::row_major> bf;
+      wmma::load_matrix_sync(
+          af, lhs + warp_row * TILE * REDUCTION_TILE + sub,
+          REDUCTION_TILE);
+      wmma::load_matrix_sync(bf, rhs + sub * HD + warp_col * TILE, HD);
+      wmma::mma_sync(main_acc, af, bf, main_acc);
+    }
     __syncthreads();
   }
-  for (int k = 0; k < SD; k += TILE) {
-    for (int j = threadIdx.x; j < OUT_ROWS * TILE; j += blockDim.x) {
-      const int t = chunk_start + tile * OUT_ROWS + j / TILE;
+  for (int k = 0; k < SD; k += REDUCTION_TILE) {
+    for (int j = threadIdx.x; j < OUT_ROWS * REDUCTION_TILE;
+         j += blockDim.x) {
+      const int t = chunk_start + tile * OUT_ROWS + j / REDUCTION_TILE;
       lhs[j] = __float2bfloat16_rn(t < tokens
-          ? conv[t * conv_dim + inner + groups * SD + group * SD + k + j % TILE]
+          ? conv[t * conv_dim + inner + groups * SD + group * SD + k + j % REDUCTION_TILE]
           : 0.0f);
     }
-    for (int j = threadIdx.x; j < TILE * HD; j += blockDim.x) {
+    for (int j = threadIdx.x; j < REDUCTION_TILE * HD;
+         j += blockDim.x) {
       const int s = k + j / HD, dim = j % HD;
       rhs[j] = starts[(((chunk * heads + head) * SD + s) * HD) + dim];
     }
     __syncthreads();
-    wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16, wmma::row_major> af;
-    wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16, wmma::row_major> bf;
-    wmma::load_matrix_sync(af, lhs + warp_row * TILE * TILE, TILE);
-    wmma::load_matrix_sync(bf, rhs + warp_col * TILE, HD);
-    wmma::mma_sync(state_acc, af, bf, state_acc);
+    for (int sub = 0; sub < REDUCTION_TILE; sub += TILE) {
+      wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, bf16,
+                     wmma::row_major> af;
+      wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, bf16,
+                     wmma::row_major> bf;
+      wmma::load_matrix_sync(
+          af, lhs + warp_row * TILE * REDUCTION_TILE + sub,
+          REDUCTION_TILE);
+      wmma::load_matrix_sync(bf, rhs + sub * HD + warp_col * TILE, HD);
+      wmma::mma_sync(state_acc, af, bf, state_acc);
+    }
     __syncthreads();
   }
   wmma::store_matrix_sync(main_out + warp_row * TILE * HD + warp_col * TILE,
@@ -225,16 +249,22 @@ extern "C" int xinfer_nemotron_ssd_wmma(
     const float* conv, const float* dt_decay, const float* starts,
     const float* d, float* y, void* cb_raw, float* log_decay,
     float* reset_at, void* transposed_raw,
-    int tokens, int heads, int groups, int conv_dim, int cb64,
+    int tokens, int heads, int groups, int conv_dim, int cb64, int k64,
     long long stream_raw) {
-  if (heads != 64 || groups != 8 || tokens <= 0) return cudaErrorInvalidValue;
+  if (heads != 64 || groups != 8 || tokens <= 0 ||
+      (cb64 != 0 && cb64 != 1) || (k64 != 0 && k64 != 1))
+    return cudaErrorInvalidValue;
   const int chunks = (tokens + CT - 1) / CT;
   auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
   auto cb = static_cast<bf16*>(cb_raw);
   auto transposed = static_cast<bf16*>(transposed_raw);
   if (cb64) {
-    cb_gemm64<<<dim3(groups, chunks, 4), 512, 0, stream>>>(
-        conv, cb, tokens, heads, groups, conv_dim);
+    if (k64)
+      cb_gemm64<64><<<dim3(groups, chunks, 4), 512, 0, stream>>>(
+          conv, cb, tokens, heads, groups, conv_dim);
+    else
+      cb_gemm64<16><<<dim3(groups, chunks, 4), 512, 0, stream>>>(
+          conv, cb, tokens, heads, groups, conv_dim);
   } else {
     cb_gemm<<<dim3(groups, chunks, 64), 32, 0, stream>>>(
         conv, cb, tokens, heads, groups, conv_dim);
@@ -243,8 +273,13 @@ extern "C" int xinfer_nemotron_ssd_wmma(
       dt_decay, log_decay, reset_at, tokens, heads);
   transpose_starts<<<(chunks * heads * SD * HD + 255) / 256, 256, 0, stream>>>(
       starts, transposed, chunks, heads);
-  ssd_output<<<dim3(heads, chunks, CT / OUT_ROWS), 512, 0, stream>>>(
-      conv, dt_decay, log_decay, reset_at, cb, transposed, d, y,
-      tokens, heads, groups, conv_dim);
+  if (k64)
+    ssd_output<64><<<dim3(heads, chunks, CT / OUT_ROWS), 512, 0, stream>>>(
+        conv, dt_decay, log_decay, reset_at, cb, transposed, d, y,
+        tokens, heads, groups, conv_dim);
+  else
+    ssd_output<16><<<dim3(heads, chunks, CT / OUT_ROWS), 512, 0, stream>>>(
+        conv, dt_decay, log_decay, reset_at, cb, transposed, d, y,
+        tokens, heads, groups, conv_dim);
   return static_cast<int>(cudaPeekAtLastError());
 }

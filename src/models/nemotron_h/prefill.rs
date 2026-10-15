@@ -25,6 +25,10 @@ static SSD_CB64: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_SSD_CB64").as_deref() == Some(std::ffi::OsStr::new("1"))
 });
 #[cfg(feature = "nemotron-mamba-ssd-wmma")]
+static SSD_K64: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_SSD_K64").as_deref() == Some(std::ffi::OsStr::new("1"))
+});
+#[cfg(feature = "nemotron-mamba-ssd-wmma")]
 unsafe extern "C" {
     fn xinfer_nemotron_ssd_wmma(
         conv: *const f32,
@@ -41,6 +45,7 @@ unsafe extern "C" {
         groups: i32,
         conv_dim: i32,
         cb64: i32,
+        k64: i32,
         stream: i64,
     ) -> i32;
 }
@@ -425,6 +430,7 @@ fn run_with_options(
                         as_i32(mixer.groups)?,
                         as_i32(mixer.conv_dim)?,
                         i32::from(*SSD_CB64),
+                        i32::from(*SSD_K64),
                         *device.cu_stream() as i64,
                     )
                 };
