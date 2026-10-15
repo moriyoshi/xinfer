@@ -72,7 +72,7 @@ __device__ __forceinline__ int nvfp4_find_expert_for_row(
   return lo;
 }
 
-template <typename InType>
+template <typename InType, bool ReluSquared>
 __global__ void xinfer_nvfp4_quantize_gathered_kernel(
     const InType* __restrict__ input,        // [total_rows, K]
     uint8_t* __restrict__ output,            // [total_rows, K/2]
@@ -106,7 +106,14 @@ __global__ void xinfer_nvfp4_quantize_gathered_kernel(
   int64_t in_base = source_row * K + k_start;
   float vals[16];
   for (int i = 0; i < NVFP4_BLOCK_SIZE; ++i) {
-    vals[i] = static_cast<float>(input[in_base + i]);
+    float value = static_cast<float>(input[in_base + i]);
+    if constexpr (ReluSquared) {
+      // The unfused Nemotron path rounds the ReLU square to BF16 before
+      // activation quantization. Preserve that rounding at the source read.
+      float positive = value < 0.0f ? 0.0f : value;
+      value = static_cast<float>(InType(__fmul_rn(positive, positive)));
+    }
+    vals[i] = value;
   }
 
   float vecMax = 0.0f;
@@ -173,15 +180,24 @@ extern "C" void xinfer_nvfp4_quantize_gathered_bf16(
     const int32_t* sorted_ids, int map_divisor,
     const float* input_scale_invs, const int32_t* expert_offsets,
     const int32_t* sf_offsets, int rows, int experts,
-    int K, int K_scale_padded, int64_t stream) {
+    int K, int K_scale_padded, int relu_squared, int64_t stream) {
   dim3 grid(rows);
   dim3 block(min(K / 16, 512));
-  xinfer_nvfp4_quantize_gathered_kernel<nv_bfloat16>
-      <<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-          static_cast<const nv_bfloat16*>(input), static_cast<uint8_t*>(output),
-          static_cast<uint8_t*>(scales), sorted_ids, map_divisor,
-          input_scale_invs, expert_offsets, sf_offsets,
-          rows, experts, K, K_scale_padded);
+  if (relu_squared) {
+    xinfer_nvfp4_quantize_gathered_kernel<nv_bfloat16, true>
+        <<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            static_cast<const nv_bfloat16*>(input), static_cast<uint8_t*>(output),
+            static_cast<uint8_t*>(scales), sorted_ids, map_divisor,
+            input_scale_invs, expert_offsets, sf_offsets,
+            rows, experts, K, K_scale_padded);
+  } else {
+    xinfer_nvfp4_quantize_gathered_kernel<nv_bfloat16, false>
+        <<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            static_cast<const nv_bfloat16*>(input), static_cast<uint8_t*>(output),
+            static_cast<uint8_t*>(scales), sorted_ids, map_divisor,
+            input_scale_invs, expert_offsets, sf_offsets,
+            rows, experts, K, K_scale_padded);
+  }
 }
 
 extern "C" void xinfer_nvfp4_quantize_gathered_f16(
@@ -189,15 +205,24 @@ extern "C" void xinfer_nvfp4_quantize_gathered_f16(
     const int32_t* sorted_ids, int map_divisor,
     const float* input_scale_invs, const int32_t* expert_offsets,
     const int32_t* sf_offsets, int rows, int experts,
-    int K, int K_scale_padded, int64_t stream) {
+    int K, int K_scale_padded, int relu_squared, int64_t stream) {
   dim3 grid(rows);
   dim3 block(min(K / 16, 512));
-  xinfer_nvfp4_quantize_gathered_kernel<half>
-      <<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
-          static_cast<const half*>(input), static_cast<uint8_t*>(output),
-          static_cast<uint8_t*>(scales), sorted_ids, map_divisor,
-          input_scale_invs, expert_offsets, sf_offsets,
-          rows, experts, K, K_scale_padded);
+  if (relu_squared) {
+    xinfer_nvfp4_quantize_gathered_kernel<half, true>
+        <<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            static_cast<const half*>(input), static_cast<uint8_t*>(output),
+            static_cast<uint8_t*>(scales), sorted_ids, map_divisor,
+            input_scale_invs, expert_offsets, sf_offsets,
+            rows, experts, K, K_scale_padded);
+  } else {
+    xinfer_nvfp4_quantize_gathered_kernel<half, false>
+        <<<grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+            static_cast<const half*>(input), static_cast<uint8_t*>(output),
+            static_cast<uint8_t*>(scales), sorted_ids, map_divisor,
+            input_scale_invs, expert_offsets, sf_offsets,
+            rows, experts, K, K_scale_padded);
+  }
 }
 
 // The grouped GEMM returns FP32 rows in expert order. Each route owns one

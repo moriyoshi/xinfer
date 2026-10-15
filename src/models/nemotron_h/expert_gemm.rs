@@ -1,7 +1,8 @@
 //! Xinfer-owned fused expert gather/activation quantization for Nemotron-H.
 //! Based on the pinned attention-rs grouped NVFP4 hardware wrapper (MIT).
-//! The only changed stage is activation quantization, which reads routed rows
-//! directly from their source instead of materializing a BF16 gather buffer.
+//! Activation quantization reads routed rows directly from their source
+//! instead of materializing a BF16 gather buffer. An opt-in kernel variant
+//! also applies ReLU² with the original BF16 rounding during that read.
 
 use attention_rs::workspace::{get_moe_activation_pool, get_moe_cutlass_workspace};
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;
@@ -32,6 +33,7 @@ unsafe extern "C" {
         experts: i32,
         k: i32,
         k_scale_padded: i32,
+        relu_squared: i32,
         stream: i64,
     );
     fn xinfer_nvfp4_quantize_gathered_f16(
@@ -47,6 +49,7 @@ unsafe extern "C" {
         experts: i32,
         k: i32,
         k_scale_padded: i32,
+        relu_squared: i32,
         stream: i64,
     );
     fn xinfer_nvfp4_scatter_f32_to_bf16_vec(
@@ -86,6 +89,7 @@ pub(super) fn moe_gemm_nvfp4_fused_quant(
     _is_prefill: bool,
     pre_swizzled_weight_scales: Option<&Tensor>,
     finalize: Option<(&Tensor, &Tensor)>,
+    relu_squared: bool,
 ) -> Result<Tensor> {
     use candle_core::{DType, Storage};
 
@@ -292,6 +296,7 @@ pub(super) fn moe_gemm_nvfp4_fused_quant(
                     num_experts as i32,
                     k as i32,
                     k_scale_padded as i32,
+                    i32::from(relu_squared),
                     stream,
                 ),
                 DType::BF16 => xinfer_nvfp4_quantize_gathered_bf16(
@@ -307,6 +312,7 @@ pub(super) fn moe_gemm_nvfp4_fused_quant(
                     num_experts as i32,
                     k as i32,
                     k_scale_padded as i32,
+                    i32::from(relu_squared),
                     stream,
                 ),
                 _ => unreachable!(),
@@ -585,6 +591,7 @@ mod tests {
                     experts as i32,
                     k as i32,
                     scale_cols as i32,
+                    0,
                     stream,
                 );
             }
@@ -598,6 +605,58 @@ mod tests {
                 baseline_scales.flatten_all()?.to_vec1::<u8>()?,
                 fused_scales.flatten_all()?.to_vec1::<u8>()?,
                 "swizzled scale bytes differ at K={k}"
+            );
+            let activated = super::super::relu_squared(&input)?;
+            unsafe {
+                ffi::nvfp4_moe_gather_bf16(
+                    ptr(&activated)? as *const _,
+                    ptr(&gathered)? as *mut _,
+                    ptr(&sorted)? as *const i32,
+                    rows as i32,
+                    k as i32,
+                    topk as i32,
+                    stream,
+                );
+                ffi::nvfp4_quantize_activation_grouped_bf16(
+                    ptr(&gathered)? as *const _,
+                    ptr(&baseline_packed)? as *mut _,
+                    ptr(&baseline_scales)? as *mut _,
+                    ptr(&input_scale_invs)? as *const f32,
+                    ptr(&expert_offsets)? as *const i32,
+                    ptr(&sf_offsets)? as *const i32,
+                    rows as i32,
+                    experts as i32,
+                    k as i32,
+                    scale_cols as i32,
+                    stream,
+                );
+                xinfer_nvfp4_quantize_gathered_bf16(
+                    ptr(&input)? as *const _,
+                    ptr(&fused_packed)? as *mut _,
+                    ptr(&fused_scales)? as *mut _,
+                    ptr(&sorted)? as *const i32,
+                    topk as i32,
+                    ptr(&input_scale_invs)? as *const f32,
+                    ptr(&expert_offsets)? as *const i32,
+                    ptr(&sf_offsets)? as *const i32,
+                    rows as i32,
+                    experts as i32,
+                    k as i32,
+                    scale_cols as i32,
+                    1,
+                    stream,
+                );
+            }
+            device.synchronize()?;
+            assert_eq!(
+                baseline_packed.flatten_all()?.to_vec1::<u8>()?,
+                fused_packed.flatten_all()?.to_vec1::<u8>()?,
+                "ReLU-squared packed bytes differ at K={k}"
+            );
+            assert_eq!(
+                baseline_scales.flatten_all()?.to_vec1::<u8>()?,
+                fused_scales.flatten_all()?.to_vec1::<u8>()?,
+                "ReLU-squared scale bytes differ at K={k}"
             );
         }
         Ok(())
