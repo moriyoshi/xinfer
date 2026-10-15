@@ -75,7 +75,7 @@ fn ssd_wmma_matches_recurrence_with_nonzero_starts_and_partial_chunk() -> Result
     let transposed = unsafe { Tensor::empty_((chunks, HEADS, SD, HD), DType::BF16, &device)? };
     let output = unsafe { Tensor::empty_((TOKENS, HEADS * HD), DType::F32, &device)? };
     let cuda = device.as_cuda_device()?.cuda_device();
-    let launch = || unsafe {
+    let launch = |cb64: i32| unsafe {
         xinfer_nemotron_ssd_wmma(
             pointer(&conv).unwrap() as *const f32,
             pointer(&dt_decay).unwrap() as *const f32,
@@ -90,18 +90,35 @@ fn ssd_wmma_matches_recurrence_with_nonzero_starts_and_partial_chunk() -> Result
             HEADS as i32,
             GROUPS as i32,
             CONV as i32,
+            cb64,
             *cuda.cu_stream() as i64,
         )
     };
-    assert_eq!(launch(), 0);
+    assert_eq!(launch(0), 0);
     let actual = output.flatten_all()?.to_vec1::<f32>()?;
+    let cb_bits = cb
+        .flatten_all()?
+        .to_vec1::<half::bf16>()?
+        .into_iter()
+        .map(|value| value.to_bits())
+        .collect::<Vec<_>>();
     let max_abs = expected
         .iter()
         .zip(&actual)
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
     assert!(max_abs < 0.003, "SSD WMMA max abs {max_abs}");
-    assert_eq!(launch(), 0);
+    assert_eq!(launch(1), 0);
+    assert_eq!(
+        cb_bits,
+        cb.flatten_all()?
+            .to_vec1::<half::bf16>()?
+            .into_iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(actual, output.flatten_all()?.to_vec1::<f32>()?);
+    assert_eq!(launch(1), 0);
     assert_eq!(actual, output.flatten_all()?.to_vec1::<f32>()?);
     Ok(())
 }
