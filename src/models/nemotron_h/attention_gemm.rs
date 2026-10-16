@@ -24,6 +24,7 @@ extern "C" {
         num_kv_heads: u32,
         cache_block_size: u32,
         scale: f32,
+        grouped_heads: bool,
         stream: i64,
     ) -> i32;
 }
@@ -76,6 +77,7 @@ pub(crate) fn try_prefill(
     kv_heads: usize,
     head_dim: usize,
     scale: f32,
+    grouped_heads: bool,
 ) -> Result<Option<Tensor>> {
     let Some((key_cache, value_cache)) = cache else {
         return Ok(None);
@@ -169,6 +171,7 @@ pub(crate) fn try_prefill(
             kv_heads as u32,
             block_size as u32,
             scale,
+            grouped_heads,
             stream,
         )
     };
@@ -320,8 +323,22 @@ mod tests {
             2,
             128,
             1.0 / (128.0f32).sqrt(),
+            false,
         )?
         .expect("GB10 specialization");
+        let grouped = try_prefill(
+            &q,
+            &k,
+            &v,
+            Some((&kc, &vc)),
+            &metadata,
+            32,
+            2,
+            128,
+            1.0 / (128.0f32).sqrt(),
+            true,
+        )?
+        .expect("GB10 grouped-query specialization");
         let expected = attention_rs::flash::flash_prefill(
             &q,
             &kc,
@@ -347,6 +364,10 @@ mod tests {
             .to_dtype(DType::F32)?
             .flatten_all()?
             .to_vec1::<f32>()?;
+        let grouped = grouped
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
         let max_abs = actual
             .iter()
             .zip(expected.iter())
@@ -357,10 +378,38 @@ mod tests {
             max_abs == 0.0,
             "attention context differs from paged BF16 oracle: {max_abs}"
         );
+        anyhow::ensure!(
+            actual == grouped,
+            "grouped-query attention differs from per-head attention"
+        );
+        let host_lengths = metadata.context_lens_host.take();
+        let grouped_paged = try_prefill(
+            &q,
+            &k,
+            &v,
+            Some((&kc, &vc)),
+            &metadata,
+            32,
+            2,
+            128,
+            1.0 / (128.0f32).sqrt(),
+            true,
+        )?
+        .expect("GB10 grouped-query paged specialization");
+        metadata.context_lens_host = host_lengths;
+        let grouped_paged = grouped_paged
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        anyhow::ensure!(
+            actual == grouped_paged,
+            "grouped-query paged attention differs from per-head attention"
+        );
         if std::env::var_os("XINFER_NEMOTRON_ATTN_BENCH").is_some() {
             use std::time::Instant;
             let mut baseline = Vec::new();
             let mut custom = Vec::new();
+            let mut grouped_times = Vec::new();
             for _ in 0..6 {
                 let began = Instant::now();
                 attention_rs::flash::flash_reshape_and_cache(
@@ -402,11 +451,27 @@ mod tests {
                     2,
                     128,
                     1.0 / (128.0f32).sqrt(),
+                    false,
                 )?;
                 device.synchronize()?;
                 custom.push(began.elapsed().as_secs_f64() * 1000.0);
+                let began = Instant::now();
+                let _ = try_prefill(
+                    &q,
+                    &k,
+                    &v,
+                    Some((&kc, &vc)),
+                    &metadata,
+                    32,
+                    2,
+                    128,
+                    1.0 / (128.0f32).sqrt(),
+                    true,
+                )?;
+                device.synchronize()?;
+                grouped_times.push(began.elapsed().as_secs_f64() * 1000.0);
             }
-            eprintln!("attention_prefill_ms_baseline={baseline:?} custom={custom:?}");
+            eprintln!("attention_prefill_ms_baseline={baseline:?} custom={custom:?} grouped={grouped_times:?}");
         }
         assert!(valid_current_lengths(
             &metadata,

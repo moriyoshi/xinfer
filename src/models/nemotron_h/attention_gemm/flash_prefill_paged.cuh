@@ -121,7 +121,7 @@
 
 #define PREFILL_USE_DYNAMIC_SMEM 1
 
-template<typename HalfT>
+template<typename HalfT, bool GROUPED_HEADS>
 __global__ void
 #if PREFILL_USE_DYNAMIC_SMEM
 __launch_bounds__(NUM_THREADS)
@@ -147,14 +147,14 @@ flash_prefill_paged(
     const float inv_sqrt_d,
     const float softcap
 ) {
-    const unsigned int q_head = blockIdx.x;
+    const unsigned int q_head_base = blockIdx.x * (GROUPED_HEADS ? 4u : 1u);
     const unsigned int q_block = blockIdx.y;
     const unsigned int seq_idx = blockIdx.z;
     const unsigned int tid = threadIdx.x;
     const unsigned int warp_id = tid / 32;
     const unsigned int lane_id = tid % 32;
 
-    if (q_head >= num_q_heads) return;
+    if (q_head_base >= num_q_heads) return;
 
     const unsigned int q_seq_start = cu_seqlens_q[seq_idx];
     const unsigned int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
@@ -162,12 +162,15 @@ flash_prefill_paged(
     const unsigned int q_offset = kv_len > q_len ? kv_len - q_len : 0;
     const int* block_table = block_tables + seq_idx * block_table_stride;
 
-    const unsigned int q_start = q_block * BR;
+    // In grouped mode each warp owns 16 rows of a different query head.
+    // Four heads share one KV head, so the staged K/V tiles are loaded once.
+    const unsigned int rows_per_head = GROUPED_HEADS ? BR / 4 : BR;
+    const unsigned int q_start = q_block * rows_per_head;
     if (q_start >= q_len) return;
-    const unsigned int q_tile_end = min(q_start + BR, q_len);
+    const unsigned int q_tile_end = min(q_start + rows_per_head, q_len);
     const unsigned int q_tile_len = q_tile_end - q_start;
     const unsigned int q_seq_stride = num_q_heads * head_dim;
-    const unsigned int kv_head = q_head / (num_q_heads / num_kv_heads);
+    const unsigned int kv_head = q_head_base / (num_q_heads / num_kv_heads);
 
     Q += q_seq_start * q_seq_stride;
     O += q_seq_start * q_seq_stride;
@@ -220,8 +223,10 @@ flash_prefill_paged(
         for (unsigned int idx = tid; idx < (BR * (HDIM / 8)); idx += NUM_THREADS) {
             unsigned int row = idx / cpr, col = (idx % cpr) * 8;
             unsigned int sa = __cvta_generic_to_shared(&smem_Q[row * HDIM_PAD + col]);
-            if (q_start + row < q_len) {
-                const void* gm = (const void*)&Q[(q_start + row) * q_seq_stride + q_head * head_dim + col];
+            const unsigned int local_row = GROUPED_HEADS ? row % (BR / 4) : row;
+            const unsigned int head = q_head_base + (GROUPED_HEADS ? row / (BR / 4) : 0);
+            if (q_start + local_row < q_len) {
+                const void* gm = (const void*)&Q[(q_start + local_row) * q_seq_stride + head * head_dim + col];
                 FLASH_CP_ASYNC(sa, gm);
             } else {
                 *((uint4*)&smem_Q[row * HDIM_PAD + col]) = make_uint4(0, 0, 0, 0);
@@ -302,7 +307,9 @@ flash_prefill_paged(
             }
 
             unsigned int c0 = nt * 8 + tid_in_group * 2, c1 = c0 + 1;
-            unsigned int qr0 = q_offset + q_start + row0, qr1 = q_offset + q_start + row1;
+            unsigned int local_row0 = GROUPED_HEADS ? row0 % (BR / 4) : row0;
+            unsigned int local_row1 = GROUPED_HEADS ? row1 % (BR / 4) : row1;
+            unsigned int qr0 = q_offset + q_start + local_row0, qr1 = q_offset + q_start + local_row1;
 
             if (causal) {
                 if (kv_start + c0 > qr0) acc_s[nt][0] = -1e30f;
@@ -318,8 +325,8 @@ flash_prefill_paged(
             }
             if (c0 >= kv_tile_len) { acc_s[nt][0] = -1e30f; acc_s[nt][2] = -1e30f; }
             if (c1 >= kv_tile_len) { acc_s[nt][1] = -1e30f; acc_s[nt][3] = -1e30f; }
-            if (row0 >= q_tile_len) { acc_s[nt][0] = -1e30f; acc_s[nt][1] = -1e30f; }
-            if (row1 >= q_tile_len) { acc_s[nt][2] = -1e30f; acc_s[nt][3] = -1e30f; }
+            if (local_row0 >= q_tile_len) { acc_s[nt][0] = -1e30f; acc_s[nt][1] = -1e30f; }
+            if (local_row1 >= q_tile_len) { acc_s[nt][2] = -1e30f; acc_s[nt][3] = -1e30f; }
         }
 
         float rmax0 = -1e30f, rmax1 = -1e30f;
@@ -432,17 +439,19 @@ flash_prefill_paged(
         float il0 = (l_r0 > 0.f) ? (1.f / l_r0) : 0.f;
         float il1 = (l_r1 > 0.f) ? (1.f / l_r1) : 0.f;
 
-        HalfT* ob = O + q_head * head_dim;
+        HalfT* ob = O + (q_head_base + (GROUPED_HEADS ? warp_id : 0)) * head_dim;
         #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
             unsigned int c0 = nt * 8 + tid_in_group * 2;
-            unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
-            if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
+            unsigned int local_r0 = GROUPED_HEADS ? r0 % (BR / 4) : r0;
+            unsigned int local_r1 = GROUPED_HEADS ? r1 % (BR / 4) : r1;
+            unsigned int gr0 = q_start + local_r0, gr1 = q_start + local_r1;
+            if (gr0 < q_len && local_r0 < q_tile_len && c0 < head_dim) {
                 unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][0] * il0));
                 unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][1] * il0));
                 *(unsigned int*)&ob[gr0 * q_seq_stride + c0] = lo | (hi << 16);
             }
-            if (gr1 < q_len && r1 < q_tile_len && c0 < head_dim) {
+            if (gr1 < q_len && local_r1 < q_tile_len && c0 < head_dim) {
                 unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][2] * il1));
                 unsigned int hi = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][3] * il1));
                 *(unsigned int*)&ob[gr1 * q_seq_stride + c0] = lo | (hi << 16);
