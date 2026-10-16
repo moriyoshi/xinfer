@@ -6,7 +6,7 @@ use anyhow::{ensure, Result};
 use attention_rs::InputMetadata;
 use candle_core::{DType, Device, Tensor};
 use parking_lot::RwLock;
-use std::{path::Path, rc::Rc, sync::Arc};
+use std::{path::Path, rc::Rc, sync::Arc, time::Instant};
 use tokenizers::Tokenizer;
 use xinfer::{
     models::{
@@ -290,6 +290,7 @@ fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
     let expected_greedy: Vec<u32> = serde_json::from_value(reference_json["greedy"].clone())?;
     let mut next = argmax(&full) as u32;
     let mut greedy = Vec::new();
+    let decode_started = Instant::now();
     for (step, &_expected) in expected_greedy.iter().enumerate() {
         greedy.push(next);
         next = argmax(&forward(
@@ -301,6 +302,10 @@ fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
             false,
         )?) as u32;
     }
+    eprintln!(
+        "gemma4_greedy_decode_ms_per_token={:.3}",
+        decode_started.elapsed().as_secs_f64() * 1000.0 / expected_greedy.len() as f64
+    );
     let greedy_matches = greedy
         .iter()
         .zip(&expected_greedy)
@@ -369,6 +374,26 @@ fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
         );
         ensure!(argmax(&long_full) == argmax(&hf_long));
         ensure!(difference < 3.0);
+    }
+    if std::env::var_os("XINFER_GEMMA4_BENCH_LONG_DECODE").is_some() {
+        let mut next = argmax(&long_full) as u32;
+        let mut generated = Vec::new();
+        let started = Instant::now();
+        for step in 0..64 {
+            generated.push(next);
+            next = argmax(&forward(
+                &model,
+                &device,
+                &long_full_cache,
+                &[next],
+                640 + step,
+                false,
+            )?) as u32;
+        }
+        eprintln!(
+            "gemma4_long_decode_ms_per_token={:.3} tokens={generated:?}",
+            started.elapsed().as_secs_f64() * 1000.0 / generated.len() as f64
+        );
     }
     Ok(())
 }

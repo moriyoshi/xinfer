@@ -75,6 +75,12 @@ impl Linear {
 
 impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if self.bias.is_none() && super::gemma4_gemv::active() {
+            if let Some(output) = super::gemma4_gemv::forward(x, &self.weight)? {
+                return Ok(output);
+            }
+        }
         let w = match *x.dims() {
             [b1, seq_len, _, _] => {
                 if seq_len > 1 {

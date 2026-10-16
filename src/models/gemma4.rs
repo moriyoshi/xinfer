@@ -639,6 +639,8 @@ pub struct Gemma4ForCausalLM {
     num_hidden_layers: usize,
     first_kv_shared_layer: usize,
     kv_source_layers: Vec<usize>,
+    #[cfg(feature = "cuda")]
+    fast_bf16_gemv: bool,
 }
 
 fn kv_source_layers(layer_types: &[String], first_shared: usize) -> Result<Vec<usize>> {
@@ -1038,6 +1040,20 @@ impl Gemma4ForCausalLM {
             dtype,
         )?;
 
+        #[cfg(feature = "cuda")]
+        let fast_bf16_gemv = dtype == DType::BF16
+            && device
+                .as_cuda_device()
+                .ok()
+                .and_then(|cuda| attention_rs::cuda_utils::sm_version(cuda))
+                .is_some_and(|sm| sm >= 80)
+            && std::env::var_os("XINFER_GEMMA4_BF16_GEMV").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+        #[cfg(feature = "cuda")]
+        if fast_bf16_gemv {
+            crate::models::layers::gemma4_gemv::prepare(device)?;
+        }
+
         Ok(Self {
             embed_tokens,
             embed_tokens_per_layer,
@@ -1057,6 +1073,8 @@ impl Gemma4ForCausalLM {
             num_hidden_layers: config.num_hidden_layers,
             first_kv_shared_layer,
             kv_source_layers,
+            #[cfg(feature = "cuda")]
+            fast_bf16_gemv,
         })
     }
 
@@ -1114,6 +1132,10 @@ impl Gemma4ForCausalLM {
         input_metadata: &InputMetadata,
         return_hidden: bool,
     ) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        let _gemv_guard = crate::models::layers::gemma4_gemv::activate(
+            !input_metadata.is_prefill && self.fast_bf16_gemv,
+        );
         let mut xs = self.embed_forward(input_ids)?;
         let per_layer_inputs = self.get_per_layer_embeddings(input_ids, &xs)?;
         let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
