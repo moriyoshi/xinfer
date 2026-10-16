@@ -207,6 +207,32 @@ run order; they do not establish a reliable end-to-end speedup. K128 was
 therefore left opt-in. The same-binary traces are
 `/tmp/nemotron-ssd-output-k{0,1}-{samebinary,reverse}.sqlite`.
 
+### Independent prefix warp geometry
+
+`XINFER_NEMOTRON_PREFIX_WARPS=2` now selects two warps only for the FP32
+chunk-boundary prefix kernel. The summary remains at its faster four-warp
+geometry, and the ordinary default remains four warps for both. The module
+cache key includes both geometry choices. No recurrence formula, chunk
+boundary, or exported state layout changes.
+
+An initial two-warp trial applied to **both** summary and prefix matched
+real-checkpoint bytes but made the 9,538-token summary 13.6 ms slower while
+reducing prefix time by 4.3 ms. It was discarded. In the same-binary
+prefix-only comparison, the 23 measured prefill prefix launches took
+41.845 ms at four warps and 38.555 ms at two; summary time was 70.909 and
+70.805 ms respectively. A single real-checkpoint 32,768-token pair, split
+into four continued 8,192-token calls, took 5,980.9 and 5,943.7 ms in
+prefill wall time. The corresponding 9,538-token wall times were 1,471.2
+and 1,470.0 ms; shared-host variability prevents attributing either wall
+difference entirely to the prefix change.
+
+All 9,538-token logits and exported Mamba-state bytes matched between
+geometries; the 32,768-token continued-prefill logits and state did too.
+The two-warp mode repeated prefill, 16 decode logits, and state bit for bit.
+Its compiled SM121 prefix kernel used 168 registers per thread with no
+reported spills. This tuning was measured on GB10 only, so it remains opt-in.
+Trace exports are `/tmp/nemotron-prefix-{4,2}warp.sqlite`.
+
 ## Cause of the remaining gap on the current fork
 
 A subsequent capture used fork `f424ebc15e3724b266c02f2e821991120578848e`
