@@ -486,3 +486,28 @@ the 66-second load occurred as host available memory and free swap fell.
 These samples cannot isolate the roughly millisecond-scale C×B improvement.
 The next substantial gap reduction still requires a different SSD
 summary/output or attention-kernel implementation.
+
+## Skip unused C×B tiles
+
+The SM121 `cb_gemm64` launch now computes three 64×64 tiles per 128-token
+chunk instead of four. Its upper-right tile contains only products where the
+source token is later than the output token. `ssd_output` already masks those
+entries before loading C×B, so that tile never contributes to an output.
+The remaining tiles keep the same WMMA operations and storage layout.
+
+The focused CUDA oracle used a fresh C×B buffer filled with NaNs. The skipped
+tile stayed poisoned, every consumed lower-triangle BF16 word matched the
+full-grid reference, and FP32 output matched across K16/K64, 64/128 output
+rows, direct/transposed starts, zero decay, and a partial chunk. On the real
+NVFP4 30B checkpoint, a single 9,538-token prefill and 16 continuation steps
+matched the saved full-grid logits (8,912,896 bytes) and exported Mamba
+state (49,930,472 bytes) byte for byte.
+
+This removes 25% of C×B thread blocks, not 25% of prefill time. Comparable
+warmed K64 launches in separate 257-token Nsight captures had median
+durations of 0.01987 ms before and 0.01891 ms after; this small difference
+can include run-to-run clock variation. The correctly configured real-model
+run took 1,250.8 ms, against recent full-grid samples around 1,269–1,273 ms
+on the shared host. That is too little evidence to claim an end-to-end
+speedup. The new isolated trace is
+`/tmp/nemotron-ssd-triangular-isolated.nsys-rep`.
