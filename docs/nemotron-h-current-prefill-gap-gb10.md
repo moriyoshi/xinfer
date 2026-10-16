@@ -136,6 +136,39 @@ inconclusive while shared-host load averages reached 25–47, so this is a
 measured kernel and scratch reduction, not an established serving-latency
 gain. The underlying FP32 chunk summary and attention costs remain.
 
+## SSD output shared scratch and 128-row tiles
+
+The SM121 SSD WMMA output kernel now reuses its shared-memory input-tile
+buffer for the FP32 accumulators after the final MMA. Each thread saves its
+main accumulator values in registers before the state accumulator overwrites
+that shared region. This reduces K64 staging from 48 KiB to 16 KiB for a
+64-row block and lets a 128-row block fit in 32 KiB. The per-output WMMA
+fragments and reduction order are unchanged.
+
+On the same 9,538-token real 30B prompt, one CUDA trace per setting measured
+the following sums over the 23 prefill SSD output launches (excluding the 23
+short warmup launches):
+
+| Output tile | Shared scratch | SSD output GPU time |
+| --- | ---: | ---: |
+| 64 rows, original buffers | 48 KiB | 106.480 ms |
+| 64 rows, reused buffer | 16 KiB | 104.955 ms |
+| 128 rows, reused buffer | 32 KiB | 93.518 ms |
+
+The 64- and 128-row reused-buffer measurements came from the same binary;
+their chunk-summary and chunk-prefix sums differed by under 0.2 ms. The
+128-row output is the default only when the opt-in SM121 SSD WMMA path is
+enabled. Set `XINFER_NEMOTRON_SSD_OUTPUT_ROWS=64` to restore the old row
+geometry. A 32-row trial cost 168.980 ms and was removed.
+
+The 128-row run matched all 8,912,896 saved real-checkpoint logit bytes and
+all 49,930,472 Mamba snapshot bytes against the prior 64-row path; a second
+prefill and 16 decode steps repeated bit for bit. The unprofiled and
+profiled whole-model wall times varied enough to obscure this roughly
+11 ms kernel gain, so it is not a measured serving-latency improvement.
+Trace exports: `/tmp/nemotron-ssd-output64-shared.sqlite` and
+`/tmp/nemotron-ssd-output128-shared.sqlite`.
+
 There is substantial shared-host variation. Another capture with identical
 flags took 2,274.7 ms, while its unprofiled run took 1,912.1 ms. The stable
 capture above was bracketed by unprofiled 1,450.8 and 1,497.1 ms runs; the

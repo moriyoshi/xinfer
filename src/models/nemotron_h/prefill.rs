@@ -36,6 +36,16 @@ static SSD_DIRECT_STARTS: LazyLock<bool> = LazyLock::new(|| {
         != Some(std::ffi::OsStr::new("0"))
 });
 #[cfg(feature = "nemotron-mamba-ssd-wmma")]
+static SSD_OUTPUT_ROWS: LazyLock<i32> = LazyLock::new(|| {
+    if std::env::var_os("XINFER_NEMOTRON_SSD_OUTPUT_ROWS").as_deref()
+        == Some(std::ffi::OsStr::new("64"))
+    {
+        64
+    } else {
+        128
+    }
+});
+#[cfg(feature = "nemotron-mamba-ssd-wmma")]
 unsafe extern "C" {
     fn xinfer_nemotron_ssd_wmma(
         conv: *const f32,
@@ -54,6 +64,7 @@ unsafe extern "C" {
         cb64: i32,
         k64: i32,
         direct_starts: i32,
+        output_rows: i32,
         stream: i64,
     ) -> i32;
 }
@@ -448,6 +459,7 @@ fn run_with_options(
                         i32::from(*SSD_CB64),
                         i32::from(*SSD_K64),
                         i32::from(*SSD_DIRECT_STARTS),
+                        *SSD_OUTPUT_ROWS,
                         *device.cu_stream() as i64,
                     )
                 };
