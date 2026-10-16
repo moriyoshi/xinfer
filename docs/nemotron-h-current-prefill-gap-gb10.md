@@ -379,11 +379,11 @@ their durations cannot be added to the gap. The existing zero-fill audit
 should check whether full-output CUTLASS allocations can be uninitialized
 only after proving every output element is written.
 
-The next controlled implementation target is a Nemotron-specific fused
-residual-plus-RMSNorm kernel, followed by the sorted-order expert
-intermediate. Re-profile after each change: the figures above overlap in
-memory bandwidth and launch scheduling, so their apparent savings are not
-additive.
+The fused residual-plus-RMSNorm kernel was implemented below. The
+sorted-order expert intermediate was tested afterward and did not produce a
+repeatable whole-prefill gain; see the follow-up at the end of this report.
+The figures above overlap in memory bandwidth and launch scheduling, so
+their apparent savings are not additive.
 
 ## Opt-in fused residual and RMSNorm
 
@@ -425,3 +425,39 @@ capture illustrates shared-host clock/load variation; the alternating
 one-model wall measurements and exact parity are the appropriate evidence
 for this change. The fused trace is
 `/tmp/nemotron-fused-residual-norm-9538.nsys-rep` with its SQLite export.
+
+## Follow-up experiments on the remaining gap
+
+The following experiments used the same 9,538 chat-token IDs and real NVFP4
+30B checkpoint as the earlier captures. They were reverted after measurement;
+the published engine path and its snapshot layout are unchanged. Whole-call
+times are separate-process samples on a shared GB10 and are useful only as
+coarse checks. The isolated CUDA traces provide the narrower kernel evidence.
+
+| Experiment | Exactness or quality | 9,538-token prefill result |
+| --- | --- | ---: |
+| Keep the expert up-projection intermediate in expert-sorted BF16 order, then quantize it without scattering and gathering | All saved prefix/16 continuation logits and Mamba snapshot bytes matched the original path | 1,265.5 / 1,278.4 ms versus a fresh 1,272.9 ms control; no demonstrated gain |
+| Replace precise SSD-output exponentials with `__expf` | Exported Mamba state changed; 249/257 teacher-forced top choices matched, maximum logit difference 4.1914 | 1,307.8 ms versus 1,278.1 ms control; slower and numerically unacceptable |
+| Make the previously optional two-warp SSD chunk-prefix geometry the GB10 default | Prefix/16 continuation logits and Mamba snapshot matched byte for byte | 1,270.7 ms versus 1,269.3 ms for the reverse-bracketed four-warp control; no demonstrated whole-call gain |
+| Double the custom attention query tile from 64 to 128 rows, retaining 32 keys | Batched-prefix and 2,048-row CUDA context oracles matched exactly; real checkpoint logits/state matched byte for byte | 1,342.0 ms versus recent 1,269–1,273 ms controls; slower |
+| Double the custom attention key tile from 32 to 64 rows, retaining 64 queries | CUDA context differed from the paged BF16 oracle by up to 0.015625 at both 257 and 2,048 rows, exceeding the existing tolerance | Rejected before a full-checkpoint run |
+
+At 2,048 rows, the isolated custom-attention kernel took **0.958 ms** for
+64-query × 32-key, **1.008 ms** for 128-query × 32-key, and **1.192 ms** for
+64-query × 64-key. The 128-query mode halved query CTAs but slowed the kernel;
+the 64-key mode retained the same CTA count, slowed it by about 24%, and
+changed the context. This rules out a direct tile-size change as the fix for
+the earlier **~78 ms** six-layer attention gap. The comparison to vLLM's
+128-query × 64-key trait is a clue about its broader implementation, not a
+tile prescription for Xinfer's warp-local MMA kernel. Raw isolated traces are
+`/tmp/nemotron-attn-{q64,q128,k64}-isolated.nsys-rep` on this host.
+
+For the Mamba SSD path, a saved experimental tensor-core chunk-state trace
+(`/tmp/nemotron-tensor-summary.sqlite`) spent **73.72 ms** in 46
+`chunk_state_wmma` launches; a saved four-warp scalar summary trace spent
+**73.59 ms** in its 46 summary launches. This does not establish a tensor-core
+gain. The current full trace still spends about **76 ms** in scalar chunk
+summary, **104 ms** in SSD output, **43 ms** in chunk prefix, and **28 ms** in
+C×B. The next useful implementation should change how chunk state and output
+are formed or reused, with a matched numerical and continued-prefill check;
+simple warp, tile, and exponential substitutions have not closed the gap.
