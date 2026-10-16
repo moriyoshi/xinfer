@@ -212,6 +212,118 @@ fn logit_bytes(logits: &[f32]) -> Vec<u8> {
 }
 
 #[test]
+fn real_30b_fused_residual_norm_parity_and_benchmark() -> Result<()> {
+    if std::env::var_os("XINFER_NEMOTRON_FUSED_NORM_BENCH").is_none() {
+        return Ok(());
+    }
+    let directory = std::env::var_os("XINFER_NEMOTRON_PREFILL_CHECKPOINT")
+        .context("XINFER_NEMOTRON_PREFILL_CHECKPOINT is required")?;
+    let length = std::env::var("XINFER_NEMOTRON_PREFILL_TOKENS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(2048);
+    let steps = std::env::var("XINFER_NEMOTRON_MOE_BENCH_STEPS")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(64);
+    ensure!(length >= 2 && steps > 0);
+    let device = Device::new_cuda(0)?;
+    let (model, config) = load(Path::new(&directory), &device)?;
+    let tokenizer = Tokenizer::from_file(Path::new(&directory).join("tokenizer.json"))
+        .map_err(anyhow::Error::msg)?;
+    let sample = tokenizer
+        .encode(
+            "A long document can mix history, engineering, mathematics, and everyday language. The model must continue each sentence from its exact preceding context. ",
+            false,
+        )
+        .map_err(anyhow::Error::msg)?
+        .get_ids()
+        .to_vec();
+    let mut tokens = sample
+        .iter()
+        .copied()
+        .cycle()
+        .take(length + steps)
+        .collect::<Vec<_>>();
+    if let Some(path) = std::env::var_os("XINFER_NEMOTRON_INPUT_IDS_FILE") {
+        let prefix: Vec<u32> = serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(
+            prefix.len() == length,
+            "input IDs must match prefill length"
+        );
+        tokens[..length].copy_from_slice(&prefix);
+    }
+    let warmup_len = length.min(512);
+    let warmup_kv = cache(&config, warmup_len, &device)?;
+    for fused in [false, true] {
+        model.set_fused_residual_norm_enabled(fused);
+        forward(&model, &device, &warmup_kv, 999, &tokens[..warmup_len], 0)?;
+        model.release_sequence_state(999);
+    }
+    let kv = cache(&config, length + steps, &device)?;
+    struct Reference {
+        prefix_logits: Vec<f32>,
+        prefix_state: Vec<u8>,
+        continuation: Vec<Vec<u8>>,
+        end_state: Vec<u8>,
+    }
+    let mut reference: Option<Reference> = None;
+    for fused in [false, true, false, true] {
+        model.set_fused_residual_norm_enabled(fused);
+        let (prefix_logits, prefill_ms) =
+            prefill(&model, &device, &kv, 0, &tokens[..length], true)?;
+        let prefix_state = model.export_mamba_state_bytes(0, length as u64, [0; 32])?;
+        let mut continuation = Vec::with_capacity(steps);
+        for index in 0..steps {
+            let logits = forward(
+                &model,
+                &device,
+                &kv,
+                0,
+                &tokens[length + index..length + index + 1],
+                length + index,
+            )?;
+            continuation.push(Sha256::digest(logit_bytes(&logits)).to_vec());
+        }
+        let end_state = model.export_mamba_state_bytes(0, (length + steps) as u64, [0; 32])?;
+        if let Some(reference) = &reference {
+            ensure!(
+                prefix_logits == reference.prefix_logits,
+                "fused norm changed prefix logits"
+            );
+            ensure!(
+                prefix_state == reference.prefix_state,
+                "fused norm changed prefix state"
+            );
+            ensure!(
+                continuation == reference.continuation,
+                "fused norm changed continuation logits"
+            );
+            ensure!(
+                end_state == reference.end_state,
+                "fused norm changed continuation state"
+            );
+        } else {
+            reference = Some(Reference {
+                prefix_logits,
+                prefix_state,
+                continuation,
+                end_state,
+            });
+        }
+        eprintln!(
+            "fused_residual_norm={fused} prefill_tokens={length} prefill_ms={prefill_ms:.3} prefill_ms_per_token={:.6}",
+            prefill_ms / length as f64
+        );
+        model.release_sequence_state(0);
+    }
+    eprintln!("fused_norm_prefix_and_continuation_byte_identical=true");
+    Ok(())
+}
+
+#[test]
 fn real_30b_moe_prefill_and_decode_benchmark() -> Result<()> {
     if std::env::var_os("XINFER_NEMOTRON_MOE_BENCH").is_none() {
         return Ok(());
