@@ -353,7 +353,10 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         eprintln!("query_tile_context_max_abs={max_abs}");
-        anyhow::ensure!(max_abs <= 0.1, "attention context mismatch: {max_abs}");
+        anyhow::ensure!(
+            max_abs == 0.0,
+            "attention context differs from paged BF16 oracle: {max_abs}"
+        );
         if std::env::var_os("XINFER_NEMOTRON_ATTN_BENCH").is_some() {
             use std::time::Instant;
             let mut baseline = Vec::new();
