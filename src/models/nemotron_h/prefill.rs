@@ -29,6 +29,11 @@ static SSD_K64: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_SSD_K64").as_deref() == Some(std::ffi::OsStr::new("1"))
 });
 #[cfg(feature = "nemotron-mamba-ssd-wmma")]
+static SSD_OUTPUT_K128: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var_os("XINFER_NEMOTRON_SSD_OUTPUT_K128").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+});
+#[cfg(feature = "nemotron-mamba-ssd-wmma")]
 static SSD_DIRECT_STARTS: LazyLock<bool> = LazyLock::new(|| {
     // The direct read preserves BF16 tiles and eliminates the per-layer
     // transposed-state buffer. Keep an opt-out for architecture comparisons.
@@ -65,6 +70,7 @@ unsafe extern "C" {
         k64: i32,
         direct_starts: i32,
         output_rows: i32,
+        output_k128: i32,
         stream: i64,
     ) -> i32;
 }
@@ -460,6 +466,7 @@ fn run_with_options(
                         i32::from(*SSD_K64),
                         i32::from(*SSD_DIRECT_STARTS),
                         *SSD_OUTPUT_ROWS,
+                        i32::from(*SSD_OUTPUT_K128),
                         *device.cu_stream() as i64,
                     )
                 };

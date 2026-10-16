@@ -180,6 +180,33 @@ Xinfer trace is `/tmp/xinfer-gap-current/full2.nsys-rep` with its SQLite
 export; the vLLM trace is
 `/tmp/xinfer-nemotron-prefill/nsys-vllm-9538-current.nsys-rep`.
 
+### Optional 128-wide SSD output reduction
+
+With `XINFER_NEMOTRON_SSD_K64=1`, setting
+`XINFER_NEMOTRON_SSD_OUTPUT_K128=1` stages all 128 reduction values per
+SSD output block. It retains the ordered 16-wide WMMA operations but uses
+48 KiB of shared scratch rather than K64's 32 KiB. The mode applies only to
+the opt-in SM121 WMMA path; the default remains K64. The launcher rejects a
+K128 request without K64 enabled.
+
+The focused CUDA recurrence test matched K64 output bytes with nonzero
+carried state, zero decay, and a partial chunk. On the real 30B checkpoint,
+the 9,538-token prefill and 16 decode steps matched the published K64 path
+byte for byte in all 8,912,896 saved logit bytes and 49,930,472 exported
+Mamba-state bytes. Two same-binary Nsight pairs used opposite orders:
+
+| Order | K64 SSD output, 23 launches | K128 SSD output, 23 launches |
+| --- | ---: | ---: |
+| K64 then K128 | 92.229 ms | 91.121 ms |
+| K128 then K64 | 92.519 ms | 91.624 ms |
+
+The named-kernel difference is 0.895–1.109 ms, or about 1% of SSD output
+time and under 0.1% of the 9,538-token prefill. The four corresponding
+whole-prefill wall times were 1,434.4, 1,433.0, 1,423.8, and 1,450.9 ms in
+run order; they do not establish a reliable end-to-end speedup. K128 was
+therefore left opt-in. The same-binary traces are
+`/tmp/nemotron-ssd-output-k{0,1}-{samebinary,reverse}.sqlite`.
+
 ## Cause of the remaining gap on the current fork
 
 A subsequent capture used fork `f424ebc15e3724b266c02f2e821991120578848e`
