@@ -16,7 +16,6 @@ use candle_core::{DType, Device, Module, Result, Tensor};
 use candle_nn::Linear;
 use either::Either;
 use parking_lot::RwLock;
-use std::iter::zip;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -189,6 +188,7 @@ impl Gemma4DecoderLayer {
         config: &Config,
         layer_idx: usize,
         is_sliding: bool,
+        shared_kv: bool,
         enable_moe: bool,
         global_head_dim: usize,
         dtype: DType,
@@ -258,20 +258,34 @@ impl Gemma4DecoderLayer {
             false
         };
 
-        let self_attn = Attention::new_with_options(
-            if is_qvar_builder {
-                vb.clone()
-            } else {
-                vb.pp("self_attn").clone()
-            },
-            comm.clone(),
-            &layer_config,
-            Some(1.0),
-            sliding_window,
-            dtype,
-            k_eq_v,
-            false,
-        )?;
+        let attn_vb = if is_qvar_builder {
+            vb.clone()
+        } else {
+            vb.pp("self_attn")
+        };
+        let self_attn = if shared_kv {
+            Attention::new_with_options_shared_kv(
+                attn_vb,
+                comm.clone(),
+                &layer_config,
+                Some(1.0),
+                sliding_window,
+                dtype,
+                k_eq_v,
+                false,
+            )?
+        } else {
+            Attention::new_with_options(
+                attn_vb,
+                comm.clone(),
+                &layer_config,
+                Some(1.0),
+                sliding_window,
+                dtype,
+                k_eq_v,
+                false,
+            )?
+        };
 
         let mlp = MLP::new(
             if is_qvar_builder {
@@ -498,6 +512,7 @@ impl Gemma4DecoderLayer {
         positions: &Tensor,
         cache: Option<(&Tensor, &Tensor)>,
         input_metadata: &InputMetadata,
+        shared_kv: bool,
     ) -> Result<Tensor> {
         let xs = xs.clone();
 
@@ -516,10 +531,21 @@ impl Gemma4DecoderLayer {
             self.rotary_emb.clone()
         };
 
-        let attn_output =
+        let attn_output = if shared_kv {
+            let source_cache = cache.ok_or_else(|| {
+                candle_core::Error::Msg("Gemma 4 shared layer requires source KV cache".into())
+            })?;
+            self.self_attn.forward_with_shared_kv(
+                &normed,
+                &Some(rope),
+                positions,
+                source_cache,
+                input_metadata,
+            )?
+        } else {
             self.self_attn
-                .forward(&normed, &Some(rope), mask, positions, cache, input_metadata)?;
-
+                .forward(&normed, &Some(rope), mask, positions, cache, input_metadata)?
+        };
         let mut xs = self.post_attention_layernorm.forward(&attn_output)?;
         xs = (xs + &residual)?;
 
@@ -611,9 +637,49 @@ pub struct Gemma4ForCausalLM {
     layer_types: Vec<String>,
     hidden_size_per_layer_input: Option<usize>,
     num_hidden_layers: usize,
+    first_kv_shared_layer: usize,
+    kv_source_layers: Vec<usize>,
+}
+
+fn kv_source_layers(layer_types: &[String], first_shared: usize) -> Result<Vec<usize>> {
+    if first_shared > layer_types.len() {
+        candle_core::bail!("Gemma 4 KV sharing boundary exceeds layer count")
+    }
+    let mut sources = Vec::with_capacity(layer_types.len());
+    for (index, layer_type) in layer_types.iter().enumerate() {
+        if index < first_shared {
+            sources.push(index);
+        } else {
+            let source = layer_types[..first_shared]
+                .iter()
+                .rposition(|previous| previous == layer_type)
+                .ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "Gemma 4 shared layer {index} has no source for {layer_type}"
+                    ))
+                })?;
+            sources.push(source);
+        }
+    }
+    Ok(sources)
 }
 
 impl Gemma4ForCausalLM {
+    /// Cache pair used by each decoder layer. The first
+    /// `num_hidden_layers - num_kv_shared_layers` entries map to themselves;
+    /// shared layers map to the last preceding non-shared layer of the same
+    /// attention type. Callers may allocate either one pair per decoder layer
+    /// or only the leading non-shared pairs. Shared-layer pairs in the former
+    /// layout are ignored and never written.
+    pub fn kv_cache_source_layers(&self) -> &[usize] {
+        &self.kv_source_layers
+    }
+
+    /// Number of KV cache pairs needed when using the compact layout.
+    pub fn num_kv_cache_layers(&self) -> usize {
+        self.first_kv_shared_layer
+    }
+
     pub fn new(
         vb: &VarBuilderX,
         comm: Rc<Comm>,
@@ -748,9 +814,14 @@ impl Gemma4ForCausalLM {
             false
         };
 
-        let first_kv_shared_layer = config
-            .num_hidden_layers
-            .saturating_sub(num_kv_shared_layers);
+        if num_kv_shared_layers > config.num_hidden_layers {
+            candle_core::bail!("Gemma 4 num_kv_shared_layers exceeds num_hidden_layers")
+        }
+        if layer_types.len() != config.num_hidden_layers {
+            candle_core::bail!("Gemma 4 layer_types length differs from num_hidden_layers")
+        }
+        let first_kv_shared_layer = config.num_hidden_layers - num_kv_shared_layers;
+        let kv_source_layers = kv_source_layers(&layer_types, first_kv_shared_layer)?;
 
         let lm_prefix = if is_qvar_builder {
             "model"
@@ -931,6 +1002,7 @@ impl Gemma4ForCausalLM {
                 config,
                 i,
                 is_sliding,
+                i >= first_kv_shared_layer,
                 enable_moe,
                 global_head_dim,
                 dtype,
@@ -983,6 +1055,8 @@ impl Gemma4ForCausalLM {
             layer_types,
             hidden_size_per_layer_input,
             num_hidden_layers: config.num_hidden_layers,
+            first_kv_shared_layer,
+            kv_source_layers,
         })
     }
 
@@ -1042,7 +1116,6 @@ impl Gemma4ForCausalLM {
     ) -> Result<Tensor> {
         let mut xs = self.embed_forward(input_ids)?;
         let per_layer_inputs = self.get_per_layer_embeddings(input_ids, &xs)?;
-
         let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
 
         let full_mask = if input_metadata.is_prefill && !seqlens.is_empty() {
@@ -1074,9 +1147,26 @@ impl Gemma4ForCausalLM {
         );
 
         if let Some(kv_caches) = kv_caches {
-            for ((k_cache, v_cache), (i, layer)) in
-                zip(kv_caches.iter(), self.layers.iter().enumerate())
+            // The standard caller keeps one pair per layer. A compact caller
+            // may supply only the leading non-shared pairs; all shared layers
+            // read their same-type source pair and never touch their own slot.
+            if kv_caches.len() != self.num_hidden_layers
+                && kv_caches.len() != self.first_kv_shared_layer
             {
+                candle_core::bail!(
+                    "Gemma 4 expected {} or {} KV cache pairs, got {}",
+                    self.num_hidden_layers,
+                    self.first_kv_shared_layer,
+                    kv_caches.len()
+                )
+            }
+            for (i, layer) in self.layers.iter().enumerate() {
+                let source = self.kv_source_layers[i];
+                let (k_cache, v_cache) = kv_caches.get(source).ok_or_else(|| {
+                    candle_core::Error::Msg(format!(
+                        "Gemma 4 missing KV cache for source layer {source}"
+                    ))
+                })?;
                 let pli = per_layer_inputs.as_ref().map(|v| &v[i]);
                 xs = layer.forward(
                     &xs,
@@ -1086,8 +1176,11 @@ impl Gemma4ForCausalLM {
                     positions,
                     Some((k_cache, v_cache)),
                     input_metadata,
+                    i >= self.first_kv_shared_layer,
                 )?;
             }
+        } else if self.first_kv_shared_layer < self.num_hidden_layers {
+            candle_core::bail!("Gemma 4 shared KV layers require paged caches")
         }
 
         if !seqlens.is_empty() && !return_hidden {
@@ -1159,5 +1252,44 @@ impl Gemma4ForCausalLM {
 
     pub fn get_vocab_size(&self) -> usize {
         self.vocab_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kv_source_layers;
+
+    #[test]
+    fn shared_kv_uses_last_nonshared_layer_of_same_type() -> candle_core::Result<()> {
+        let types = [
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ]
+        .map(str::to_owned);
+        assert_eq!(kv_source_layers(&types, 4)?, vec![0, 1, 2, 3, 2, 3]);
+        assert!(kv_source_layers(&types, 0).is_err());
+        assert!(kv_source_layers(&types, 7).is_err());
+
+        let e4b_types = (0..42)
+            .map(|i| {
+                if (i + 1) % 6 == 0 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+                .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let e4b_sources = kv_source_layers(&e4b_types, 24)?;
+        assert_eq!(&e4b_sources[..24], &(0..24).collect::<Vec<_>>());
+        assert_eq!(
+            &e4b_sources[24..],
+            &[22, 22, 22, 22, 22, 23, 22, 22, 22, 22, 22, 23, 22, 22, 22, 22, 22, 23]
+        );
+        Ok(())
     }
 }
