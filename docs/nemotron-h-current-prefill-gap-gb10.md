@@ -384,3 +384,44 @@ residual-plus-RMSNorm kernel, followed by the sorted-order expert
 intermediate. Re-profile after each change: the figures above overlap in
 memory bandwidth and launch scheduling, so their apparent savings are not
 additive.
+
+## Opt-in fused residual and RMSNorm
+
+`XINFER_NEMOTRON_FUSED_RESIDUAL_NORM=1` enables a Nemotron-specific CUDA
+kernel for BF16 prefill. A caller can also use
+`NemotronHForCausalLM::set_fused_residual_norm_enabled(bool)` between forward
+calls. The first layer norm and final residual remain on their original
+paths; each other prefill layer combines the previous BF16 residual add with
+the current FP32 RMSNorm. The kernel stores the rounded BF16 residual before
+normalizing and reproduces Candle's 32- or 1,024-thread XOR reduction order.
+Single-token decode is unchanged. The mode is disabled by default and
+compiles its CUDA PTX on first use outside graph capture.
+
+The focused CUDA test matched Candle's BF16 residual and normalized output
+bytes at hidden widths 128, 2,688, and 4,480. On the real NVFP4 30B
+checkpoint, alternating unfused/fused/unfused/fused runs on one loaded model
+matched every prefix logit, every continuation logit hash, and the entire
+portable Mamba state envelope byte for byte. The 8,448-token case used an
+8,192-token call followed by a 256-token continued-prefill call, then 16
+decode steps. The 9,538-token case used the fixed chat IDs in one call,
+then 16 decode steps. A separate 2,048-token comparison matched all 65
+saved logit vectors and the prefix state exactly.
+
+| One-model prefill schedule | Unfused runs | Fused runs |
+| --- | ---: | ---: |
+| 8,192 + 256 continued tokens | 1,343.7 / 1,246.0 ms | 1,142.0 / 1,171.9 ms |
+| 9,538 fixed chat tokens, one call | 1,385.5 / 1,370.0 ms | 1,248.4 / 1,245.0 ms |
+
+The 9,538-token fused runs leave about 225–228 ms relative to the saved
+1,020.3 ms vLLM range. That comparison spans separate sessions; it is a
+directional remaining-gap estimate, not an isolated head-to-head result.
+
+In a separate 9,538-token Nsight capture, 51 fused layer kernels totaled
+50.37 ms. The original 52 adds, 53 norm casts in each direction, and 53
+RMSNorms totaled about 179.6 ms in the prior trace. The captured grouped
+expert GEMMs rose from 236.64 to 333.21 ms despite identical expert code,
+and the marked whole-call range rose from 1,430.62 to 1,476.70 ms. That
+capture illustrates shared-host clock/load variation; the alternating
+one-model wall measurements and exact parity are the appropriate evidence
+for this change. The fused trace is
+`/tmp/nemotron-fused-residual-norm-9538.nsys-rep` with its SQLite export.

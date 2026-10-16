@@ -13,6 +13,8 @@ mod grouped_moe;
 #[cfg(feature = "cuda")]
 mod prefill;
 #[cfg(feature = "cuda")]
+mod residual_norm;
+#[cfg(feature = "cuda")]
 mod route_grouping;
 mod state;
 
@@ -655,6 +657,8 @@ pub struct NemotronHForCausalLM {
     expert_cache: Option<Arc<Mutex<ExpertCache>>>,
     mamba_prefill_fast_enabled: AtomicBool,
     mamba_decode_fused_enabled: AtomicBool,
+    #[cfg(feature = "cuda")]
+    fused_residual_norm_enabled: AtomicBool,
 }
 
 impl NemotronHForCausalLM {
@@ -828,6 +832,8 @@ impl NemotronHForCausalLM {
             expert_cache,
             mamba_prefill_fast_enabled: AtomicBool::new(true),
             mamba_decode_fused_enabled: AtomicBool::new(true),
+            #[cfg(feature = "cuda")]
+            fused_residual_norm_enabled: AtomicBool::new(residual_norm::enabled()),
         })
     }
 
@@ -843,6 +849,15 @@ impl NemotronHForCausalLM {
     /// the next forward call; do not toggle this concurrently with a call.
     pub fn set_mamba_decode_fused_enabled(&self, enabled: bool) {
         self.mamba_decode_fused_enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    /// Opt into the BF16 residual-plus-RMSNorm CUDA kernel during prefill.
+    /// Changes take effect on the next forward call; do not toggle this
+    /// concurrently with a call.
+    #[cfg(feature = "cuda")]
+    pub fn set_fused_residual_norm_enabled(&self, enabled: bool) {
+        self.fused_residual_norm_enabled
             .store(enabled, Ordering::Relaxed);
     }
 
@@ -1045,7 +1060,27 @@ impl NemotronHForCausalLM {
         );
         let mut states = self.states.write();
         let mut kv_index = 0;
+        #[cfg(feature = "cuda")]
+        let use_fused_residual_norm = metadata.is_prefill
+            && self.dtype == DType::BF16
+            && self.device.is_cuda()
+            && self.fused_residual_norm_enabled.load(Ordering::Relaxed);
+        #[cfg(not(feature = "cuda"))]
+        let use_fused_residual_norm = false;
+        let mut pending_output: Option<Tensor> = None;
         for (i, block) in self.layers.iter().enumerate() {
+            #[cfg(feature = "cuda")]
+            let input = if use_fused_residual_norm && i > 0 {
+                let previous = pending_output.take().ok_or_else(|| {
+                    candle_core::Error::Msg("missing Nemotron residual before fused norm".into())
+                })?;
+                let (residual, normalized) = residual_norm::forward(&xs, &previous, &block.norm)?;
+                xs = residual;
+                normalized
+            } else {
+                block.norm.forward(&xs)?
+            };
+            #[cfg(not(feature = "cuda"))]
             let input = block.norm.forward(&xs)?;
             let output = match &block.mixer {
                 Mixer::Mamba(m) => {
@@ -1073,6 +1108,13 @@ impl NemotronHForCausalLM {
                 Mixer::Mlp(mlp) => mlp.forward(&input)?,
                 Mixer::Moe(moe) => moe.forward(&input, metadata.is_prefill)?,
             };
+            if use_fused_residual_norm {
+                pending_output = Some(output);
+            } else {
+                xs = (&xs + output)?;
+            }
+        }
+        if let Some(output) = pending_output {
             xs = (&xs + output)?;
         }
         drop(states);

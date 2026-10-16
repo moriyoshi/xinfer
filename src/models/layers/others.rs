@@ -14,6 +14,18 @@ pub struct NormX {
     dtype: DType,
 }
 impl NormX {
+    /// Expose the FP32 RMSNorm parameters to model-specific fused CUDA paths.
+    /// The returned tensor is a cheap handle clone of the resident weight.
+    pub(crate) fn f32_rms_weight_eps(&self) -> Option<(Tensor, f32)> {
+        if self.dtype != DType::F32 || self.v4_weight.is_some() {
+            return None;
+        }
+        match &self.norm {
+            Either::Left(norm) => Some((norm.clone().into_inner().weight().clone(), self.v4_eps)),
+            Either::Right(_) => None,
+        }
+    }
+
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         if let Some(weight) = &self.v4_weight {
             return self.forward_v4(xs, weight);
