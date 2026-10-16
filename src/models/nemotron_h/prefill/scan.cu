@@ -4,6 +4,9 @@ typedef unsigned int uint32_t;
 #ifndef SUMMARY_WARPS
 #define SUMMARY_WARPS 4
 #endif
+#ifndef PREFIX_WARPS
+#define PREFIX_WARPS 4
+#endif
 #define SCAN_WARPS 8
 
 struct Params {
@@ -237,11 +240,11 @@ extern "C" __global__ void nemotron_mamba_chunk_prefix(
     const int warp = int(threadIdx.x) >> 5;
     const int lane = int(threadIdx.x) & 31;
     const int channel = lane * 4;
-    const int rows = HEAD_DIM / SUMMARY_WARPS;
-    float state[HEAD_DIM / SUMMARY_WARPS][4];
+    const int rows = HEAD_DIM / PREFIX_WARPS;
+    float state[HEAD_DIM / PREFIX_WARPS][4];
     #pragma unroll
     for (int r = 0; r < rows; ++r) {
-        const int row = r * SUMMARY_WARPS + warp;
+        const int row = r * PREFIX_WARPS + warp;
         const int offset = (head * HEAD_DIM + row) * 128 + channel;
         #pragma unroll
         for (int j = 0; j < 4; ++j) state[r][j] = initial_state[offset + j];
@@ -251,7 +254,7 @@ extern "C" __global__ void nemotron_mamba_chunk_prefix(
         const int block_state = (chunk * p.heads + head) * HEAD_DIM * 128;
         #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            const int row = r * SUMMARY_WARPS + warp;
+            const int row = r * PREFIX_WARPS + warp;
             const int offset = block_state + row * 128 + channel;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
@@ -264,7 +267,7 @@ extern "C" __global__ void nemotron_mamba_chunk_prefix(
     if (final_state != nullptr) {
         #pragma unroll
         for (int r = 0; r < rows; ++r) {
-            const int row = r * SUMMARY_WARPS + warp;
+            const int row = r * PREFIX_WARPS + warp;
             const int offset = (head * HEAD_DIM + row) * 128 + channel;
             #pragma unroll
             for (int j = 0; j < 4; ++j) final_state[offset + j] = state[r][j];

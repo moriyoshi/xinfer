@@ -83,6 +83,15 @@ static SUMMARY_WARPS: LazyLock<usize> = LazyLock::new(|| {
         4
     }
 });
+static PREFIX_WARPS: LazyLock<usize> = LazyLock::new(|| {
+    if std::env::var_os("XINFER_NEMOTRON_PREFIX_WARPS").as_deref()
+        == Some(std::ffi::OsStr::new("2"))
+    {
+        2
+    } else {
+        4
+    }
+});
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 static CHUNKED_SCAN: LazyLock<bool> = LazyLock::new(|| {
     std::env::var_os("XINFER_NEMOTRON_CHUNKED_SCAN").as_deref() != Some(std::ffi::OsStr::new("0"))
@@ -198,8 +207,8 @@ fn module(mixer: &Mamba2) -> Result<String> {
     let sm = attention_rs::cuda_utils::sm_version(mixer.device.as_cuda_device()?)
         .ok_or_else(|| candle_core::Error::Msg("unknown Mamba CUDA compute capability".into()))?;
     let module = format!(
-        "xinfer_nemotron_mamba_h{}_sm{}_sw{}_v8",
-        mixer.head_dim, sm, *SUMMARY_WARPS
+        "xinfer_nemotron_mamba_h{}_sm{}_sw{}_pw{}_v9",
+        mixer.head_dim, sm, *SUMMARY_WARPS, *PREFIX_WARPS
     );
     let _guard = COMPILE_LOCK.lock().unwrap();
     if !device.has_func(&module, PREPARE) {
@@ -209,9 +218,10 @@ fn module(mixer: &Mamba2) -> Result<String> {
             candle_core::bail!("Nemotron Mamba CUDA kernels must be loaded before graph capture")
         }
         let source = format!(
-            "#define HEAD_DIM {}\n#define SUMMARY_WARPS {}\n{}",
+            "#define HEAD_DIM {}\n#define SUMMARY_WARPS {}\n#define PREFIX_WARPS {}\n{}",
             mixer.head_dim,
             *SUMMARY_WARPS,
+            *PREFIX_WARPS,
             include_str!("prefill/scan.cu")
         );
         let ptx = compile_ptx_with_opts(
@@ -410,7 +420,7 @@ fn run_with_options(
             prefix.launch(
                 LaunchConfig {
                     grid_dim: (as_u32(mixer.heads)?, 1, 1),
-                    block_dim: (as_u32(*SUMMARY_WARPS * 32)?, 1, 1),
+                    block_dim: (as_u32(*PREFIX_WARPS * 32)?, 1, 1),
                     shared_mem_bytes: 0,
                 },
                 (
