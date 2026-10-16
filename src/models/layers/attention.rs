@@ -17,6 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 enum QkvProjection {
+    QueryOnly(TensorParallelColumnLinear),
     Separate {
         q_proj: TensorParallelColumnLinear,
         k_proj: TensorParallelColumnLinear,
@@ -422,6 +423,56 @@ impl Attention {
         k_eq_v: bool,
         qk_l2_norm: bool,
     ) -> Result<Self> {
+        Self::new_with_options_impl(
+            vb,
+            comm,
+            config,
+            attention_scale,
+            sliding_window,
+            dtype,
+            k_eq_v,
+            qk_l2_norm,
+            false,
+        )
+    }
+
+    /// Gemma 4 shared layers have no usable K/V projection weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options_shared_kv(
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        config: &Config,
+        attention_scale: Option<f32>,
+        sliding_window: Option<usize>,
+        dtype: DType,
+        k_eq_v: bool,
+        qk_l2_norm: bool,
+    ) -> Result<Self> {
+        Self::new_with_options_impl(
+            vb,
+            comm,
+            config,
+            attention_scale,
+            sliding_window,
+            dtype,
+            k_eq_v,
+            qk_l2_norm,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_options_impl(
+        vb: VarBuilderX,
+        comm: Rc<Comm>,
+        config: &Config,
+        attention_scale: Option<f32>,
+        sliding_window: Option<usize>,
+        dtype: DType,
+        k_eq_v: bool,
+        qk_l2_norm: bool,
+        query_only: bool,
+    ) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_heads = config.num_attention_heads;
         let num_kv_heads = config.num_key_value_heads;
@@ -476,7 +527,22 @@ impl Attention {
         let attention_heads = num_heads / world_size;
         let (kv_heads, kv_shard) = kv_head_shard(num_kv_heads, comm.rank(), world_size)?;
 
-        let qkv_proj = if let Some(packed) = Self::try_load_packed_qkv(
+        let qkv_proj = if query_only {
+            QkvProjection::QueryOnly(TensorParallelColumnLinear::load_with_hints(
+                hidden_size,
+                q_out_dim,
+                attention_bias,
+                if is_qvar_builder {
+                    vb.pp(key_map["q_proj"])
+                } else {
+                    vb.pp("q_proj")
+                },
+                comm.clone(),
+                &config.quantization_config,
+                &config.quant,
+                dtype,
+            )?)
+        } else if let Some(packed) = Self::try_load_packed_qkv(
             &vb,
             hidden_size,
             q_out_dim,
@@ -589,16 +655,37 @@ impl Attention {
             norm_dtype,
             qk_norm_add_one,
         );
-        let k_norm = rms_norm(
-            head_dim,
-            config.rms_norm_eps,
-            k_norm_vb.clone(),
-            norm_dtype,
-            qk_norm_add_one,
-        );
+        let k_norm = if query_only {
+            None
+        } else {
+            Some(rms_norm(
+                head_dim,
+                config.rms_norm_eps,
+                k_norm_vb.clone(),
+                norm_dtype,
+                qk_norm_add_one,
+            ))
+        };
 
-        let (q_norm, k_norm, full_dim_qk_norm) = if q_norm.is_ok() && k_norm.is_ok() {
-            (Some(q_norm.unwrap()), Some(k_norm.unwrap()), false)
+        let (q_norm, k_norm, full_dim_qk_norm) = if query_only {
+            if let Ok(q_norm) = q_norm {
+                (Some(q_norm), None, false)
+            } else {
+                let q_shard = shard(0, comm.rank(), comm.world_size());
+                match rms_norm_sharded(
+                    num_heads * head_dim,
+                    config.rms_norm_eps,
+                    q_norm_vb,
+                    norm_dtype,
+                    qk_norm_add_one,
+                    q_shard,
+                ) {
+                    Ok(q_norm) => (Some(q_norm), None, true),
+                    Err(_) => (None, None, false),
+                }
+            }
+        } else if q_norm.is_ok() && k_norm.as_ref().is_some_and(Result::is_ok) {
+            (Some(q_norm.unwrap()), Some(k_norm.unwrap().unwrap()), false)
         } else {
             let q_shard = shard(0, comm.rank(), comm.world_size());
             let q_full = rms_norm_sharded(
@@ -755,6 +842,127 @@ impl Attention {
         )
     }
 
+    /// Gemma 4 shared-KV attention. The preceding source layer has already
+    /// written this call's keys and values into `source_cache`; this layer
+    /// projects only Q and reads that cache without appending to it.
+    pub fn forward_with_shared_kv(
+        &self,
+        xs: &Tensor,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        positions: &Tensor,
+        source_cache: (&Tensor, &Tensor),
+        input_metadata: &InputMetadata,
+    ) -> Result<Tensor> {
+        #[cfg(not(feature = "flash"))]
+        candle_core::bail!("Gemma 4 shared attention requires the flash feature");
+
+        #[cfg(feature = "flash")]
+        {
+            let (seq_len, _) = xs.dims2()?;
+            let q_proj = match &self.qkv_proj {
+                QkvProjection::QueryOnly(q_proj) => q_proj,
+                _ => {
+                    candle_core::bail!("Gemma 4 shared attention requires a query-only projection")
+                }
+            };
+            if self.attn_output_gate {
+                candle_core::bail!("Gemma 4 shared attention does not support output gating")
+            }
+            let mut q = q_proj
+                .forward(xs)?
+                .reshape((seq_len, self.num_heads, self.head_dim))?;
+            if self.promote_qk_to_f32 && q.dtype() != DType::F32 {
+                q = q.to_dtype(DType::F32)?;
+            }
+            if let Some(norm) = &self.q_norm {
+                q = if self.full_dim_qk_norm {
+                    norm.forward(&q.reshape((seq_len, self.num_heads * self.head_dim))?)?
+                        .reshape((seq_len, self.num_heads, self.head_dim))?
+                } else {
+                    norm.forward(&q.flatten(0, 1)?)?.reshape((
+                        seq_len,
+                        self.num_heads,
+                        self.head_dim,
+                    ))?
+                };
+            }
+            if let Some(rope) = rotary_emb {
+                // The existing fused RoPE API rotates Q and K together. A
+                // one-head scratch K lets it rotate Q without loading or
+                // projecting this shared layer's unused checkpoint K/V.
+                let scratch_k = Tensor::zeros((seq_len, 1, self.head_dim), q.dtype(), q.device())?;
+                if let Some((rotated_q, _)) =
+                    rope.apply_rotary_emb_qkv(&q, &scratch_k, positions)?
+                {
+                    q = rotated_q;
+                }
+            }
+            if self.qk_l2_norm {
+                let rms = (q.sqr()?.mean_keepdim(D::Minus1)? + 1e-5)?.sqrt()?;
+                q = q.broadcast_div(&rms)?;
+            }
+            if q.dtype() != self.dtype {
+                q = q.to_dtype(self.dtype)?;
+            }
+            let (key_cache, value_cache) = source_cache;
+            if key_cache.dtype() != q.dtype() || value_cache.dtype() != q.dtype() {
+                candle_core::bail!("Gemma 4 shared attention requires native K/V cache dtype")
+            }
+            let block_tables = input_metadata.block_tables.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("Gemma 4 shared attention requires block tables".into())
+            })?;
+            let context_lens = input_metadata.context_lens.as_ref().ok_or_else(|| {
+                candle_core::Error::Msg("Gemma 4 shared attention requires context lengths".into())
+            })?;
+            let context = if input_metadata.is_prefill {
+                attention_rs::flash::flash_prefill(
+                    &q,
+                    key_cache,
+                    value_cache,
+                    block_tables,
+                    context_lens,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.score_scale,
+                    self.softcapping.unwrap_or(0.0) as f32,
+                    self.sliding_window,
+                    None,
+                    None,
+                    input_metadata.cu_seqlens_q.as_ref(),
+                    input_metadata.max_seqlen_q,
+                )?
+            } else {
+                let output = q.zeros_like()?;
+                attention_rs::flash::flash_decode(
+                    &q,
+                    key_cache,
+                    value_cache,
+                    block_tables,
+                    context_lens,
+                    &output,
+                    input_metadata.max_context_len,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.score_scale,
+                    self.softcapping.unwrap_or(0.0) as f32,
+                    self.sliding_window,
+                    None,
+                    None,
+                    None,
+                )?
+            };
+            let y = context.reshape((seq_len, self.num_heads * self.head_dim))?;
+            let y = if self.is_qvar_builder {
+                y
+            } else {
+                y.to_dtype(xs.dtype())?
+            };
+            self.o_proj.forward(&y)
+        }
+    }
+
     /// Qwen3 experiment hook. The observer runs only when explicitly supplied.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_with_probe(
@@ -830,6 +1038,9 @@ impl Attention {
         let (seq_len, _) = xs.dims2()?;
 
         let (q_raw, k, v) = match &self.qkv_proj {
+            QkvProjection::QueryOnly(_) => {
+                candle_core::bail!("query-only attention requires forward_with_shared_kv")
+            }
             QkvProjection::Separate {
                 q_proj,
                 k_proj,
@@ -1055,6 +1266,9 @@ impl Attention {
         let (seq_len, _) = xs.dims2()?;
 
         let (q_raw, k, v) = match &self.qkv_proj {
+            QkvProjection::QueryOnly(_) => {
+                candle_core::bail!("query-only attention requires forward_with_shared_kv")
+            }
             QkvProjection::Separate {
                 q_proj,
                 k_proj,
