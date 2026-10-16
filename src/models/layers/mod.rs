@@ -4,6 +4,8 @@ pub mod deltanet;
 pub mod distributed;
 pub mod ds_v4;
 pub mod gdn_state;
+#[cfg(feature = "cuda")]
+pub(crate) mod gemma4_gemv;
 pub mod indexer;
 pub mod linear;
 pub mod mask;
