@@ -540,3 +540,38 @@ the query-head blocks by four, so the total block count and aggregate K/V
 loads are approximately unchanged. It mainly avoids masked work near the
 causal frontier. A larger per-head row tile or a different attention kernel
 is needed to address the measured 63–78 ms attention gap to vLLM.
+
+## Prefix-state partitioning and fast attention exponentials
+
+Two more changes were measured on the same GB10 and then reverted. Neither
+changed the published inference path.
+
+The first divided each Mamba chunk-prefix head's 64 state rows among two or
+four independent CTAs. The hope was that more CTAs would hide the long
+75-chunk state scan's memory latency. The 257-token CUDA recurrence test with
+head width 64 passed, and the real 9,538-token prefix, 16 continuation logits,
+and exported Mamba state matched the one-CTA path byte for byte. The saved
+Nsight traces give the more useful result: over the 23 long-prefix kernel
+launches, one CTA per head took **42.766 ms**, two took **50.398 ms**, and four
+took **54.371 ms**. The whole-call wall times varied between 1,305 and
+1,393 ms across those traces and cannot overturn the direct kernel result.
+More CTAs replicated chunk-boundary control and memory traffic without enough
+occupancy benefit. The traces are `/tmp/nemotron-prefix-p{1,2,4}-full9538.sqlite`.
+
+The second change replaced the custom attention softmax's precise `expf`
+with the GPU `__expf` intrinsic behind an experimental switch. On the
+8,192-row BF16 CUDA fixture, the ordinary custom attention returned exactly
+the paged-kernel BF16 context. The fast variant changed 200 of 33,554,432
+BF16 context words, with maximum absolute difference **0.015625**. Six
+same-process calls including cache writes and synchronization measured
+**17.94–18.31 ms** for precise exponentials and **17.72–18.19 ms** for fast
+ones. The samples ran in a fixed order, so this small difference is not an
+isolated kernel gain. At 2,048 rows, 82 BF16 words changed with the same
+maximum difference. The altered numerics without a convincing timing gain
+do not justify using fast exponentials in the default path. The 8,192-row
+CUDA oracle test passed for the unchanged precise path after the experiment.
+
+These results narrow the next attention work to the QK/PV tile pipeline and
+KV movement, rather than exponential precision. The larger Mamba opportunity
+remains the chunk summary/output algorithm; duplicating the serial prefix
+across more CTAs moves in the wrong direction.
