@@ -105,18 +105,28 @@ attention kernel are unchanged. K64's larger shared-memory footprint is
 
 ## Direct FP32 chunk starts follow-up
 
-The optional `XINFER_NEMOTRON_SSD_DIRECT_STARTS=1` mode reads each carried
+The `XINFER_NEMOTRON_SSD_DIRECT_STARTS=1` mode reads each carried
 FP32 chunk state directly in the SSD output kernel and converts it into the
 same BF16 shared-memory tile. It skips the separate state-transpose kernel
 and its allocation. For a 9,538-token call this removes a 78,643,200-byte
 (75 MiB) temporary buffer; for each 8,192-token continued call it removes
-64 MiB. The default remains the original transpose path.
+64 MiB. This mode is now the default when the opt-in SM121 SSD WMMA path is
+enabled; set `XINFER_NEMOTRON_SSD_DIRECT_STARTS=0` for the original transpose
+path.
 
 The CUDA recurrence oracle matched output bytes with nonzero carried state,
 zero decay, and a partial chunk. On the real 30B checkpoint, final logits
 and exported Mamba state matched the transpose path byte for byte at 2,048,
 9,538, and 32,768 tokens; the 32K test used four continued calls. The
 direct path also repeated its full CUDA output byte for byte.
+
+A subsequent 9,538-token, 16-step real-checkpoint comparison after the
+attention warp-local change again matched all 8,912,896 logit bytes and all
+49,930,472 snapshot bytes. The unprofiled prefill calls measured 2,545.3 ms
+with transpose and 1,466.2 ms with direct starts, but model load varied from
+52.5 to 80.3 seconds on this shared host. Those two wall measurements do not
+establish a 1.08-second kernel gain; the paired Nsight kernel result below is
+the narrower evidence for the change.
 
 In nearby 9,538-token Nsight captures, 46 transpose launches cost 28.1 ms.
 The 46 SSD output launches rose from 98.5 to 113.1 ms with coalesced FP32
