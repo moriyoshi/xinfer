@@ -319,3 +319,68 @@ unnecessary hardware-FP4 output clears, at most roughly 30 ms of recorded
 memsets; (5) reduce first-use allocation/kernel-setup latency. The grouped
 expert GEMM contributes about 40 ms, and dense FP4/BF16 GEMMs are close to
 vLLM, so a GEMM rewrite alone cannot close the measured gap.
+
+## Further attribution on the current epic branch (2026-10-16)
+
+A fresh Nsight capture on `648cb0141dd777e1f4978a4649691093fae0852e`
+used the same 9,538 token IDs and the flags above, including the later K64
+SSD and warp-local attention modes. Its `BENCH_PREFILL_NEMOTRON` range was
+1,476.752 ms. The saved vLLM `BENCH_PREFILL_9538` range was 1,020.285 ms.
+These are separate captures on a shared host; their 456.467 ms difference is
+an attribution baseline, not a paired service-latency estimate. Raw SQLite
+exports are `/tmp/nemotron-current-epic-gap.sqlite` and
+`/tmp/xinfer-nemotron-prefill/nsys-vllm-9538-current.sqlite`.
+
+The largest newly identified repeated path is the residual plus layer RMSNorm.
+Nemotron-H calls `NormX::forward` before each of its 52 mixers and adds the
+residual afterward. Because its norm weights and arithmetic are FP32, the
+BF16 hidden state is cast to FP32, normalized, and cast back to BF16. In the
+captured Xinfer range the 52 BF16 residual-add kernels took 41.46 ms, the
+53 BF16-to-FP32 casts immediately before layer/final norms took 44.36 ms,
+the 53 FP32 RMSNorms took 53.05 ms, and the 53 casts immediately after them
+took 40.70 ms: about **179.6 ms** of named GPU work. The saved vLLM range
+contains 52 `fused_add_rms_norm` kernels totaling **45.78 ms**. The roughly
+**134 ms difference** is a strong optimization target, but it is not a
+measured speedup: a Xinfer fusion must preserve the exact residual placement,
+BF16 rounding, and continued-prefill behavior, then quantify logits and
+snapshot state against the current path.
+
+The routed-expert path has another concrete data-movement opportunity. After
+the grouped up GEMM writes expert-sorted FP32 rows, Xinfer scatters and rounds
+them into BF16 route-assignment order. Its down-projection quantizer then
+gathers those same assignments back into expert-sorted order. With the
+existing fused-ReLU-quant flag enabled, the scatter alone took **65.23 ms**
+over 23 layers; gathered quantization took **62.07 ms** over 46 launches.
+Keeping the intermediate in sorted order while preserving the FP32-to-BF16
+rounding boundary could remove the scatter and part of the gather, but needs
+a byte-parity test of down-projection packed inputs and scales. The existing
+`XINFER_NEMOTRON_EXPERT_FUSED_RELU_QUANT=1` already avoids a separate
+activation pass: in a nearby single capture, the marked range dropped from
+1,476.752 to 1,430.624 ms and ReLU² kernels from 58.35 to 15.12 ms.
+That one-pair whole-range difference is indicative; the activation-kernel
+change is the narrower evidence. The flag requires the
+`nemotron-expert-fused-quant` build feature and the fused expert quant path.
+
+The 46 grouped CUTLASS expert GEMMs took 236.64 ms with the fused-ReLU flag,
+versus 197.84 ms in the saved vLLM range. Xinfer uses an SM120 block-scaled
+pointer-array ping-pong collective with a 128×128×128 tile; the vLLM trace
+shows a cooperative collective with a 128×128×256 tile. This template
+difference is a testable explanation for some of the **38.8 ms** gap, but
+different layouts and scheduling also matter; changing the tile alone has
+not been benchmarked. The two alternating Xinfer grouped launches totaled
+102.26 and 134.38 ms, respectively.
+
+Finally, the current marked Xinfer range had 87.52 ms with no recorded GPU
+kernel, copy, or memset, versus 3.22 ms in vLLM. With the fused-ReLU flag,
+Xinfer's inactive time was 71.00 ms. Its memsets took 34.91 ms and wrote
+7.09 GB, versus 5.43 ms and 1.18 GB in vLLM. These are distinct from the
+named norm and expert kernel times; CUDA API waits overlap device work, so
+their durations cannot be added to the gap. The existing zero-fill audit
+should check whether full-output CUTLASS allocations can be uninitialized
+only after proving every output element is written.
+
+The next controlled implementation target is a Nemotron-specific fused
+residual-plus-RMSNorm kernel, followed by the sorted-order expert
+intermediate. Re-profile after each change: the figures above overlap in
+memory bandwidth and launch scheduling, so their apparent savings are not
+additive.
