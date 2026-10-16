@@ -299,12 +299,14 @@ extern "C" int xinfer_nemotron_ssd_wmma(
     const float* d, float* y, void* cb_raw, float* log_decay,
     float* reset_at, void* transposed_raw,
     int tokens, int heads, int groups, int conv_dim, int cb64, int k64,
-    int direct_starts, int output_rows,
+    int direct_starts, int output_rows, int output_k128,
     long long stream_raw) {
   if (heads != 64 || groups != 8 || tokens <= 0 ||
       (cb64 != 0 && cb64 != 1) || (k64 != 0 && k64 != 1) ||
       (direct_starts != 0 && direct_starts != 1) ||
       (output_rows != 64 && output_rows != 128) ||
+      (output_k128 != 0 && output_k128 != 1) ||
+      (output_k128 && !k64) ||
       (!direct_starts && transposed_raw == nullptr))
     return cudaErrorInvalidValue;
   const int chunks = (tokens + CT - 1) / CT;
@@ -327,7 +329,15 @@ extern "C" int xinfer_nemotron_ssd_wmma(
   if (!direct_starts)
     transpose_starts<<<(chunks * heads * SD * HD + 255) / 256, 256, 0, stream>>>(
         starts, transposed, chunks, heads);
-  if (k64 && direct_starts)
+  if (k64 && output_k128 && direct_starts)
+    launch_ssd_output<128, true>(
+        conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
+        d, y, tokens, heads, groups, conv_dim, output_rows, chunks, stream);
+  else if (k64 && output_k128)
+    launch_ssd_output<128, false>(
+        conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
+        d, y, tokens, heads, groups, conv_dim, output_rows, chunks, stream);
+  else if (k64 && direct_starts)
     launch_ssd_output<64, true>(
         conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
         d, y, tokens, heads, groups, conv_dim, output_rows, chunks, stream);
