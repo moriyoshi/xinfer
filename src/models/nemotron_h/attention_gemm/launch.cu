@@ -14,7 +14,7 @@ extern "C" int xinfer_nemotron_flash_prefill_bf16(
   using Half = __nv_bfloat16;
   constexpr int shared_bytes =
       (BR * HDIM_PAD + 2 * BC * HDIM_PAD + BC * HDIM_PAD +
-       BR * (BC + PAD_P)) * sizeof(Half) + BR * 2 * sizeof(float);
+       BR * (BC + PAD_P)) * sizeof(Half);
   auto kernel = flash_prefill_paged<Half>;
   cudaError_t err = cudaFuncSetAttribute(
       kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);

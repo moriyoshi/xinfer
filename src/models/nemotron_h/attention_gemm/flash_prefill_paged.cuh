@@ -24,9 +24,9 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// Xinfer's Nemotron-H specialization expands BR from 32 to 64 with eight
-// warps. Each K/V tile is reused across twice as many query rows while the
-// per-warp QK and PV operation order remains the same.
+// Xinfer's Nemotron-H specialization uses 64 query rows and four warps.
+// One warp owns each 16-row group and all 32 score columns, avoiding
+// cross-warp softmax reductions for every K/V tile.
 // Key differences from atlas GB10 (SM121):
 //   - Uses ldmatrix.x4 / ldmatrix.trans for efficient smem→register loads (SM80+)
 //   - Uses IEEE expf for long-context softmax stability (was __expf)
@@ -40,7 +40,7 @@
 //     4. Online softmax in registers (warp-shuffle max/sum)
 //     5. O += P @ V                 (mma.sync m16n8k16)
 //
-// Tile sizes: BR=64, BC=32 (8 warps, 256 threads)
+// Tile sizes: BR=64, BC=32 (4 warps, 128 threads)
 // Q/O layout: [q_len, num_q_heads, head_dim] BF16
 // KV cache:   [num_blocks, block_size, num_kv_heads, head_dim] BF16 (NHD paged)
 //
@@ -67,9 +67,9 @@
 #define HDIM FLASH_HDIM
 #define HDIM_PAD (HDIM + PAD_KV)
 #define PAD_P 8
-#define N_TILES_PER_WARP ((HDIM / 8) / 2)
+#define N_TILES_PER_WARP (HDIM / 8)
 #define TILE_CHUNKS (BC * (HDIM / 8))
-#define NUM_THREADS 256
+#define NUM_THREADS 128
 
 // Paged KV tile loader: cp.async from scattered pages to contiguous smem.
 // block_size is always power-of-2 in practice; __ffs gives bit position for shift.
@@ -104,20 +104,17 @@
     } while(0)
 
 // ============================================================================
-// BR=64 prefill kernel (8 warps, 256 threads)
+// BR=64 prefill kernel (4 warps, 128 threads)
 //
 // Warp roles:
-//   QK^T: 8 warps — four 16-row groups, two N halves
-//         N-split: warps 0-3 use columns 0-15; warps 4-7 use 16-31
-//   PV:   all 8 warps — four 16-row groups, two output-column halves
-//         Each warp handles N_TILES_PER_WARP N-tiles
+//   QK^T: four 16-row groups, all 32 score columns in each warp
+//   PV:   four 16-row groups, all 128 output columns in each warp
 //
 // Shared memory:
 //   Q:   [64][HDIM_PAD] BF16
 //   K:   [2][32][HDIM_PAD] BF16  (double-buffered)
 //   V:   [32][HDIM_PAD] BF16
 //   P:   [64][40] BF16
-//   m/l: [64][2] FP32
 // ============================================================================
 
 #if HDIM <= 256
@@ -181,23 +178,19 @@ flash_prefill_paged(
     HalfT* smem_K_flat = smem_Q + BR * HDIM_PAD;
     HalfT* smem_V = smem_K_flat + 2 * BC * HDIM_PAD;
     HalfT* smem_P = smem_V + BC * HDIM_PAD;
-    float* smem_ml = reinterpret_cast<float*>(smem_P + BR * (BC + PAD_P));
     #define SMEM_K_PAGED(buf, idx) smem_K_flat[(buf) * BC * HDIM_PAD + (idx)]
 #else
     __shared__ HalfT smem_Q[BR * HDIM_PAD];
     __shared__ HalfT smem_K_arr[2][BC * HDIM_PAD];
     __shared__ HalfT smem_V[BC * HDIM_PAD];
     __shared__ HalfT smem_P[BR * (BC + PAD_P)];
-    __shared__ float smem_ml[BR * 2];
     #define SMEM_K_PAGED(buf, idx) smem_K_arr[buf][idx]
 #endif
 
     const unsigned int group_id = lane_id >> 2;
     const unsigned int tid_in_group = lane_id & 3;
-    const unsigned int qk_warp_m = (warp_id & 3) * 16;
-    const unsigned int qk_n_start = (warp_id >> 2) * 2;
-    const unsigned int pv_warp_m = (warp_id & 3) * 16;
-    const unsigned int pv_n_start = (warp_id >> 2) * N_TILES_PER_WARP;
+    const unsigned int qk_warp_m = warp_id * 16;
+    const unsigned int pv_warp_m = warp_id * 16;
     const unsigned int p_stride = BC + PAD_P;
 
     float acc_o[N_TILES_PER_WARP][4];
@@ -256,11 +249,11 @@ flash_prefill_paged(
         LOAD_KV_TILE_BF16(V_cache, V_direct, direct_current, q_seq_start, q_offset, block_table, smem_V, kv_start, kv_len, kv_head, tid, NUM_THREADS);
         FLASH_ASYNC_COMMIT();
 
-        // QK^T: eight warps, four M groups and two N halves
-        float acc_s[2][4];
+        // QK^T: one warp owns all four N tiles for its 16 query rows.
+        float acc_s[4][4];
         {
             #pragma unroll
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < 4; i++) {
                 acc_s[i][0] = 0.f; acc_s[i][1] = 0.f;
                 acc_s[i][2] = 0.f; acc_s[i][3] = 0.f;
             }
@@ -281,8 +274,8 @@ flash_prefill_paged(
                 unsigned int a3 = sQ32[ar1 * hdim_pad_u32 + aq_off + 4];
 
                 #pragma unroll
-                for (int nt = 0; nt < 2; nt++) {
-                    unsigned int nc = (qk_n_start + nt) * 8 + group_id;
+                for (int nt = 0; nt < 4; nt++) {
+                    unsigned int nc = nt * 8 + group_id;
                     unsigned int bk_off = tid_in_group + kb_u32;
                     unsigned int b0 = sK32[nc * hdim_pad_u32 + bk_off];
                     unsigned int b1 = sK32[nc * hdim_pad_u32 + bk_off + 4];
@@ -294,10 +287,10 @@ flash_prefill_paged(
             }
         }
 
-        // Scale, softcap, mask (all 8 warps, each on its 2 N-tiles)
+        // Scale, softcap, mask for this warp's 32 score columns.
         unsigned int row0 = qk_warp_m + group_id, row1 = row0 + 8;
         #pragma unroll
-        for (int nt = 0; nt < 2; nt++) {
+        for (int nt = 0; nt < 4; nt++) {
             acc_s[nt][0] *= inv_sqrt_d; acc_s[nt][1] *= inv_sqrt_d;
             acc_s[nt][2] *= inv_sqrt_d; acc_s[nt][3] *= inv_sqrt_d;
 
@@ -308,7 +301,7 @@ flash_prefill_paged(
                 acc_s[nt][3] = softcap * tanhf(acc_s[nt][3] / softcap);
             }
 
-            unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2, c1 = c0 + 1;
+            unsigned int c0 = nt * 8 + tid_in_group * 2, c1 = c0 + 1;
             unsigned int qr0 = q_offset + q_start + row0, qr1 = q_offset + q_start + row1;
 
             if (causal) {
@@ -329,30 +322,16 @@ flash_prefill_paged(
             if (row1 >= q_tile_len) { acc_s[nt][2] = -1e30f; acc_s[nt][3] = -1e30f; }
         }
 
-        // Partial row-max from this warp's 2 N-tiles
-        float rmax0 = fmaxf(fmaxf(acc_s[0][0], acc_s[0][1]), fmaxf(acc_s[1][0], acc_s[1][1]));
-        float rmax1 = fmaxf(fmaxf(acc_s[0][2], acc_s[0][3]), fmaxf(acc_s[1][2], acc_s[1][3]));
+        float rmax0 = -1e30f, rmax1 = -1e30f;
+        #pragma unroll
+        for (int nt = 0; nt < 4; nt++) {
+            rmax0 = fmaxf(rmax0, fmaxf(acc_s[nt][0], acc_s[nt][1]));
+            rmax1 = fmaxf(rmax1, fmaxf(acc_s[nt][2], acc_s[nt][3]));
+        }
         rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 1));
         rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xFFFFFFFF, rmax0, 2));
         rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 1));
         rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xFFFFFFFF, rmax1, 2));
-
-        // Cross-warp max: warps 0-3 and 4-7 share corresponding row groups
-        // smem_ml[row * 2 + half] where half = warp_id >> 2
-        if (tid_in_group == 0) {
-            smem_ml[row0 * 2 + (warp_id >> 2)] = rmax0;
-            smem_ml[row1 * 2 + (warp_id >> 2)] = rmax1;
-        }
-        __syncthreads();
-
-        // Combine full row max from both N-halves
-        {
-            unsigned int half = warp_id >> 2;
-            float other0 = smem_ml[row0 * 2 + (1 - half)];
-            float other1 = smem_ml[row1 * 2 + (1 - half)];
-            rmax0 = fmaxf(rmax0, other0);
-            rmax1 = fmaxf(rmax1, other1);
-        }
 
         // Online softmax rescale
         float mn0 = fmaxf(m_r0, rmax0);
@@ -370,34 +349,37 @@ flash_prefill_paged(
             m_r1 = mn1;
         }
 
-        // exp(s - max), write P to smem, partial l (all 8 warps)
-        float sum0 = 0.f, sum1 = 0.f;
+        // exp(s - max), write P to smem, and update the warp-local row sum.
+        // Retain the original two-half addition order. Each warp now owns
+        // both halves, but the BF16 context stays byte-identical.
+        float sum0_lo = 0.f, sum1_lo = 0.f;
+        float sum0_hi = 0.f, sum1_hi = 0.f;
         #pragma unroll
-        for (int nt = 0; nt < 2; nt++) {
+        for (int nt = 0; nt < 4; nt++) {
             float p00 = expf(acc_s[nt][0] - m_r0), p01 = expf(acc_s[nt][1] - m_r0);
             float p10 = expf(acc_s[nt][2] - m_r1), p11 = expf(acc_s[nt][3] - m_r1);
-            sum0 += p00 + p01; sum1 += p10 + p11;
-            unsigned int c0 = (qk_n_start + nt) * 8 + tid_in_group * 2;
+            if (nt < 2) {
+                sum0_lo += p00 + p01; sum1_lo += p10 + p11;
+            } else {
+                sum0_hi += p00 + p01; sum1_hi += p10 + p11;
+            }
+            unsigned int c0 = nt * 8 + tid_in_group * 2;
             smem_P[row0 * p_stride + c0]     = FLASH_FROM_FLOAT(p00);
             smem_P[row0 * p_stride + c0 + 1] = FLASH_FROM_FLOAT(p01);
             smem_P[row1 * p_stride + c0]     = FLASH_FROM_FLOAT(p10);
             smem_P[row1 * p_stride + c0 + 1] = FLASH_FROM_FLOAT(p11);
         }
-        sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 1);
-        sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, 2);
-        sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, 1);
-        sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, 2);
+        sum0_lo += __shfl_xor_sync(0xFFFFFFFF, sum0_lo, 1);
+        sum0_lo += __shfl_xor_sync(0xFFFFFFFF, sum0_lo, 2);
+        sum0_hi += __shfl_xor_sync(0xFFFFFFFF, sum0_hi, 1);
+        sum0_hi += __shfl_xor_sync(0xFFFFFFFF, sum0_hi, 2);
+        sum1_lo += __shfl_xor_sync(0xFFFFFFFF, sum1_lo, 1);
+        sum1_lo += __shfl_xor_sync(0xFFFFFFFF, sum1_lo, 2);
+        sum1_hi += __shfl_xor_sync(0xFFFFFFFF, sum1_hi, 1);
+        sum1_hi += __shfl_xor_sync(0xFFFFFFFF, sum1_hi, 2);
 
-        // Cross-warp l sum: accumulate partial sums from both N-halves
-        if (tid_in_group == 0) {
-            smem_ml[row0 * 2 + (warp_id >> 2)] = sum0;
-            smem_ml[row1 * 2 + (warp_id >> 2)] = sum1;
-        }
-        __syncthreads();
-        {
-            l_r0 += smem_ml[row0 * 2] + smem_ml[row0 * 2 + 1];
-            l_r1 += smem_ml[row1 * 2] + smem_ml[row1 * 2 + 1];
-        }
+        l_r0 += sum0_lo + sum0_hi;
+        l_r1 += sum1_lo + sum1_hi;
 
         // Wait for V
         FLASH_ASYNC_WAIT();
@@ -410,7 +392,7 @@ flash_prefill_paged(
             FLASH_ASYNC_COMMIT();
         }
 
-        // PV MMA (all 8 warps)
+        // PV MMA (one warp per 16-query-row group)
         {
             const unsigned int* sP32 = (const unsigned int*)smem_P;
             const unsigned short* sV = (const unsigned short*)smem_V;
@@ -425,7 +407,7 @@ flash_prefill_paged(
                 unsigned int a3 = sP32[ar1 * p_stride_u32 + pk_off + 4];
                 #pragma unroll
                 for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
-                    unsigned int nc = (pv_n_start + nt) * 8 + group_id;
+                    unsigned int nc = nt * 8 + group_id;
                     unsigned int k0 = ks * 16 + tid_in_group * 2, k1 = k0 + 8;
                     unsigned int b0 = ((unsigned int)sV[(k0 + 1) * HDIM_PAD + nc] << 16) |
                                       (unsigned int)sV[k0 * HDIM_PAD + nc];
@@ -453,7 +435,7 @@ flash_prefill_paged(
         HalfT* ob = O + q_head * head_dim;
         #pragma unroll
         for (int nt = 0; nt < N_TILES_PER_WARP; nt++) {
-            unsigned int c0 = (pv_n_start + nt) * 8 + tid_in_group * 2;
+            unsigned int c0 = nt * 8 + tid_in_group * 2;
             unsigned int gr0 = q_start + r0, gr1 = q_start + r1;
             if (gr0 < q_len && r0 < q_tile_len && c0 < head_dim) {
                 unsigned int lo = (unsigned int)FLASH_AS_USHORT(FLASH_FROM_FLOAT(acc_o[nt][0] * il0));
