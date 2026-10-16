@@ -511,3 +511,32 @@ run took 1,250.8 ms, against recent full-grid samples around 1,269–1,273 ms
 on the shared host. That is too little evidence to claim an end-to-end
 speedup. The new isolated trace is
 `/tmp/nemotron-ssd-triangular-isolated.nsys-rep`.
+
+## Four query heads per attention block
+
+`XINFER_NEMOTRON_ATTENTION_GQA_WARPS=1` is an opt-in layout for the custom
+SM121 BF16 prefill kernel. Each of its four warps handles 16 rows of a
+different query head; the four heads share one KV head and one staged K/V
+tile. The ordinary mode assigns the four warps to consecutive rows of one
+query head. The grouped mode retains each warp's QK, softmax, and PV order,
+and supports both contiguous current K/V and paged carried prefixes.
+
+The CUDA context test matched the ordinary kernel and the paged BF16 oracle
+byte for byte with 257 rows, a 13-token carried prefix, partial tiles, and
+two sequences. The same test matched at 2,048 and 9,538 rows. The real NVFP4
+30B single-call 9,538-token prefix, 16 continuation logits, and exported
+Mamba state matched the saved ordinary-mode bytes exactly.
+
+| Isolated attention fixture | Ordinary custom kernel | Grouped query warps |
+| --- | ---: | ---: |
+| 2,048 rows, six warmed wall samples | 1.011–1.017 ms | 0.982–0.984 ms |
+| 9,538 rows, six warmed wall samples | 22.70–23.21 ms | 22.34–22.81 ms |
+
+These are same-process calls including cache writes and synchronization.
+The real-model grouped run took 1,262.2 ms, whereas the preceding ordinary
+run took 1,250.8 ms on the shared host. There is no demonstrated whole-model
+gain. Grouping changes the query rows per block from 64 to 16 while reducing
+the query-head blocks by four, so the total block count and aggregate K/V
+loads are approximately unchanged. It mainly avoids masked work near the
+causal frontier. A larger per-head row tile or a different attention kernel
+is needed to address the measured 63–78 ms attention gap to vLLM.

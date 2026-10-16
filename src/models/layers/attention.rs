@@ -966,6 +966,8 @@ impl Attention {
                 self.num_kv_heads,
                 self.head_dim,
                 self.score_scale,
+                std::env::var_os("XINFER_NEMOTRON_ATTENTION_GQA_WARPS").as_deref()
+                    == Some(std::ffi::OsStr::new("1")),
             )?
         } else {
             None
