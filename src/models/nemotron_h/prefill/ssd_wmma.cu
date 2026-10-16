@@ -11,7 +11,6 @@ constexpr int CT = 128;
 constexpr int TILE = 16;
 constexpr int HD = 64;
 constexpr int SD = 128;
-constexpr int OUT_ROWS = 64;
 
 __global__ void cb_gemm(const float* conv, bf16* cb, int tokens, int heads,
                         int groups, int conv_dim) {
@@ -140,7 +139,7 @@ __global__ void transpose_starts(const float* starts, bf16* transposed,
       starts[(head_chunk * HD + dim) * SD + state]);
 }
 
-template<int REDUCTION_TILE, bool DIRECT_STARTS>
+template<int REDUCTION_TILE, bool DIRECT_STARTS, int OUT_ROWS>
 __global__ void ssd_output(const float* conv, const float* dt_decay,
                            const float* log_decay, const float* reset_at,
                            const bf16* cb,
@@ -153,9 +152,15 @@ __global__ void ssd_output(const float* conv, const float* dt_decay,
   const int group = head / (heads / groups);
   const int chunk_start = chunk * CT;
   const int inner = heads * HD;
-  __shared__ bf16 lhs[OUT_ROWS * REDUCTION_TILE];
-  __shared__ bf16 rhs[REDUCTION_TILE * HD];
-  __shared__ float main_out[OUT_ROWS * HD], state_out[OUT_ROWS * HD];
+  constexpr int STAGING_BYTES =
+      (OUT_ROWS * REDUCTION_TILE + REDUCTION_TILE * HD) * sizeof(bf16);
+  constexpr int RESULT_BYTES = OUT_ROWS * HD * sizeof(float);
+  constexpr int SHARED_BYTES = STAGING_BYTES > RESULT_BYTES
+      ? STAGING_BYTES : RESULT_BYTES;
+  __shared__ __align__(16) unsigned char scratch[SHARED_BYTES];
+  bf16* lhs = reinterpret_cast<bf16*>(scratch);
+  bf16* rhs = lhs + OUT_ROWS * REDUCTION_TILE;
+  float* result = reinterpret_cast<float*>(scratch);
   wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> main_acc;
   wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> state_acc;
   wmma::fill_fragment(main_acc, 0.0f);
@@ -238,23 +243,55 @@ __global__ void ssd_output(const float* conv, const float* dt_decay,
     }
     __syncthreads();
   }
-  wmma::store_matrix_sync(main_out + warp_row * TILE * HD + warp_col * TILE,
-                          main_acc, HD,
-                          wmma::mem_row_major);
-  wmma::store_matrix_sync(state_out + warp_row * TILE * HD + warp_col * TILE,
-                          state_acc, HD,
-                          wmma::mem_row_major);
+  // The two staging tiles are dead after the final MMA. Reuse their shared
+  // storage for one FP32 result at a time, retaining each thread's main
+  // values in registers while the state result is written.
   __syncthreads();
-  for (int j = threadIdx.x; j < OUT_ROWS * HD; j += blockDim.x) {
+  wmma::store_matrix_sync(result + warp_row * TILE * HD + warp_col * TILE,
+                          main_acc, HD, wmma::mem_row_major);
+  __syncthreads();
+  constexpr int VALUES_PER_THREAD = OUT_ROWS * HD / (OUT_ROWS / TILE * HD / TILE * 32);
+  float main_values[VALUES_PER_THREAD];
+  #pragma unroll
+  for (int value = 0; value < VALUES_PER_THREAD; ++value) {
+    const int j = int(threadIdx.x) + value * int(blockDim.x);
+    main_values[value] = result[j];
+  }
+  __syncthreads();
+  wmma::store_matrix_sync(result + warp_row * TILE * HD + warp_col * TILE,
+                          state_acc, HD, wmma::mem_row_major);
+  __syncthreads();
+  #pragma unroll
+  for (int value = 0; value < VALUES_PER_THREAD; ++value) {
+    const int j = int(threadIdx.x) + value * int(blockDim.x);
     const int t = chunk_start + tile * OUT_ROWS + j / HD;
     const int dim = j % HD;
     if (t < tokens) {
       const float x = conv[t * conv_dim + head * HD + dim];
       const float initial = reset_at[t * heads + head] < 0.0f
-          ? expf(log_decay[t * heads + head]) * state_out[j] : 0.0f;
-      y[t * inner + head * HD + dim] = main_out[j] + initial + x * d[head];
+          ? expf(log_decay[t * heads + head]) * result[j] : 0.0f;
+      y[t * inner + head * HD + dim] = main_values[value] + initial + x * d[head];
     }
   }
+}
+
+template<int REDUCTION_TILE, bool DIRECT_STARTS>
+void launch_ssd_output(const float* conv, const float* dt_decay,
+                       const float* log_decay, const float* reset_at,
+                       const bf16* cb, const bf16* transposed,
+                       const float* starts, const float* d, float* y,
+                       int tokens, int heads, int groups, int conv_dim,
+                       int output_rows, int chunks, cudaStream_t stream) {
+  if (output_rows == 128)
+    ssd_output<REDUCTION_TILE, DIRECT_STARTS, 128>
+        <<<dim3(heads, chunks, CT / 128), 1024, 0, stream>>>(
+            conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
+            d, y, tokens, heads, groups, conv_dim);
+  else
+    ssd_output<REDUCTION_TILE, DIRECT_STARTS, 64>
+        <<<dim3(heads, chunks, CT / 64), 512, 0, stream>>>(
+            conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
+            d, y, tokens, heads, groups, conv_dim);
 }
 
 extern "C" int xinfer_nemotron_ssd_wmma(
@@ -262,11 +299,12 @@ extern "C" int xinfer_nemotron_ssd_wmma(
     const float* d, float* y, void* cb_raw, float* log_decay,
     float* reset_at, void* transposed_raw,
     int tokens, int heads, int groups, int conv_dim, int cb64, int k64,
-    int direct_starts,
+    int direct_starts, int output_rows,
     long long stream_raw) {
   if (heads != 64 || groups != 8 || tokens <= 0 ||
       (cb64 != 0 && cb64 != 1) || (k64 != 0 && k64 != 1) ||
       (direct_starts != 0 && direct_starts != 1) ||
+      (output_rows != 64 && output_rows != 128) ||
       (!direct_starts && transposed_raw == nullptr))
     return cudaErrorInvalidValue;
   const int chunks = (tokens + CT - 1) / CT;
@@ -289,22 +327,21 @@ extern "C" int xinfer_nemotron_ssd_wmma(
   if (!direct_starts)
     transpose_starts<<<(chunks * heads * SD * HD + 255) / 256, 256, 0, stream>>>(
         starts, transposed, chunks, heads);
-  const dim3 output_grid(heads, chunks, CT / OUT_ROWS);
   if (k64 && direct_starts)
-    ssd_output<64, true><<<output_grid, 512, 0, stream>>>(
+    launch_ssd_output<64, true>(
         conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
-        d, y, tokens, heads, groups, conv_dim);
+        d, y, tokens, heads, groups, conv_dim, output_rows, chunks, stream);
   else if (k64)
-    ssd_output<64, false><<<output_grid, 512, 0, stream>>>(
+    launch_ssd_output<64, false>(
         conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
-        d, y, tokens, heads, groups, conv_dim);
+        d, y, tokens, heads, groups, conv_dim, output_rows, chunks, stream);
   else if (direct_starts)
-    ssd_output<16, true><<<output_grid, 512, 0, stream>>>(
+    launch_ssd_output<16, true>(
         conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
-        d, y, tokens, heads, groups, conv_dim);
+        d, y, tokens, heads, groups, conv_dim, output_rows, chunks, stream);
   else
-    ssd_output<16, false><<<output_grid, 512, 0, stream>>>(
+    launch_ssd_output<16, false>(
         conv, dt_decay, log_decay, reset_at, cb, transposed, starts,
-        d, y, tokens, heads, groups, conv_dim);
+        d, y, tokens, heads, groups, conv_dim, output_rows, chunks, stream);
   return static_cast<int>(cudaPeekAtLastError());
 }
