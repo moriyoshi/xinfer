@@ -461,3 +461,28 @@ summary, **104 ms** in SSD output, **43 ms** in chunk prefix, and **28 ms** in
 C×B. The next useful implementation should change how chunk state and output
 are formed or reused, with a matched numerical and continued-prefill check;
 simple warp, tile, and exponential substitutions have not closed the gap.
+
+## C×B shared-scratch reuse
+
+The opt-in SM121 WMMA C×B kernel now overwrites its dead BF16 input staging
+tiles with the FP32 result after the final MMA. Its final loop barrier already
+protects that reuse. For the usual K64 setting, static shared storage falls
+from 32 KiB to 16 KiB per block; the ordered WMMA operations and BF16 output
+rounding are unchanged. The one-warp C×B fallback and the model's other paths
+are unchanged.
+
+The focused CUDA SSD test matched every C×B BF16 word and FP32 output word
+with nonzero carried state, zero decay, and a partial chunk. On the real 30B
+checkpoint, all saved 9,538-token prefix and 16 continuation logits and the
+entire exported Mamba state matched the prior kernel byte for byte. In
+separate isolated 257-token Nsight captures, comparable warmed K64 C×B
+launches fell from roughly 0.022 to 0.020 ms. These short captures suggest
+a small kernel gain, not a measured whole-prefill speedup.
+
+The two new real-checkpoint wall samples were 1,581 and 1,400 ms versus
+recent 1,269–1,273 ms controls. They coincided with unstable host loading
+(23 and 66 seconds) and one decode p50 rising to 35 ms from about 25 ms;
+the 66-second load occurred as host available memory and free swap fell.
+These samples cannot isolate the roughly millisecond-scale C×B improvement.
+The next substantial gap reduction still requires a different SSD
+summary/output or attention-kernel implementation.

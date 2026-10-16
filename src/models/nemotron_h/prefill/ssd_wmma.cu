@@ -67,8 +67,14 @@ __global__ void cb_gemm64(const float* conv, bf16* cb, int tokens,
   const int warp_n = warp % 4;
   const int start = chunk * CT;
   const int inner = heads * HD;
-  __shared__ bf16 a[64 * REDUCTION_TILE], b[REDUCTION_TILE * 64];
-  __shared__ float result[64 * 64];
+  constexpr int STAGING_BYTES = 2 * 64 * REDUCTION_TILE * sizeof(bf16);
+  constexpr int RESULT_BYTES = 64 * 64 * sizeof(float);
+  constexpr int SHARED_BYTES = STAGING_BYTES > RESULT_BYTES
+      ? STAGING_BYTES : RESULT_BYTES;
+  __shared__ __align__(16) unsigned char scratch[SHARED_BYTES];
+  bf16* a = reinterpret_cast<bf16*>(scratch);
+  bf16* b = a + 64 * REDUCTION_TILE;
+  float* result = reinterpret_cast<float*>(scratch);
   wmma::fragment<wmma::accumulator, TILE, TILE, TILE, float> acc;
   wmma::fill_fragment(acc, 0.0f);
   for (int sk = 0; sk < SD; sk += REDUCTION_TILE) {
@@ -99,6 +105,8 @@ __global__ void cb_gemm64(const float* conv, bf16* cb, int tokens,
     }
     __syncthreads();
   }
+  // The loop's final barrier makes the staging tiles dead before the result
+  // overwrites the same shared storage.
   wmma::store_matrix_sync(result + warp_m * TILE * 64 + warp_n * TILE,
                           acc, 64, wmma::mem_row_major);
   __syncthreads();
