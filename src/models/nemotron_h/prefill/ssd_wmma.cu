@@ -60,8 +60,11 @@ __global__ void cb_gemm64(const float* conv, bf16* cb, int tokens,
                           int heads, int groups, int conv_dim) {
   const int group = blockIdx.x;
   const int chunk = blockIdx.y;
-  const int tile_m = blockIdx.z / 2;
-  const int tile_n = blockIdx.z % 2;
+  // Only the lower triangle is consumed by ssd_output (i <= t). The
+  // upper-right 64x64 tile is entirely future-token products, so do not
+  // launch a block for it. z maps to (0,0), (1,0), (1,1).
+  const int tile_m = blockIdx.z == 0 ? 0 : 1;
+  const int tile_n = blockIdx.z == 2 ? 1 : 0;
   const int warp = threadIdx.x / 32;
   const int warp_m = warp / 4;
   const int warp_n = warp % 4;
@@ -323,10 +326,10 @@ extern "C" int xinfer_nemotron_ssd_wmma(
   auto transposed = static_cast<bf16*>(transposed_raw);
   if (cb64) {
     if (k64)
-      cb_gemm64<64><<<dim3(groups, chunks, 4), 512, 0, stream>>>(
+      cb_gemm64<64><<<dim3(groups, chunks, 3), 512, 0, stream>>>(
           conv, cb, tokens, heads, groups, conv_dim);
     else
-      cb_gemm64<16><<<dim3(groups, chunks, 4), 512, 0, stream>>>(
+      cb_gemm64<16><<<dim3(groups, chunks, 3), 512, 0, stream>>>(
           conv, cb, tokens, heads, groups, conv_dim);
   } else {
     cb_gemm<<<dim3(groups, chunks, 64), 32, 0, stream>>>(
