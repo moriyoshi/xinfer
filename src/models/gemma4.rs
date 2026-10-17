@@ -28,6 +28,20 @@ struct Gemma4Router {
     eps: f64,
 }
 
+enum PerLayerModelProjection {
+    Dense(Linear),
+    Quantized(ReplicatedLinear),
+}
+
+impl Module for PerLayerModelProjection {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(linear) => linear.forward(xs),
+            Self::Quantized(linear) => linear.forward(xs),
+        }
+    }
+}
+
 impl Gemma4Router {
     fn new(
         hidden_size: usize,
@@ -622,7 +636,7 @@ impl Gemma4DecoderLayer {
 pub struct Gemma4ForCausalLM {
     embed_tokens: candle_nn::Embedding,
     embed_tokens_per_layer: Option<candle_nn::Embedding>,
-    per_layer_model_projection: Option<Linear>,
+    per_layer_model_projection: Option<PerLayerModelProjection>,
     per_layer_projection_norm: Option<NormX>,
     layers: Vec<Gemma4DecoderLayer>,
     norm: NormX,
@@ -849,38 +863,55 @@ impl Gemma4ForCausalLM {
                 )?;
 
                 let proj_vb = vb.pp(&format!("{}.per_layer_model_projection", lm_prefix));
-                let proj_linear = match &proj_vb.0 {
-                    Either::Left(pvb) => {
-                        use candle_nn::var_builder::Shard;
-                        let w = pvb.get_with_hints(
-                            (total_dim, config.hidden_size),
-                            "weight",
-                            Shard::default(),
-                        )?;
-                        let w_f32 = w.to_dtype(DType::F32)?;
-                        let w = if let Ok(scale) = pvb
-                            .get_with_hints((total_dim, 1), "weight_scale", Shard::default())
-                            .or_else(|_| {
-                                pvb.get_with_hints(
-                                    (total_dim, 1),
-                                    "weight_scale_inv",
-                                    Shard::default(),
-                                )
-                            }) {
-                            let scale = scale.to_dtype(DType::F32)?;
-                            w_f32.broadcast_mul(&scale)?.to_dtype(dtype)?
-                        } else {
-                            w_f32.to_dtype(dtype)?
-                        };
-                        Linear::new(w, None)
-                    }
-                    Either::Right(pvb) => {
-                        let w = pvb
-                            .get((total_dim, config.hidden_size), "weight")?
-                            .dequantize(pvb.device())?
-                            .to_dtype(dtype)?;
-                        Linear::new(w, None)
-                    }
+                let native_nvfp4 = config
+                    .quantization_config
+                    .as_ref()
+                    .is_some_and(|quant| quant.quant_method == "nvfp4")
+                    && (proj_vb.has_key("weight_scale_2")
+                        || proj_vb.has_key("weight_global_scale"));
+                let proj_linear = if native_nvfp4 {
+                    PerLayerModelProjection::Quantized(ReplicatedLinear::load_no_bias(
+                        config.hidden_size,
+                        total_dim,
+                        proj_vb,
+                        &config.quantization_config,
+                        &None,
+                        dtype,
+                    )?)
+                } else {
+                    PerLayerModelProjection::Dense(match &proj_vb.0 {
+                        Either::Left(pvb) => {
+                            use candle_nn::var_builder::Shard;
+                            let w = pvb.get_with_hints(
+                                (total_dim, config.hidden_size),
+                                "weight",
+                                Shard::default(),
+                            )?;
+                            let w_f32 = w.to_dtype(DType::F32)?;
+                            let w = if let Ok(scale) = pvb
+                                .get_with_hints((total_dim, 1), "weight_scale", Shard::default())
+                                .or_else(|_| {
+                                    pvb.get_with_hints(
+                                        (total_dim, 1),
+                                        "weight_scale_inv",
+                                        Shard::default(),
+                                    )
+                                }) {
+                                let scale = scale.to_dtype(DType::F32)?;
+                                w_f32.broadcast_mul(&scale)?.to_dtype(dtype)?
+                            } else {
+                                w_f32.to_dtype(dtype)?
+                            };
+                            Linear::new(w, None)
+                        }
+                        Either::Right(pvb) => {
+                            let w = pvb
+                                .get((total_dim, config.hidden_size), "weight")?
+                                .dequantize(pvb.device())?
+                                .to_dtype(dtype)?;
+                            Linear::new(w, None)
+                        }
+                    })
                 };
 
                 let norm = rms_norm(
@@ -1132,6 +1163,8 @@ impl Gemma4ForCausalLM {
         input_metadata: &InputMetadata,
         return_hidden: bool,
     ) -> Result<Tensor> {
+        let _linear_prefill =
+            crate::models::layers::linear::set_linear_is_prefill(input_metadata.is_prefill);
         #[cfg(feature = "cuda")]
         let _gemv_guard = crate::models::layers::gemma4_gemv::activate(
             !input_metadata.is_prefill && self.fast_bf16_gemv,
