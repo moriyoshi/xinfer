@@ -290,6 +290,8 @@ fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
     let expected_greedy: Vec<u32> = serde_json::from_value(reference_json["greedy"].clone())?;
     let mut next = argmax(&full) as u32;
     let mut greedy = Vec::new();
+    #[cfg(feature = "nvtx")]
+    nvtx::range_push!("gemma4_greedy_decode");
     let decode_started = Instant::now();
     for (step, &_expected) in expected_greedy.iter().enumerate() {
         greedy.push(next);
@@ -306,6 +308,8 @@ fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
         "gemma4_greedy_decode_ms_per_token={:.3}",
         decode_started.elapsed().as_secs_f64() * 1000.0 / expected_greedy.len() as f64
     );
+    #[cfg(feature = "nvtx")]
+    nvtx::range_pop!();
     let greedy_matches = greedy
         .iter()
         .zip(&expected_greedy)
@@ -378,6 +382,8 @@ fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
     if std::env::var_os("XINFER_GEMMA4_BENCH_LONG_DECODE").is_some() {
         let mut next = argmax(&long_full) as u32;
         let mut generated = Vec::new();
+        #[cfg(feature = "nvtx")]
+        nvtx::range_push!("gemma4_long_decode");
         let started = Instant::now();
         for step in 0..64 {
             generated.push(next);
@@ -394,6 +400,8 @@ fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
             "gemma4_long_decode_ms_per_token={:.3} tokens={generated:?}",
             started.elapsed().as_secs_f64() * 1000.0 / generated.len() as f64
         );
+        #[cfg(feature = "nvtx")]
+        nvtx::range_pop!();
     }
     Ok(())
 }
