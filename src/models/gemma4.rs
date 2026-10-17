@@ -19,6 +19,23 @@ use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
 
+fn default_cuda_nvfp4_fusions(config: &Config, dtype: DType, device: &Device) -> bool {
+    dtype == DType::BF16
+        && device.is_cuda()
+        && config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|quant| quant.quant_method == "nvfp4")
+}
+
+fn gemma4_fusion_setting(value: Option<&std::ffi::OsStr>, default_enabled: bool) -> bool {
+    value.map_or(default_enabled, |value| value == std::ffi::OsStr::new("1"))
+}
+
+fn gemma4_fusion_enabled(name: &str, default_enabled: bool) -> bool {
+    gemma4_fusion_setting(std::env::var_os(name).as_deref(), default_enabled)
+}
+
 fn gemma4_norm_forward(norm: &NormX, xs: &Tensor, fused: bool) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if fused {
@@ -240,6 +257,9 @@ impl Gemma4DecoderLayer {
         hidden_size_per_layer_input: Option<usize>,
     ) -> Result<Self> {
         let is_qvar_builder = vb.is_qvar_builder();
+        let default_fusions = default_cuda_nvfp4_fusions(config, dtype, &vb.device());
+        let fused_gelu = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_GELU", default_fusions);
+        let fused_rms_norm = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_RMSNORM", default_fusions);
 
         let sliding_window = if is_sliding {
             config.sliding_window
@@ -347,10 +367,7 @@ impl Gemma4DecoderLayer {
             dtype,
             "",
         )?
-        .with_gemma4_fused_gelu(
-            std::env::var_os("XINFER_GEMMA4_FUSED_GELU").as_deref()
-                == Some(std::ffi::OsStr::new("1")),
-        );
+        .with_gemma4_fused_gelu(fused_gelu);
 
         let moe_cfg_ref = config.moe_cfg.as_ref();
         let (moe, gemma4_router) = if enable_moe && moe_cfg_ref.is_some() {
@@ -531,8 +548,7 @@ impl Gemma4DecoderLayer {
             self_attn,
             mlp,
             moe,
-            fused_rms_norm: std::env::var_os("XINFER_GEMMA4_FUSED_RMSNORM").as_deref()
-                == Some(std::ffi::OsStr::new("1")),
+            fused_rms_norm,
             input_layernorm,
             post_attention_layernorm,
             pre_feedforward_layernorm,
@@ -1162,21 +1178,13 @@ impl Gemma4ForCausalLM {
             crate::models::layers::gemma4_gemv::prepare(device)?;
         }
 
+        let default_fusions = default_cuda_nvfp4_fusions(config, dtype, device);
         #[cfg(feature = "cuda")]
-        if dtype == DType::BF16
-            && device.is_cuda()
-            && config
-                .quantization_config
-                .as_ref()
-                .is_some_and(|quant| quant.quant_method == "nvfp4")
-            && std::env::var_os("XINFER_GEMMA4_FUSED_GELU").as_deref()
-                == Some(std::ffi::OsStr::new("1"))
-        {
+        if default_fusions && gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_GELU", default_fusions) {
             crate::models::layers::gemma4_gated_gelu::prepare(device)?;
         }
 
-        let fused_rms_norm = std::env::var_os("XINFER_GEMMA4_FUSED_RMSNORM").as_deref()
-            == Some(std::ffi::OsStr::new("1"));
+        let fused_rms_norm = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_RMSNORM", default_fusions);
         #[cfg(feature = "cuda")]
         if fused_rms_norm && dtype == DType::BF16 && device.is_cuda() {
             crate::models::layers::gemma4_rms_norm::prepare(device)?;
@@ -1410,7 +1418,17 @@ impl Gemma4ForCausalLM {
 
 #[cfg(test)]
 mod tests {
-    use super::kv_source_layers;
+    use super::{gemma4_fusion_setting, kv_source_layers};
+
+    #[test]
+    fn fusion_defaults_and_explicit_overrides() {
+        let disabled = std::ffi::OsStr::new("0");
+        let enabled = std::ffi::OsStr::new("1");
+        assert!(gemma4_fusion_setting(None, true));
+        assert!(!gemma4_fusion_setting(None, false));
+        assert!(!gemma4_fusion_setting(Some(disabled), true));
+        assert!(gemma4_fusion_setting(Some(enabled), false));
+    }
 
     #[test]
     fn shared_kv_uses_last_nonshared_layer_of_same_type() -> candle_core::Result<()> {
