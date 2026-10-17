@@ -32,6 +32,19 @@ One further vLLM sweep used `enforce_eager=True` with the same weights, BF16 KV,
 
 These are three-sample medians. vLLM's normal compiled/graph mode is therefore material to its decode advantage here. The main table compares the production-like default mode, while the eager control shows why direct model calls should not be equated to an uncompiled vLLM path.
 
+## Xinfer CUDA profile and opt-in GEMV follow-up
+
+An isolated Nsight Systems trace of the same Xinfer real-checkpoint test used `nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none`. The large vocabulary-projection GEMV marks the end of each forward, allowing the three 2,048-token and three 8,192-token prefill intervals to be separated from decode. The figures below are from one representative interval per size; profiling adds overhead, so compare the kernel components within the trace rather than treating its wall time as a new unprofiled benchmark.
+
+| Xinfer prefill | Wall interval | GPU kernel time | Attention | FP4 CUTLASS GEMM | RMS norms | BF16 copies and casts | Other kernels and idle |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 tokens | 464 ms | 413 ms | 30 ms | 70 ms | 50 ms | 146 ms | 168 ms |
+| 8,192 tokens | 2,157 ms | 1,944 ms | 313 ms | 278 ms | 230 ms | 601 ms | 735 ms |
+
+The copy-and-cast column includes `ucopy_bf16`, `cast_bf16_f32`, and `cast_f32_bf16`; it is 227.7 + 193.9 + 179.4 ms at 8,192 tokens. The remaining GPU work there includes BF16 multiply (156 ms), add (92 ms), GELU (89 ms), activation quantization (106 ms), and RoPE (41 ms). These components are additive kernel durations, not exclusive attribution to specific source lines. The 42-layer model has seven full-attention and 35 sliding-attention layers, matching the 7 + 35 prefill attention launches. Attention is material but cannot alone explain the approximately 1.29-second first-token difference from vLLM at 8,192 tokens. The trace establishes Xinfer's costs; a corresponding vLLM GPU trace is still needed to assign its speedup to particular fusions or kernels.
+
+In the full Xinfer trace, a cuBLAS BF16 GEMV ran 443 times at a median 8.62 ms and consumed 18.8% of recorded GPU kernel time. There are 432 measured decode steps; this shape is consistent with the tied 262,144-row vocabulary head. The existing `XINFER_GEMMA4_BF16_GEMV=1` option replaces eligible decode GEMVs with Xinfer's row-parallel kernel. On the same NVFP4 checkpoint, an additional isolated three-sample run measured decode medians of 32.12, 34.84, and 37.12 ms per step at 40, 2,048, and 8,192 tokens. The original default-mode six-sample medians were 36.00, 38.64, and 40.96 ms. The opt-in mode closes about 4 ms of decode time but remains slower than default vLLM's 23.81, 24.50, and 25.44 ms. The first-token choice stayed 818; this run did not establish full continuation parity across GEMV modes, and BF16 accumulation order differs.
+
 ## Reproduction
 
 `tests/prepare_gemma4_vllm_bench.py` builds the exact token streams and a two-file BF16-KV metadata overlay from the checkpoint and the 40-token reference. It leaves the weight shards untouched; the symlinks in the overlay resolve when the original checkpoint is mounted at `/weights` in Docker. Xinfer's opt-in test is `bench_real_e4b_nvfp4_single_sequence` in `tests/gemma4_shared_kv.rs`.
