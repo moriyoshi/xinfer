@@ -171,6 +171,69 @@ fn load_model(dir: &Path, device: &Device) -> Result<(Gemma4ForCausalLM, Config)
 }
 
 #[test]
+#[ignore = "requires a real NVFP4 checkpoint and an idle CUDA GPU"]
+fn bench_real_e4b_nvfp4_single_sequence() -> Result<()> {
+    let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
+        .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
+    let bench_dir =
+        std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
+    let device = Device::new_cuda(0)?;
+    let (model, config) = load_model(Path::new(&model_dir), &device)?;
+    ensure!(
+        config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|quant| quant.quant_method == "nvfp4"),
+        "expected an NVFP4 checkpoint"
+    );
+    let sizes = [40usize, 2048, 8192];
+    let mut prompts = Vec::new();
+    for size in sizes {
+        let path = Path::new(&bench_dir).join(format!("tokens-{size}.json"));
+        let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(tokens.len() == size, "wrong token count for {size}");
+        prompts.push(tokens);
+    }
+    let warm_cache = cache(&config, 64, true, &device)?;
+    let warm = forward(&model, &device, &warm_cache, &prompts[0], 0, true)?;
+    forward(
+        &model,
+        &device,
+        &warm_cache,
+        &[argmax(&warm) as u32],
+        prompts[0].len(),
+        false,
+    )?;
+    drop(warm_cache);
+
+    for tokens in prompts {
+        for sample in 0..3 {
+            let kv = cache(&config, tokens.len() + 64, true, &device)?;
+            let started = Instant::now();
+            let logits = forward(&model, &device, &kv, &tokens, 0, true)?;
+            let prefill_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let first_token = argmax(&logits);
+            let mut next = first_token as u32;
+            let started = Instant::now();
+            for step in 0..48 {
+                let logits = forward(&model, &device, &kv, &[next], tokens.len() + step, false)?;
+                next = argmax(&logits) as u32;
+            }
+            let decode_ms_per_step = started.elapsed().as_secs_f64() * 1000.0 / 48.0;
+            eprintln!(
+                "gemma4_nvfp4_bench tokens={} sample={} prefill_ms={:.3} decode_ms_per_step={:.3} first_token={}",
+                tokens.len(),
+                sample,
+                prefill_ms,
+                decode_ms_per_step,
+                first_token
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn real_e4b_nvfp4_load_prefill_and_continuation() -> Result<()> {
     let Some(quant_dir) = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT") else {
         return Ok(());
