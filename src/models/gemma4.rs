@@ -19,6 +19,35 @@ use parking_lot::RwLock;
 use std::rc::Rc;
 use std::sync::Arc;
 
+fn gemma4_norm_forward(norm: &NormX, xs: &Tensor, fused: bool) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if fused {
+        if let Some((weight, eps)) = norm.f32_rms_weight_eps() {
+            if let Some(output) = crate::models::layers::gemma4_rms_norm::forward(xs, &weight, eps)?
+            {
+                return Ok(output);
+            }
+        }
+    }
+    let _ = fused;
+    norm.forward(xs)
+}
+
+fn gemma4_norm_add(norm: &NormX, xs: &Tensor, residual: &Tensor, fused: bool) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if fused {
+        if let Some((weight, eps)) = norm.f32_rms_weight_eps() {
+            if let Some(output) =
+                crate::models::layers::gemma4_rms_norm::forward_add(xs, &weight, residual, eps)?
+            {
+                return Ok(output);
+            }
+        }
+    }
+    let _ = fused;
+    norm.forward(xs)? + residual
+}
+
 struct Gemma4Router {
     scale: Tensor,
     proj: candle_nn::Linear,
@@ -173,6 +202,7 @@ pub struct Gemma4DecoderLayer {
     mlp: MLP,
     moe: Option<Gemma4MoE>,
     gemma4_router: Option<Gemma4Router>,
+    fused_rms_norm: bool,
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
     pre_feedforward_layernorm: NormX,
@@ -316,7 +346,11 @@ impl Gemma4DecoderLayer {
             false,
             dtype,
             "",
-        )?;
+        )?
+        .with_gemma4_fused_gelu(
+            std::env::var_os("XINFER_GEMMA4_FUSED_GELU").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
+        );
 
         let moe_cfg_ref = config.moe_cfg.as_ref();
         let (moe, gemma4_router) = if enable_moe && moe_cfg_ref.is_some() {
@@ -497,6 +531,8 @@ impl Gemma4DecoderLayer {
             self_attn,
             mlp,
             moe,
+            fused_rms_norm: std::env::var_os("XINFER_GEMMA4_FUSED_RMSNORM").as_deref()
+                == Some(std::ffi::OsStr::new("1")),
             input_layernorm,
             post_attention_layernorm,
             pre_feedforward_layernorm,
@@ -531,7 +567,7 @@ impl Gemma4DecoderLayer {
         let xs = xs.clone();
 
         let residual = xs.clone();
-        let normed = self.input_layernorm.forward(&xs)?;
+        let normed = gemma4_norm_forward(&self.input_layernorm, &xs, self.fused_rms_norm)?;
 
         let mask = if self.is_sliding {
             sliding_mask
@@ -560,30 +596,66 @@ impl Gemma4DecoderLayer {
             self.self_attn
                 .forward(&normed, &Some(rope), mask, positions, cache, input_metadata)?
         };
-        let mut xs = self.post_attention_layernorm.forward(&attn_output)?;
-        xs = (xs + &residual)?;
+        let fused_post_pre = if self.fused_rms_norm {
+            #[cfg(feature = "cuda")]
+            {
+                match (
+                    self.post_attention_layernorm.f32_rms_weight_eps(),
+                    self.pre_feedforward_layernorm.f32_rms_weight_eps(),
+                ) {
+                    (Some((post_weight, post_eps)), Some((pre_weight, pre_eps))) => {
+                        crate::models::layers::gemma4_rms_norm::post_attention_pre_feedforward(
+                            &attn_output,
+                            &residual,
+                            &post_weight,
+                            &pre_weight,
+                            post_eps,
+                            pre_eps,
+                        )?
+                    }
+                    _ => None,
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                None
+            }
+        } else {
+            None
+        };
+        let (xs, mlp_input) = if let Some(pair) = fused_post_pre {
+            pair
+        } else {
+            let xs = gemma4_norm_add(
+                &self.post_attention_layernorm,
+                &attn_output,
+                &residual,
+                self.fused_rms_norm,
+            )?;
+            let mlp_input =
+                gemma4_norm_forward(&self.pre_feedforward_layernorm, &xs, self.fused_rms_norm)?;
+            (xs, mlp_input)
+        };
 
         let residual = xs.clone();
-
-        let mlp_input = self.pre_feedforward_layernorm.forward(&xs)?;
         let mlp_output = self.mlp.forward(&mlp_input)?;
 
         let combined = if let Some(moe) = &self.moe {
-            let mlp_normed = self
-                .post_feedforward_layernorm_1
-                .as_ref()
-                .unwrap()
-                .forward(&mlp_output)?;
+            let mlp_normed = gemma4_norm_forward(
+                self.post_feedforward_layernorm_1.as_ref().unwrap(),
+                &mlp_output,
+                self.fused_rms_norm,
+            )?;
 
             let residual_flat = residual.flatten(0, residual.rank() - 2)?;
 
             let moe_output = if let Some(router) = &self.gemma4_router {
                 let (topk_weights, topk_ids) = router.forward(&residual_flat)?;
-                let moe_input = self
-                    .pre_feedforward_layernorm_2
-                    .as_ref()
-                    .unwrap()
-                    .forward(&residual_flat)?;
+                let moe_input = gemma4_norm_forward(
+                    self.pre_feedforward_layernorm_2.as_ref().unwrap(),
+                    &residual_flat,
+                    self.fused_rms_norm,
+                )?;
                 moe.forward_with_routing(
                     &moe_input,
                     topk_weights,
@@ -591,28 +663,32 @@ impl Gemma4DecoderLayer {
                     input_metadata.moe_is_prefill(),
                 )?
             } else {
-                let moe_input = self
-                    .pre_feedforward_layernorm_2
-                    .as_ref()
-                    .unwrap()
-                    .forward(&residual_flat)?;
+                let moe_input = gemma4_norm_forward(
+                    self.pre_feedforward_layernorm_2.as_ref().unwrap(),
+                    &residual_flat,
+                    self.fused_rms_norm,
+                )?;
                 moe.forward(&moe_input, input_metadata.moe_is_prefill())?
             };
             let moe_output = moe_output.reshape(residual.shape())?;
 
-            let moe_normed = self
-                .post_feedforward_layernorm_2
-                .as_ref()
-                .unwrap()
-                .forward(&moe_output)?;
+            let moe_normed = gemma4_norm_forward(
+                self.post_feedforward_layernorm_2.as_ref().unwrap(),
+                &moe_output,
+                self.fused_rms_norm,
+            )?;
 
             (mlp_normed + moe_normed)?
         } else {
             mlp_output
         };
 
-        let combined = self.post_feedforward_layernorm.forward(&combined)?;
-        let mut xs = (&residual + combined)?;
+        let mut xs = gemma4_norm_add(
+            &self.post_feedforward_layernorm,
+            &combined,
+            &residual,
+            self.fused_rms_norm,
+        )?;
 
         if let (Some(gate), Some(proj), Some(norm), Some(pli)) = (
             &self.per_layer_input_gate,
@@ -626,7 +702,7 @@ impl Gemma4DecoderLayer {
                 .apply(&candle_nn::Activation::GeluPytorchTanh)?;
             let gated = (gated * pli)?;
             let projected = proj.forward(&gated)?;
-            xs = (&residual_ple + norm.forward(&projected)?)?;
+            xs = gemma4_norm_add(norm, &projected, &residual_ple, self.fused_rms_norm)?;
         }
 
         xs.broadcast_mul(&self.layer_scalar.to_dtype(xs.dtype())?)
@@ -652,6 +728,7 @@ pub struct Gemma4ForCausalLM {
     hidden_size_per_layer_input: Option<usize>,
     num_hidden_layers: usize,
     first_kv_shared_layer: usize,
+    fused_rms_norm: bool,
     kv_source_layers: Vec<usize>,
     #[cfg(feature = "cuda")]
     fast_bf16_gemv: bool,
@@ -1085,6 +1162,26 @@ impl Gemma4ForCausalLM {
             crate::models::layers::gemma4_gemv::prepare(device)?;
         }
 
+        #[cfg(feature = "cuda")]
+        if dtype == DType::BF16
+            && device.is_cuda()
+            && config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|quant| quant.quant_method == "nvfp4")
+            && std::env::var_os("XINFER_GEMMA4_FUSED_GELU").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+        {
+            crate::models::layers::gemma4_gated_gelu::prepare(device)?;
+        }
+
+        let fused_rms_norm = std::env::var_os("XINFER_GEMMA4_FUSED_RMSNORM").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        #[cfg(feature = "cuda")]
+        if fused_rms_norm && dtype == DType::BF16 && device.is_cuda() {
+            crate::models::layers::gemma4_rms_norm::prepare(device)?;
+        }
+
         Ok(Self {
             embed_tokens,
             embed_tokens_per_layer,
@@ -1103,6 +1200,7 @@ impl Gemma4ForCausalLM {
             hidden_size_per_layer_input,
             num_hidden_layers: config.num_hidden_layers,
             first_kv_shared_layer,
+            fused_rms_norm,
             kv_source_layers,
             #[cfg(feature = "cuda")]
             fast_bf16_gemv,
@@ -1143,7 +1241,7 @@ impl Gemma4ForCausalLM {
 
         let seq_len = input_ids.dim(0)?;
         let projected = projected.reshape((seq_len, self.num_hidden_layers, pli_dim))?;
-        let projected = norm.forward(&projected)?;
+        let projected = gemma4_norm_forward(norm, &projected, self.fused_rms_norm)?;
 
         let embedded = embedded.reshape((seq_len, self.num_hidden_layers, pli_dim))?;
         let combined = ((projected + embedded)? * std::f64::consts::FRAC_1_SQRT_2)?;
@@ -1244,7 +1342,7 @@ impl Gemma4ForCausalLM {
             xs = xs.index_select(&Tensor::from_vec(indices, (batch,), xs.device())?, 0)?;
         }
 
-        let xs = self.norm.forward(&xs)?;
+        let xs = gemma4_norm_forward(&self.norm, &xs, self.fused_rms_norm)?;
 
         if return_hidden {
             xs.to_dtype(DType::F32)

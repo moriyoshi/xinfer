@@ -36,6 +36,7 @@ pub struct MLP {
     down_proj: TensorParallelRowLinear,
     activation: Activation,
     swiglu_limit: f32,
+    gemma4_fused_gelu: bool,
 }
 
 impl MLP {
@@ -562,7 +563,14 @@ impl MLP {
             down_proj,
             activation: activation.clone(),
             swiglu_limit: 0.0,
+            gemma4_fused_gelu: false,
         })
+    }
+
+    /// Use the BF16 fused gated GELU path for a merged NVFP4 Gemma 4 MLP.
+    pub fn with_gemma4_fused_gelu(mut self, enabled: bool) -> Self {
+        self.gemma4_fused_gelu = enabled;
+        self
     }
 
     pub fn with_swiglu_limit(mut self, limit: f32) -> Self {
@@ -605,6 +613,15 @@ impl MLP {
                     m.weight_scale_swizzled.as_ref(),
                     Some(&m.row_scales),
                 )?;
+                #[cfg(feature = "cuda")]
+                if self.gemma4_fused_gelu
+                    && self.swiglu_limit == 0.0
+                    && matches!(self.activation, Activation::GeluPytorchTanh)
+                {
+                    if let Some(activated) = super::gemma4_gated_gelu::forward(&gate_up, m.n)? {
+                        return self.down_proj.forward(&activated);
+                    }
+                }
                 let leading: Vec<usize> = if orig_dims.len() > 2 {
                     orig_dims[..orig_dims.len() - 1].to_vec()
                 } else {
