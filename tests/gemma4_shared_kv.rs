@@ -154,6 +154,200 @@ fn max_abs(left: &[f32], right: &[f32]) -> f32 {
         .fold(0.0, f32::max)
 }
 
+fn load_model(dir: &Path, device: &Device) -> Result<(Gemma4ForCausalLM, Config)> {
+    let (paths, is_gguf, config, _, _, _) = init_config_tokenizer(&engine_config(dir))?;
+    ensure!(!is_gguf && config.num_hidden_layers == 42);
+    let vb = VarBuilderX::new(&paths, false, DType::BF16, device)?;
+    let model = Gemma4ForCausalLM::new(
+        &vb,
+        Rc::new(Comm::default()),
+        &config,
+        DType::BF16,
+        false,
+        device,
+        Arc::new(RwLock::new(Box::new(ProgressReporter::new(0)))),
+    )?;
+    Ok((model, config))
+}
+
+#[test]
+fn real_e4b_nvfp4_load_prefill_and_continuation() -> Result<()> {
+    let Some(quant_dir) = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT") else {
+        return Ok(());
+    };
+    let bf16_dir = std::env::var_os("XINFER_GEMMA4_CHECKPOINT")
+        .expect("XINFER_GEMMA4_CHECKPOINT required with NVFP4 checkpoint");
+    let reference = std::env::var_os("XINFER_GEMMA4_REFERENCE_DIR")
+        .expect("XINFER_GEMMA4_REFERENCE_DIR required with NVFP4 checkpoint");
+    let reference = Path::new(&reference);
+    let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(reference.join("tokens.json"))?)?;
+    let reference_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(reference.join("hf.json"))?)?;
+    let teacher: Vec<u32> = serde_json::from_value(reference_json["greedy"].clone())?;
+    let device = Device::new_cuda(0)?;
+    let (quant, quant_config) = load_model(Path::new(&quant_dir), &device)?;
+    ensure!(
+        quant_config
+            .quantization_config
+            .as_ref()
+            .is_some_and(|config| config.quant_method == "nvfp4"),
+        "expected native NVFP4 checkpoint"
+    );
+    let (bf16, bf16_config) = load_model(Path::new(&bf16_dir), &device)?;
+    ensure!(bf16_config.quantization_config.is_none());
+    let quant_cache = cache(&quant_config, 768, true, &device)?;
+    let bf16_cache = cache(&bf16_config, 768, true, &device)?;
+    let quant_start = Instant::now();
+    let quant_logits = forward(&quant, &device, &quant_cache, &tokens, 0, true)?;
+    eprintln!(
+        "gemma4_nvfp4_prefill_ms={:.3}",
+        quant_start.elapsed().as_secs_f64() * 1000.0
+    );
+    let bf16_logits = forward(&bf16, &device, &bf16_cache, &tokens, 0, true)?;
+    ensure!(quant_logits.len() == bf16_logits.len());
+    ensure!(quant_logits.iter().all(|value| value.is_finite()));
+    eprintln!(
+        "gemma4_nvfp4_prefix_max_abs={} top1={}/{}",
+        max_abs(&quant_logits, &bf16_logits),
+        argmax(&quant_logits),
+        argmax(&bf16_logits)
+    );
+    ensure!(
+        argmax(&quant_logits) == argmax(&bf16_logits),
+        "NVFP4 prefix top choice differs from BF16"
+    );
+
+    let quant_repeat_cache = cache(&quant_config, 768, true, &device)?;
+    let quant_repeat = forward(&quant, &device, &quant_repeat_cache, &tokens, 0, true)?;
+    ensure!(
+        quant_logits == quant_repeat,
+        "NVFP4 prefill is not repeatable"
+    );
+
+    let mut choices_agree = 0usize;
+    let mut different_choices = Vec::new();
+    let mut largest_logit_diff = 0.0f32;
+    let mut quant_decode_ms = 0.0f64;
+    let mut bf16_decode_ms = 0.0f64;
+    let mut replay_logits = Vec::new();
+    for (step, &token) in teacher.iter().enumerate() {
+        let started = Instant::now();
+        let quant_next = forward(
+            &quant,
+            &device,
+            &quant_cache,
+            &[token],
+            tokens.len() + step,
+            false,
+        )?;
+        quant_decode_ms += started.elapsed().as_secs_f64() * 1000.0;
+        if step < 4 {
+            replay_logits.push(quant_next.clone());
+        }
+        let started = Instant::now();
+        let bf16_next = forward(
+            &bf16,
+            &device,
+            &bf16_cache,
+            &[token],
+            tokens.len() + step,
+            false,
+        )?;
+        bf16_decode_ms += started.elapsed().as_secs_f64() * 1000.0;
+        ensure!(quant_next.iter().all(|value| value.is_finite()));
+        if argmax(&quant_next) == argmax(&bf16_next) {
+            choices_agree += 1;
+        } else {
+            different_choices.push(step);
+        }
+        largest_logit_diff = largest_logit_diff.max(max_abs(&quant_next, &bf16_next));
+    }
+    eprintln!(
+        "gemma4_nvfp4_teacher_forced_top1={choices_agree}/{} differing_positions={different_choices:?} max_abs={largest_logit_diff} nvfp4_ms_per_token={:.3} bf16_ms_per_token={:.3}",
+        teacher.len(),
+        quant_decode_ms / teacher.len() as f64,
+        bf16_decode_ms / teacher.len() as f64,
+    );
+    ensure!(
+        choices_agree >= 40,
+        "NVFP4 disagrees with BF16 at too many teacher-forced positions: {choices_agree}/{}",
+        teacher.len()
+    );
+    for (step, &token) in teacher.iter().take(replay_logits.len()).enumerate() {
+        let replay = forward(
+            &quant,
+            &device,
+            &quant_repeat_cache,
+            &[token],
+            tokens.len() + step,
+            false,
+        )?;
+        ensure!(
+            replay == replay_logits[step],
+            "NVFP4 decode changed on repeated schedule at step {step}"
+        );
+    }
+
+    let quant_greedy_cache = cache(&quant_config, 768, true, &device)?;
+    let bf16_greedy_cache = cache(&bf16_config, 768, true, &device)?;
+    let mut quant_next = argmax(&forward(
+        &quant,
+        &device,
+        &quant_greedy_cache,
+        &tokens,
+        0,
+        true,
+    )?) as u32;
+    let mut bf16_next = argmax(&forward(
+        &bf16,
+        &device,
+        &bf16_greedy_cache,
+        &tokens,
+        0,
+        true,
+    )?) as u32;
+    let mut quant_greedy = Vec::new();
+    let mut bf16_greedy = Vec::new();
+    for step in 0..teacher.len() {
+        quant_greedy.push(quant_next);
+        bf16_greedy.push(bf16_next);
+        quant_next = argmax(&forward(
+            &quant,
+            &device,
+            &quant_greedy_cache,
+            &[quant_next],
+            tokens.len() + step,
+            false,
+        )?) as u32;
+        bf16_next = argmax(&forward(
+            &bf16,
+            &device,
+            &bf16_greedy_cache,
+            &[bf16_next],
+            tokens.len() + step,
+            false,
+        )?) as u32;
+    }
+    let matching_prefix = quant_greedy
+        .iter()
+        .zip(&bf16_greedy)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let tokenizer = Tokenizer::from_file(Path::new(&bf16_dir).join("tokenizer.json"))
+        .map_err(anyhow::Error::msg)?;
+    eprintln!(
+        "gemma4_nvfp4_greedy_matching_prefix={matching_prefix}/{} nvfp4_text={} bf16_text={}",
+        teacher.len(),
+        tokenizer
+            .decode(&quant_greedy, true)
+            .map_err(anyhow::Error::msg)?,
+        tokenizer
+            .decode(&bf16_greedy, true)
+            .map_err(anyhow::Error::msg)?,
+    );
+    Ok(())
+}
+
 #[test]
 fn real_e4b_shared_kv_matches_hf_and_continuations() -> Result<()> {
     let Some(dir) = std::env::var_os("XINFER_GEMMA4_CHECKPOINT") else {
