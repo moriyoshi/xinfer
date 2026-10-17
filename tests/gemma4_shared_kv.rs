@@ -236,37 +236,52 @@ fn bench_real_e4b_nvfp4_single_sequence() -> Result<()> {
 #[test]
 #[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
 fn real_e4b_nvfp4_fused_gelu_matches_baseline() -> Result<()> {
-    real_e4b_nvfp4_fast_modes_match_baseline(true, false)
+    real_e4b_nvfp4_fast_modes_match_baseline(true, false, false)
 }
 
 #[test]
 #[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
 fn real_e4b_nvfp4_fused_gelu_and_rmsnorm_match_baseline() -> Result<()> {
-    real_e4b_nvfp4_fast_modes_match_baseline(true, true)
+    real_e4b_nvfp4_fast_modes_match_baseline(true, true, false)
 }
 
-fn real_e4b_nvfp4_fast_modes_match_baseline(fused_gelu: bool, fused_rms_norm: bool) -> Result<()> {
+#[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_default_fusions_match_opt_out() -> Result<()> {
+    real_e4b_nvfp4_fast_modes_match_baseline(true, true, true)
+}
+
+fn real_e4b_nvfp4_fast_modes_match_baseline(
+    fused_gelu: bool,
+    fused_rms_norm: bool,
+    use_default: bool,
+) -> Result<()> {
     let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
         .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
     let bench_dir =
         std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
     let device = Device::new_cuda(0)?;
 
-    // This opt-in test is run by name in its own process. Select the mode at
+    // This ignored test is run by name in its own process. Select the mode at
     // construction, then restore the process environment before inference.
     let previous_gelu = std::env::var_os("XINFER_GEMMA4_FUSED_GELU");
     let previous_rms = std::env::var_os("XINFER_GEMMA4_FUSED_RMSNORM");
     std::env::set_var("XINFER_GEMMA4_FUSED_GELU", "0");
     std::env::set_var("XINFER_GEMMA4_FUSED_RMSNORM", "0");
     let (baseline, config) = load_model(Path::new(&model_dir), &device)?;
-    std::env::set_var(
-        "XINFER_GEMMA4_FUSED_GELU",
-        if fused_gelu { "1" } else { "0" },
-    );
-    std::env::set_var(
-        "XINFER_GEMMA4_FUSED_RMSNORM",
-        if fused_rms_norm { "1" } else { "0" },
-    );
+    if use_default {
+        std::env::remove_var("XINFER_GEMMA4_FUSED_GELU");
+        std::env::remove_var("XINFER_GEMMA4_FUSED_RMSNORM");
+    } else {
+        std::env::set_var(
+            "XINFER_GEMMA4_FUSED_GELU",
+            if fused_gelu { "1" } else { "0" },
+        );
+        std::env::set_var(
+            "XINFER_GEMMA4_FUSED_RMSNORM",
+            if fused_rms_norm { "1" } else { "0" },
+        );
+    }
     let (fused, fused_config) = load_model(Path::new(&model_dir), &device)?;
     if let Some(value) = previous_gelu {
         std::env::set_var("XINFER_GEMMA4_FUSED_GELU", value);
@@ -299,7 +314,7 @@ fn real_e4b_nvfp4_fast_modes_match_baseline(fused_gelu: bool, fused_rms_norm: bo
             next = argmax(&base_logits) as u32;
         }
         eprintln!(
-            "gemma4_fast_mode_parity gelu={fused_gelu} rms={fused_rms_norm} tokens={size} prefix_max_abs={prefix_max_abs} continuation_max_abs={continuation_max_abs} top1={top1_equal}/49"
+            "gemma4_fast_mode_parity gelu={fused_gelu} rms={fused_rms_norm} default={use_default} tokens={size} prefix_max_abs={prefix_max_abs} continuation_max_abs={continuation_max_abs} top1={top1_equal}/49"
         );
         ensure!(
             top1_equal == 49,
