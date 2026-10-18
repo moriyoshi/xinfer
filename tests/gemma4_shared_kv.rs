@@ -302,6 +302,30 @@ fn nvfp4_resident_scales_reject_malformed_tensors() -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "cuda", feature = "nemotron-expert-fused-quant"))]
+#[test]
+fn nvfp4_checked_bf16_gemm_rejects_empty_problem() {
+    // The checked native entry point must reject an impossible shape before
+    // touching any pointer, so a failed launch cannot expose output storage.
+    let status = unsafe {
+        kernels::ffi::nvfp4_cutlass_gemm_bf16_checked(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+            32,
+            32,
+            std::ptr::null_mut(),
+            0,
+            0,
+        )
+    };
+    assert_ne!(status, 0);
+}
+
 fn real_e4b_nvfp4_single_fusion_matches_baseline(
     setting: &str,
     enabled_value: Option<&str>,
