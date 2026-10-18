@@ -17,6 +17,12 @@ pub trait ApplyRotaryEmbedding {
 
     fn get_original_max_position_embeddings(&self) -> Option<usize>;
     fn get_llama_4_scaling_beta(&self) -> Option<f64>;
+
+    /// Full-width F32 tables for model-specific fused Q/K normalization and
+    /// rotary kernels. Other rotary layouts keep the existing path.
+    fn full_f32_tables(&self) -> Option<(&Tensor, &Tensor, bool)> {
+        None
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +116,13 @@ impl ApplyRotaryEmbedding for RotaryEmbedding {
 
     fn get_llama_4_scaling_beta(&self) -> Option<f64> {
         self.llama_4_scaling_beta
+    }
+
+    fn full_f32_tables(&self) -> Option<(&Tensor, &Tensor, bool)> {
+        (self.rotary_dim.is_none()
+            && self.cos.dtype() == DType::F32
+            && self.sin.dtype() == DType::F32)
+            .then_some((&self.cos, &self.sin, self.is_rope_i))
     }
 }
 

@@ -260,6 +260,8 @@ impl Gemma4DecoderLayer {
         let default_fusions = default_cuda_nvfp4_fusions(config, dtype, &vb.device());
         let fused_gelu = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_GELU", default_fusions);
         let fused_rms_norm = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_RMSNORM", default_fusions);
+        let fused_qk_rope = default_fusions
+            && gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_QK_ROPE", default_fusions);
 
         let sliding_window = if is_sliding {
             config.sliding_window
@@ -349,7 +351,8 @@ impl Gemma4DecoderLayer {
                 k_eq_v,
                 false,
             )?
-        };
+        }
+        .with_gemma4_fused_qk_rope(fused_qk_rope);
 
         let mlp = MLP::new(
             if is_qvar_builder {
@@ -1188,6 +1191,11 @@ impl Gemma4ForCausalLM {
         #[cfg(feature = "cuda")]
         if fused_rms_norm && dtype == DType::BF16 && device.is_cuda() {
             crate::models::layers::gemma4_rms_norm::prepare(device)?;
+        }
+        #[cfg(feature = "cuda")]
+        if default_fusions && gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_QK_ROPE", default_fusions)
+        {
+            crate::models::layers::gemma4_qk_rope::prepare(device)?;
         }
 
         Ok(Self {

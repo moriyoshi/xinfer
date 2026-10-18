@@ -79,6 +79,7 @@ pub struct Attention {
     promote_qk_to_f32: bool,
     v_norm_eps: Option<f64>,
     nemotron_attention_gemm: bool,
+    gemma4_fused_qk_rope: bool,
 }
 
 impl Attention {
@@ -748,6 +749,7 @@ impl Attention {
             promote_qk_to_f32: is_qvar_builder || config.higher_precision_required() || qk_l2_norm,
             v_norm_eps,
             nemotron_attention_gemm: false,
+            gemma4_fused_qk_rope: false,
         })
     }
 
@@ -756,6 +758,59 @@ impl Attention {
     pub fn with_nemotron_attention_gemm(mut self) -> Self {
         self.nemotron_attention_gemm = true;
         self
+    }
+
+    /// Enables the Gemma 4 BF16 Q/K norm and RoPE CUDA fusion.
+    pub fn with_gemma4_fused_qk_rope(mut self, enabled: bool) -> Self {
+        self.gemma4_fused_qk_rope = enabled;
+        self
+    }
+
+    fn fused_gemma4_qk_rope(
+        &self,
+        q: &Tensor,
+        k: Option<&Tensor>,
+        rotary_emb: &Option<Arc<dyn ApplyRotaryEmbedding>>,
+        positions: &Tensor,
+    ) -> Result<Option<(Tensor, Option<Tensor>)>> {
+        #[cfg(feature = "cuda")]
+        if self.gemma4_fused_qk_rope
+            && self.promote_qk_to_f32
+            && !self.full_dim_qk_norm
+            && !self.qk_l2_norm
+            && self.dtype == DType::BF16
+        {
+            if let (Some(q_norm), Some(rope)) = (&self.q_norm, rotary_emb) {
+                if let (Some((q_weight, q_eps)), Some((cos, sin, interleaved))) =
+                    (q_norm.f32_rms_weight_eps(), rope.full_f32_tables())
+                {
+                    let k_params = if let Some(k) = k {
+                        self.k_norm
+                            .as_ref()
+                            .and_then(NormX::f32_rms_weight_eps)
+                            .map(|(weight, eps)| (k, weight, eps))
+                    } else {
+                        None
+                    };
+                    if k.is_none() || k_params.is_some() {
+                        if let Some(result) = crate::models::layers::gemma4_qk_rope::forward(
+                            q,
+                            k_params,
+                            &q_weight,
+                            q_eps,
+                            cos,
+                            sin,
+                            positions,
+                            interleaved,
+                        )? {
+                            return Ok(Some(result));
+                        }
+                    }
+                }
+            }
+        }
+        let _ = (q, k, rotary_emb, positions);
+        Ok(None)
     }
 
     /// Promote Q/K to F32 when needed and apply per-token or per-head RMSNorm before RoPE.
@@ -868,35 +923,41 @@ impl Attention {
             if self.attn_output_gate {
                 candle_core::bail!("Gemma 4 shared attention does not support output gating")
             }
-            let mut q = q_proj
+            let q = q_proj
                 .forward(xs)?
                 .reshape((seq_len, self.num_heads, self.head_dim))?;
-            if self.promote_qk_to_f32 && q.dtype() != DType::F32 {
-                q = q.to_dtype(DType::F32)?;
-            }
-            if let Some(norm) = &self.q_norm {
-                q = if self.full_dim_qk_norm {
-                    norm.forward(&q.reshape((seq_len, self.num_heads * self.head_dim))?)?
-                        .reshape((seq_len, self.num_heads, self.head_dim))?
+            let mut q =
+                if let Some((q, _)) = self.fused_gemma4_qk_rope(&q, None, rotary_emb, positions)? {
+                    q
                 } else {
-                    norm.forward(&q.flatten(0, 1)?)?.reshape((
-                        seq_len,
-                        self.num_heads,
-                        self.head_dim,
-                    ))?
+                    let mut q = q;
+                    if self.promote_qk_to_f32 && q.dtype() != DType::F32 {
+                        q = q.to_dtype(DType::F32)?;
+                    }
+                    if let Some(norm) = &self.q_norm {
+                        q = if self.full_dim_qk_norm {
+                            norm.forward(&q.reshape((seq_len, self.num_heads * self.head_dim))?)?
+                                .reshape((seq_len, self.num_heads, self.head_dim))?
+                        } else {
+                            norm.forward(&q.flatten(0, 1)?)?.reshape((
+                                seq_len,
+                                self.num_heads,
+                                self.head_dim,
+                            ))?
+                        };
+                    }
+                    if let Some(rope) = rotary_emb {
+                        // The existing fused RoPE API rotates Q and K together.
+                        let scratch_k =
+                            Tensor::zeros((seq_len, 1, self.head_dim), q.dtype(), q.device())?;
+                        if let Some((rotated_q, _)) =
+                            rope.apply_rotary_emb_qkv(&q, &scratch_k, positions)?
+                        {
+                            q = rotated_q;
+                        }
+                    }
+                    q
                 };
-            }
-            if let Some(rope) = rotary_emb {
-                // The existing fused RoPE API rotates Q and K together. A
-                // one-head scratch K lets it rotate Q without loading or
-                // projecting this shared layer's unused checkpoint K/V.
-                let scratch_k = Tensor::zeros((seq_len, 1, self.head_dim), q.dtype(), q.device())?;
-                if let Some((rotated_q, _)) =
-                    rope.apply_rotary_emb_qkv(&q, &scratch_k, positions)?
-                {
-                    q = rotated_q;
-                }
-            }
             if self.qk_l2_norm {
                 let rms = (q.sqr()?.mean_keepdim(D::Minus1)? + 1e-5)?.sqrt()?;
                 q = q.broadcast_div(&rms)?;
@@ -1087,16 +1148,20 @@ impl Attention {
         let k = k.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
         let v = v.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
 
-        let (q, k) = self.prepare_qk_for_rope(q, k, seq_len)?;
-
-        // Apply rotary embeddings
-        let (q, k) = if let Some(rotary_emb) = &rotary_emb {
-            match rotary_emb.apply_rotary_emb_qkv(&q, &k, positions)? {
-                Some((q_new, k_new)) => (q_new, k_new),
-                None => (q, k),
-            }
-        } else {
+        let (q, k) = if let Some((q, Some(k))) =
+            self.fused_gemma4_qk_rope(&q, Some(&k), rotary_emb, positions)?
+        {
             (q, k)
+        } else {
+            let (q, k) = self.prepare_qk_for_rope(q, k, seq_len)?;
+            if let Some(rotary_emb) = rotary_emb {
+                match rotary_emb.apply_rotary_emb_qkv(&q, &k, positions)? {
+                    Some((q_new, k_new)) => (q_new, k_new),
+                    None => (q, k),
+                }
+            } else {
+                (q, k)
+            }
         };
 
         let (q, k) = if self.qk_l2_norm {
