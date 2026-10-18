@@ -251,6 +251,59 @@ fn real_e4b_nvfp4_default_fusions_match_opt_out() -> Result<()> {
     real_e4b_nvfp4_fast_modes_match_baseline(true, true, true)
 }
 
+#[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_fused_qk_rope_matches_baseline() -> Result<()> {
+    let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
+        .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
+    let bench_dir =
+        std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
+    let device = Device::new_cuda(0)?;
+    let previous = std::env::var_os("XINFER_GEMMA4_FUSED_QK_ROPE");
+    std::env::set_var("XINFER_GEMMA4_FUSED_QK_ROPE", "0");
+    let (baseline, config) = load_model(Path::new(&model_dir), &device)?;
+    std::env::remove_var("XINFER_GEMMA4_FUSED_QK_ROPE");
+    let (fused, fused_config) = load_model(Path::new(&model_dir), &device)?;
+    if let Some(value) = previous {
+        std::env::set_var("XINFER_GEMMA4_FUSED_QK_ROPE", value);
+    } else {
+        std::env::remove_var("XINFER_GEMMA4_FUSED_QK_ROPE");
+    }
+    ensure!(config.hidden_size == fused_config.hidden_size);
+    for size in [40usize, 2048, 8192] {
+        let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(
+            Path::new(&bench_dir).join(format!("tokens-{size}.json")),
+        )?)?;
+        let base_cache = cache(&config, size + 64, true, &device)?;
+        let fused_cache = cache(&config, size + 64, true, &device)?;
+        let mut base_logits = forward(&baseline, &device, &base_cache, &tokens, 0, true)?;
+        let mut fused_logits = forward(&fused, &device, &fused_cache, &tokens, 0, true)?;
+        let prefix_max_abs = max_abs(&base_logits, &fused_logits);
+        let mut continuation_max_abs = 0.0f32;
+        let mut top1_equal = usize::from(argmax(&base_logits) == argmax(&fused_logits));
+        let mut next = argmax(&base_logits) as u32;
+        for step in 0..48 {
+            base_logits = forward(&baseline, &device, &base_cache, &[next], size + step, false)?;
+            fused_logits = forward(&fused, &device, &fused_cache, &[next], size + step, false)?;
+            continuation_max_abs = continuation_max_abs.max(max_abs(&base_logits, &fused_logits));
+            top1_equal += usize::from(argmax(&base_logits) == argmax(&fused_logits));
+            next = argmax(&base_logits) as u32;
+        }
+        eprintln!(
+            "gemma4_qk_rope_parity tokens={size} prefix_max_abs={prefix_max_abs} continuation_max_abs={continuation_max_abs} top1={top1_equal}/49"
+        );
+        ensure!(
+            prefix_max_abs == 0.0 && continuation_max_abs == 0.0,
+            "fused Q/K RoPE changed logits at {size}"
+        );
+        ensure!(
+            top1_equal == 49,
+            "fused Q/K RoPE changed a top-1 choice at {size}"
+        );
+    }
+    Ok(())
+}
+
 fn real_e4b_nvfp4_fast_modes_match_baseline(
     fused_gelu: bool,
     fused_rms_norm: bool,

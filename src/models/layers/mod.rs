@@ -9,6 +9,8 @@ pub(crate) mod gemma4_gated_gelu;
 #[cfg(feature = "cuda")]
 pub(crate) mod gemma4_gemv;
 #[cfg(feature = "cuda")]
+pub(crate) mod gemma4_qk_rope;
+#[cfg(feature = "cuda")]
 pub(crate) mod gemma4_rms_norm;
 pub mod indexer;
 pub mod linear;

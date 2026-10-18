@@ -65,6 +65,26 @@ In that Xinfer prefill interval, 301 activation quantizations take 109 ms, scale
 
 To reproduce the measured path, add `XINFER_GEMMA4_BF16_GEMV=1` to the Xinfer benchmark command below; the two new fusions are automatic for this checkpoint. `cargo test --release --features cuda,cutlass --test gemma4_shared_kv real_e4b_nvfp4_default_fusions_match_opt_out -- --ignored --nocapture` runs the real-checkpoint default/opt-out parity check with the same checkpoint and token-file environment variables. The Nsight and vLLM trace files are under `/tmp/xinfer-gemma4-vllm-bench/` on the measurement host.
 
+## Fused Q/K norm and RoPE
+
+The Gemma 4 BF16 NVFP4 CUDA path now reads projected BF16 Q/K, performs the existing per-head RMSNorm and RoPE in FP32, and writes BF16 attention inputs in one kernel. Shared-KV layers use its query-only mode, avoiding the scratch K used by the ordinary RoPE call. It is enabled by default for this configuration; set `XINFER_GEMMA4_FUSED_QK_ROPE=0` to use the original path. The fusion applies only when the model has full-width FP32 RoPE tables and per-head FP32 normalization weights; other layouts retain the ordinary path. The module is prepared during model construction for CUDA graph capture.
+
+The kernel uses Candle's 32-thread reduction order for head widths below 1024. A first implementation used a different reduction order and changed one top choice at the 40-token prefix. With the matching reduction, the real E4B NVFP4 checkpoint produced **bit-identical logits** between opt-out and fused models for 40, 2,048, and 8,192-token prefixes and 48 teacher-forced continuation positions after each prefix: maximum absolute logit difference zero and top-1 agreement 147/147. The test is `real_e4b_nvfp4_fused_qk_rope_matches_baseline` in `tests/gemma4_shared_kv.rs`. A focused CUDA test also compares the kernel with FP32 Candle RMSNorm plus attention-rs RoPE for interleaved and non-interleaved layouts and query-only operation.
+
+In an isolated GB10 sweep on the same checkpoint with the existing fused GELU, RMSNorm, and BF16 GEMV paths enabled, six samples per mode in baseline/fused/fused/baseline order gave:
+
+| Prompt tokens | Q/K opt-out prefill | Fused Q/K prefill | Prefill gain | Q/K opt-out decode | Fused Q/K decode |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 40 | 34.86 ms | 33.18 ms | 4.8% | 30.10 ms/step | 28.96 ms/step |
+| 2,048 | 288.03 ms | 255.69 ms | 11.2% | 32.98 ms/step | 31.55 ms/step |
+| 8,192 | 1,388.32 ms | 1,253.98 ms | 9.7% | 35.31 ms/step | 33.96 ms/step |
+
+The 8K fused prefill remains 1.39× the earlier vLLM first-token median of 903.1 ms, with 351 ms remaining gap. These vLLM and fused Xinfer sweeps were on the same checkpoint and token IDs but at different times. An isolated 8K Q/K-only control measured median 10.94 ms for the original cast/norm/RoPE/cast sequence and 2.90 ms for the fused kernel, using an 8-query-head/2-KV-head/256-width shape. The real model's savings are smaller than 42 times this synthetic result because head shapes and other work differ.
+
+An Nsight Systems interval for one fused 8K prefill records 1,057 ms summed GPU kernel time versus 1,183 ms in the comparable opt-out trace. The fused Q/K kernel takes 31 ms across 42 launches. FP4 CUTLASS GEMM takes 278 ms and attention 311 ms, both already close to the vLLM trace's 283 and 286 ms. The next largest Xinfer components are activation quantization 103 ms, gated GELU 98 ms, fused RMSNorm/add 67 ms, post-attention/pre-feedforward normalization 43 ms, and BF16 multiplication 36 ms. The trace and per-mode benchmark logs are under `/tmp/xinfer-gemma4-qk-bench/` on this host.
+
+The same 8K interval has 737 host-to-device copies totaling only 9,356 bytes; 603 are four-byte copies. Two four-byte scalar uploads occur in each of the 301 NVFP4 linear calls at `attention-rs/src/nvfp4_linear.rs` when calibrated input scales are used. Nsight reports 211 ms summed CPU API time for the 737 copies and 0.385 ms of GPU transfer time. The API duration overlaps GPU work and is **not** an additive 211 ms saving opportunity. A resident per-linear GPU scale pair, passed through an attention-rs NVFP4 API, is a plausible next cross-crate lever to test before another GEMM rewrite. The other remaining Xinfer candidates are the residual/norm chain and prefill host launch overhead. The four paired sweeps recorded no competing GPU process; minimum `MemAvailable` after the prior fuzz process exited was 99.1 GiB.
+
 ## Reproduction
 
 `tests/prepare_gemma4_vllm_bench.py` builds the exact token streams and a two-file BF16-KV metadata overlay from the checkpoint and the 40-token reference. It leaves the weight shards untouched; the symlinks in the overlay resolve when the original checkpoint is mounted at `/weights` in Docker. Xinfer's opt-in test is `bench_real_e4b_nvfp4_single_sequence` in `tests/gemma4_shared_kv.rs`.
