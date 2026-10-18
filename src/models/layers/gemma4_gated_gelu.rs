@@ -105,6 +105,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fused_gelu_nvfp4_quant_matches_materialized_bf16() -> Result<()> {
+        let Ok(device) = candle_core::Device::new_cuda(0) else {
+            return Ok(());
+        };
+        if !cfg!(feature = "cutlass")
+            || attention_rs::cuda_utils::sm_version(device.as_cuda_device()?).unwrap_or(0) < 100
+        {
+            return Ok(());
+        }
+        for (tokens, width) in [(3usize, 32usize), (128, 256)] {
+            let n = 32usize;
+            let gate_up = Tensor::from_vec(
+                (0..tokens * width * 2)
+                    .map(|i| ((i * 97 % 211) as f32 - 105.0) / 41.0)
+                    .collect::<Vec<_>>(),
+                (tokens, width * 2),
+                &device,
+            )?
+            .to_dtype(DType::BF16)?;
+            let weight = Tensor::from_vec(
+                (0..n * width / 2)
+                    .map(|i| (i * 37 % 256) as u8)
+                    .collect::<Vec<_>>(),
+                (n, width / 2),
+                &device,
+            )?;
+            let scales = Tensor::from_vec(vec![0x38u8; n * width / 16], (n, width / 16), &device)?;
+            let activated = forward(&gate_up, width)?.expect("contiguous BF16 gate/up");
+            let expected = attention_rs::nvfp4_linear::nvfp4_matmul(
+                &activated, &weight, &scales, 1.0, 1.0, None, true, None, None,
+            )?;
+            let expected = expected.flatten_all()?.to_vec1::<half::bf16>()?;
+            let resident = Tensor::from_vec(vec![1.0f32, 1.0], 2, &device)?;
+            for device_scales in [None, Some(&resident)] {
+                let actual =
+                    attention_rs::nvfp4_linear::nvfp4_gated_gelu_matmul_with_device_scales(
+                        &gate_up,
+                        &weight,
+                        &scales,
+                        1.0,
+                        1.0,
+                        None,
+                        true,
+                        None,
+                        None,
+                        device_scales,
+                    )?;
+                device.synchronize()?;
+                let actual = actual.flatten_all()?.to_vec1::<half::bf16>()?;
+                assert_eq!(actual, expected, "tokens={tokens} width={width}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn fused_gated_gelu_matches_separate_bf16_ops() -> Result<()> {
         let Ok(device) = candle_core::Device::new_cuda(0) else {
             return Ok(());

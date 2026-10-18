@@ -1707,9 +1707,75 @@ pub struct LnNvfp4 {
     pub input_scale: f32,
     pub bias: Option<Tensor>,
     pub weight_scale_swizzled: Option<Tensor>,
+    /// Model-owned hardware scales kept alive across CUDA graph replay.
+    pub resident_scales: Option<Tensor>,
+}
+
+pub(crate) fn nvfp4_resident_scales(
+    global_scale: f32,
+    input_scale: f32,
+    device: &candle_core::Device,
+) -> Result<Option<Tensor>> {
+    #[cfg(feature = "cuda")]
+    if cfg!(feature = "cutlass")
+        && device.is_cuda()
+        && std::env::var_os("XINFER_NVFP4_RESIDENT_SCALES").is_some_and(|value| value == "1")
+        && attention_rs::cuda_utils::sm_version(device.as_cuda_device()?).unwrap_or(0) >= 100
+    {
+        let (scale, inverse) = if input_scale > 1e-12 {
+            (input_scale, 1.0 / input_scale)
+        } else {
+            (1.0, 1.0)
+        };
+        return Ok(Some(Tensor::from_vec(
+            vec![scale * global_scale, inverse],
+            2,
+            device,
+        )?));
+    }
+    let _ = (global_scale, input_scale, device);
+    Ok(None)
 }
 
 impl LnNvfp4 {
+    /// Fuse Gemma 4's rounded BF16 gated GELU into hardware FP4 activation
+    /// quantization. None means the caller should use its ordinary path.
+    pub(crate) fn forward_gated_gelu(&self, gate_up: &Tensor) -> Result<Option<Tensor>> {
+        #[cfg(feature = "cuda")]
+        {
+            if cfg!(feature = "cutlass")
+                && !attention_rs::nvfp4_online_scale()
+                && gate_up.dtype() == DType::BF16
+                && gate_up.device().is_cuda()
+                && gate_up.rank() == 2
+                && gate_up.is_contiguous()
+                && (linear_is_prefill() || attention_rs::nvfp4_hw_decode())
+                && attention_rs::cuda_utils::sm_version(gate_up.device().as_cuda_device()?)
+                    .unwrap_or(0)
+                    >= 100
+                && self.blocks.dim(0)?.is_multiple_of(32)
+                && self.blocks.dim(1)?.checked_mul(4) == Some(gate_up.dim(1)?)
+                && (gate_up.dim(1)? / 2).is_multiple_of(32)
+            {
+                return Ok(Some(
+                    attention_rs::nvfp4_linear::nvfp4_gated_gelu_matmul_with_device_scales(
+                        gate_up,
+                        &self.blocks,
+                        &self.scales,
+                        self.global_scale,
+                        self.input_scale,
+                        self.bias.as_ref(),
+                        linear_is_prefill(),
+                        self.weight_scale_swizzled.as_ref(),
+                        None,
+                        self.resident_scales.as_ref(),
+                    )?,
+                ));
+            }
+        }
+        Ok(None)
+    }
+
     fn load_fp8_scale_tensor(
         vb: &VarBuilder,
         out_dim: usize,
@@ -1838,6 +1904,7 @@ impl LnNvfp4 {
         } else {
             None
         };
+        let resident_scales = nvfp4_resident_scales(global_scale, input_scale, vb.device())?;
 
         #[cfg(feature = "cuda")]
         let weight_scale_swizzled = {
@@ -1861,6 +1928,7 @@ impl LnNvfp4 {
             input_scale,
             bias,
             weight_scale_swizzled,
+            resident_scales,
         })
     }
 }
@@ -1876,7 +1944,7 @@ impl Module for LnNvfp4 {
             x.clone()
         };
 
-        let result = attention_rs::nvfp4_linear::nvfp4_matmul(
+        let result = attention_rs::nvfp4_linear::nvfp4_matmul_with_device_scales(
             &x_2d,
             &self.blocks,
             &self.scales,
@@ -1886,6 +1954,7 @@ impl Module for LnNvfp4 {
             linear_is_prefill(),
             self.weight_scale_swizzled.as_ref(),
             None,
+            self.resident_scales.as_ref(),
         )?;
 
         if orig_dims.len() > 2 {

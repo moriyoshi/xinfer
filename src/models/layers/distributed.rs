@@ -1,6 +1,6 @@
 use crate::models::layers::linear::{
-    is_channel_scale_shape, linear_b_x as linear_b, linear_no_bias_x as linear, LinearX as Linear,
-    LnFp8, LnMxfp4, LnNvfp4, QLinear,
+    is_channel_scale_shape, linear_b_x as linear_b, linear_no_bias_x as linear,
+    nvfp4_resident_scales, LinearX as Linear, LnFp8, LnMxfp4, LnNvfp4, QLinear,
 };
 use crate::models::layers::{isq_high_precision_quant, VarBuilderX};
 use crate::utils::config::QuantConfig;
@@ -575,6 +575,29 @@ impl TensorParallelRowLinear {
             }
         }
         Ok(xs)
+    }
+
+    /// Use the packed NVFP4 down projection with fused BF16 gated GELU when
+    /// its hardware path is available; preserve the row collective and bias.
+    pub(crate) fn forward_gated_gelu(&self, gate_up: &Tensor) -> Result<Option<Tensor>> {
+        let Some(linear) = self.linear.as_nvfp4() else {
+            return Ok(None);
+        };
+        let Some(mut xs) = linear.forward_gated_gelu(gate_up)? else {
+            return Ok(None);
+        };
+        #[cfg(feature = "nccl")]
+        if let Some(all_reduce) = &self.all_reduce {
+            xs = xs.apply_op1_no_bwd(all_reduce)?;
+        }
+        if let Some(bias) = &self.bias {
+            if bias.dtype() == xs.dtype() {
+                xs = xs.broadcast_add(bias)?;
+            } else {
+                xs = xs.broadcast_add(&bias.to_dtype(xs.dtype())?)?;
+            }
+        }
+        Ok(Some(xs))
     }
 }
 
@@ -1239,6 +1262,11 @@ impl MergedParallelColumnLinear {
                         };
                         #[cfg(not(feature = "cuda"))]
                         let weight_scale_swizzled: Option<Tensor> = None;
+                        let resident_scales = nvfp4_resident_scales(
+                            nvfp4_global_scale,
+                            nvfp4_input_scale,
+                            merged_blocks.device(),
+                        )?;
 
                         LinearX::LnNvfp4(LnNvfp4 {
                             blocks: merged_blocks,
@@ -1247,6 +1275,7 @@ impl MergedParallelColumnLinear {
                             input_scale: nvfp4_input_scale,
                             bias: None,
                             weight_scale_swizzled,
+                            resident_scales,
                         })
                     } else {
                         LinearX::LnMxfp4(LnMxfp4 {

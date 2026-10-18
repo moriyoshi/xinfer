@@ -286,6 +286,9 @@ impl Gemma4DecoderLayer {
         let is_qvar_builder = vb.is_qvar_builder();
         let default_fusions = default_cuda_nvfp4_fusions(config, dtype, &vb.device());
         let fused_gelu = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_GELU", default_fusions);
+        let fused_gelu_fp4 = fused_gelu
+            && default_fusions
+            && gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_GELU_FP4", false);
         let fused_rms_norm = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_RMSNORM", default_fusions);
         let fused_layer_scale = fused_rms_norm
             && gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_LAYER_SCALE", default_fusions);
@@ -399,7 +402,8 @@ impl Gemma4DecoderLayer {
             dtype,
             "",
         )?
-        .with_gemma4_fused_gelu(fused_gelu);
+        .with_gemma4_fused_gelu(fused_gelu)
+        .with_gemma4_fused_gelu_fp4(fused_gelu_fp4);
 
         let moe_cfg_ref = config.moe_cfg.as_ref();
         let (moe, gemma4_router) = if enable_moe && moe_cfg_ref.is_some() {

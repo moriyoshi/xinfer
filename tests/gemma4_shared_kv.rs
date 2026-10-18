@@ -254,16 +254,58 @@ fn real_e4b_nvfp4_default_fusions_match_opt_out() -> Result<()> {
 #[test]
 #[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
 fn real_e4b_nvfp4_fused_qk_rope_matches_baseline() -> Result<()> {
-    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_FUSED_QK_ROPE")
+    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_FUSED_QK_ROPE", None)
 }
 
 #[test]
 #[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
 fn real_e4b_nvfp4_fused_layer_scale_matches_baseline() -> Result<()> {
-    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_FUSED_LAYER_SCALE")
+    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_FUSED_LAYER_SCALE", None)
 }
 
-fn real_e4b_nvfp4_single_fusion_matches_baseline(setting: &str) -> Result<()> {
+#[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_resident_scales_matches_baseline() -> Result<()> {
+    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_NVFP4_RESIDENT_SCALES", Some("1"))
+}
+
+#[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_gated_gelu_fp4_matches_baseline() -> Result<()> {
+    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_FUSED_GELU_FP4", Some("1"))
+}
+
+#[test]
+fn nvfp4_resident_scales_reject_malformed_tensors() -> Result<()> {
+    let device = Device::Cpu;
+    let input = Tensor::zeros((1, 16), DType::F16, &device)?;
+    let weight = Tensor::zeros((1, 8), DType::U8, &device)?;
+    let scales = Tensor::zeros((1, 1), DType::U8, &device)?;
+    for invalid in [
+        Tensor::zeros((1,), DType::F32, &device)?,
+        Tensor::zeros((2,), DType::F16, &device)?,
+    ] {
+        let result = attention_rs::nvfp4_linear::nvfp4_matmul_with_device_scales(
+            &input,
+            &weight,
+            &scales,
+            1.0,
+            1.0,
+            None,
+            true,
+            None,
+            None,
+            Some(&invalid),
+        );
+        ensure!(result.is_err(), "malformed device scales were accepted");
+    }
+    Ok(())
+}
+
+fn real_e4b_nvfp4_single_fusion_matches_baseline(
+    setting: &str,
+    enabled_value: Option<&str>,
+) -> Result<()> {
     let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
         .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
     let bench_dir =
@@ -272,7 +314,11 @@ fn real_e4b_nvfp4_single_fusion_matches_baseline(setting: &str) -> Result<()> {
     let previous = std::env::var_os(setting);
     std::env::set_var(setting, "0");
     let (baseline, config) = load_model(Path::new(&model_dir), &device)?;
-    std::env::remove_var(setting);
+    if let Some(value) = enabled_value {
+        std::env::set_var(setting, value);
+    } else {
+        std::env::remove_var(setting);
+    }
     let (fused, fused_config) = load_model(Path::new(&model_dir), &device)?;
     if let Some(value) = previous {
         std::env::set_var(setting, value);

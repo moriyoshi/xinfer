@@ -19,6 +19,7 @@ struct Nvfp4MergedWeights {
     input_scale: f32,
     row_scales: Tensor,
     weight_scale_swizzled: Option<Tensor>,
+    resident_scales: Option<Tensor>,
     n: usize,
 }
 
@@ -37,6 +38,7 @@ pub struct MLP {
     activation: Activation,
     swiglu_limit: f32,
     gemma4_fused_gelu: bool,
+    gemma4_fused_gelu_fp4: bool,
 }
 
 impl MLP {
@@ -116,6 +118,13 @@ impl MLP {
                     input_scale: g.input_scale.max(u.input_scale),
                     row_scales,
                     weight_scale_swizzled: swizzled,
+                    resident_scales: super::linear::nvfp4_resident_scales(
+                        g.global_scale,
+                        g.input_scale.max(u.input_scale),
+                        &dev,
+                    )
+                    .ok()
+                    .flatten(),
                     n,
                 })
             }
@@ -564,12 +573,18 @@ impl MLP {
             activation: activation.clone(),
             swiglu_limit: 0.0,
             gemma4_fused_gelu: false,
+            gemma4_fused_gelu_fp4: false,
         })
     }
 
     /// Use the BF16 fused gated GELU path for a merged NVFP4 Gemma 4 MLP.
     pub fn with_gemma4_fused_gelu(mut self, enabled: bool) -> Self {
         self.gemma4_fused_gelu = enabled;
+        self
+    }
+
+    pub fn with_gemma4_fused_gelu_fp4(mut self, enabled: bool) -> Self {
+        self.gemma4_fused_gelu_fp4 = enabled;
         self
     }
 
@@ -602,7 +617,7 @@ impl MLP {
                 } else {
                     xs.clone()
                 };
-                let gate_up = attention_rs::nvfp4_linear::nvfp4_matmul(
+                let gate_up = attention_rs::nvfp4_linear::nvfp4_matmul_with_device_scales(
                     &x_2d,
                     &m.blocks,
                     &m.scales,
@@ -612,12 +627,18 @@ impl MLP {
                     crate::models::layers::linear::linear_is_prefill(),
                     m.weight_scale_swizzled.as_ref(),
                     Some(&m.row_scales),
+                    m.resident_scales.as_ref(),
                 )?;
                 #[cfg(feature = "cuda")]
                 if self.gemma4_fused_gelu
                     && self.swiglu_limit == 0.0
                     && matches!(self.activation, Activation::GeluPytorchTanh)
                 {
+                    if self.gemma4_fused_gelu_fp4 {
+                        if let Some(output) = self.down_proj.forward_gated_gelu(&gate_up)? {
+                            return Ok(output);
+                        }
+                    }
                     if let Some(activated) = super::gemma4_gated_gelu::forward(&gate_up, m.n)? {
                         return self.down_proj.forward(&activated);
                     }

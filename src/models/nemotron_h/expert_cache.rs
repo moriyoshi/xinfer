@@ -701,6 +701,9 @@ impl ExpertSource {
             input_scale,
             bias: None,
             weight_scale_swizzled,
+            // Expert cache admission is byte-bounded; keep auxiliary scales
+            // on the existing scratch path until they are budgeted as well.
+            resident_scales: None,
         }))
     }
 }
