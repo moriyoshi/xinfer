@@ -98,6 +98,50 @@ extern "C" __global__ void xinfer_gemma4_rms_norm_add_bf16_f32(
   }
 }
 
+// The layer output scale follows the rounded BF16 residual sum. Keep both
+// roundings so this replaces the separate BF16 broadcast multiply exactly.
+extern "C" __global__ void xinfer_gemma4_rms_norm_add_scale_bf16_f32(
+    const uint16_t* __restrict__ input,
+    const float* __restrict__ weight,
+    const uint16_t* __restrict__ residual,
+    const uint16_t* __restrict__ layer_scale,
+    uint16_t* __restrict__ output,
+    int columns,
+    float eps) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lanes = blockDim.x;
+  float sum = 0.0f;
+  for (int col = tid; col < columns; col += lanes) {
+    const float value = bf16_to_f32(input[static_cast<unsigned long long>(row) * columns + col]);
+    sum = fmaf(value, value, sum);
+  }
+  sum = warp_sum(sum);
+  if (lanes > 32) {
+    __shared__ float warp_sums[32];
+    const int warp = tid / 32;
+    const int lane = tid % 32;
+    if (tid < 32) warp_sums[tid] = 0.0f;
+    __syncthreads();
+    if (lane == 0) warp_sums[warp] = sum;
+    __syncthreads();
+    sum = lane < lanes / 32 ? warp_sums[lane] : 0.0f;
+    sum = warp_sum(sum);
+    if (warp == 0 && lane == 0) warp_sums[0] = sum;
+    __syncthreads();
+    sum = warp_sums[0];
+  }
+  const float scale = rsqrtf(sum / static_cast<float>(columns) + eps);
+  const float output_scale = bf16_to_f32(layer_scale[0]);
+  for (int col = tid; col < columns; col += lanes) {
+    const unsigned long long index = static_cast<unsigned long long>(row) * columns + col;
+    const float value = bf16_to_f32(input[index]);
+    const float normalized = bf16_to_f32(f32_to_bf16(scale * value * weight[col]));
+    const float added = bf16_to_f32(f32_to_bf16(normalized + bf16_to_f32(residual[index])));
+    output[index] = f32_to_bf16(added * output_scale);
+  }
+}
+
 // Gemma 4 computes post-attention RMSNorm, adds the residual in BF16, then
 // computes pre-feedforward RMSNorm of that rounded sum. Both outputs are used.
 extern "C" __global__ void xinfer_gemma4_post_attn_pre_ff_bf16(

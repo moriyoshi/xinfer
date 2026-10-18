@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 const KERNEL: &str = "xinfer_gemma4_rms_norm_bf16_f32";
 const ADD_KERNEL: &str = "xinfer_gemma4_rms_norm_add_bf16_f32";
+const ADD_SCALE_KERNEL: &str = "xinfer_gemma4_rms_norm_add_scale_bf16_f32";
 const POST_PRE_KERNEL: &str = "xinfer_gemma4_post_attn_pre_ff_bf16";
 static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -37,7 +38,7 @@ fn module(device: &candle_core::CudaDevice) -> Result<String> {
     if sm < 80 {
         candle_core::bail!("Gemma RMSNorm requires compute capability 8.0 or later")
     }
-    let name = format!("xinfer_gemma4_rms_norm_sm{sm}_v3");
+    let name = format!("xinfer_gemma4_rms_norm_sm{sm}_v4");
     let _guard = COMPILE_LOCK.lock().unwrap();
     if !cuda.has_func(&name, KERNEL) {
         let capture = capture_status(*cuda.cu_stream())
@@ -53,8 +54,12 @@ fn module(device: &candle_core::CudaDevice) -> Result<String> {
             },
         )
         .map_err(|e| candle_core::Error::Msg(format!("compile Gemma RMSNorm: {e}")))?;
-        cuda.load_ptx(ptx, &name, &[KERNEL, ADD_KERNEL, POST_PRE_KERNEL])
-            .map_err(|e| candle_core::Error::Msg(format!("load Gemma RMSNorm: {e}")))?;
+        cuda.load_ptx(
+            ptx,
+            &name,
+            &[KERNEL, ADD_KERNEL, ADD_SCALE_KERNEL, POST_PRE_KERNEL],
+        )
+        .map_err(|e| candle_core::Error::Msg(format!("load Gemma RMSNorm: {e}")))?;
     }
     Ok(name)
 }
@@ -65,7 +70,7 @@ pub(crate) fn prepare(device: &candle_core::Device) -> Result<()> {
 }
 
 pub(crate) fn forward(input: &Tensor, weight: &Tensor, eps: f32) -> Result<Option<Tensor>> {
-    forward_inner(input, weight, None, eps)
+    forward_inner(input, weight, None, None, eps)
 }
 
 pub(crate) fn forward_add(
@@ -74,7 +79,24 @@ pub(crate) fn forward_add(
     residual: &Tensor,
     eps: f32,
 ) -> Result<Option<Tensor>> {
-    forward_inner(input, weight, Some(residual), eps)
+    forward_inner(input, weight, Some(residual), None, eps)
+}
+
+pub(crate) fn forward_add_scale(
+    input: &Tensor,
+    weight: &Tensor,
+    residual: &Tensor,
+    layer_scale: &Tensor,
+    eps: f32,
+) -> Result<Option<Tensor>> {
+    if layer_scale.dtype() != DType::BF16
+        || !layer_scale.device().same_device(input.device())
+        || !layer_scale.is_contiguous()
+        || layer_scale.dims() != [1]
+    {
+        return Ok(None);
+    }
+    forward_inner(input, weight, Some(residual), Some(layer_scale), eps)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,6 +173,7 @@ fn forward_inner(
     input: &Tensor,
     weight: &Tensor,
     residual: Option<&Tensor>,
+    layer_scale: Option<&Tensor>,
     eps: f32,
 ) -> Result<Option<Tensor>> {
     if input.dtype() != DType::BF16
@@ -190,7 +213,9 @@ fn forward_inner(
     let function = cuda
         .get_func(
             &name,
-            if residual.is_some() {
+            if layer_scale.is_some() {
+                ADD_SCALE_KERNEL
+            } else if residual.is_some() {
                 ADD_KERNEL
             } else {
                 KERNEL
@@ -203,7 +228,23 @@ fn forward_inner(
         block_dim: (threads, 1, 1),
         shared_mem_bytes: 0,
     };
-    if let Some(residual) = residual {
+    if let (Some(residual), Some(layer_scale)) = (residual, layer_scale) {
+        unsafe {
+            function.launch(
+                config,
+                (
+                    pointer_bf16(input)?,
+                    pointer_f32(weight)?,
+                    pointer_bf16(residual)?,
+                    pointer_bf16(layer_scale)?,
+                    pointer_bf16(&output)?,
+                    columns as i32,
+                    eps,
+                ),
+            )
+        }
+        .map_err(|e| candle_core::Error::Msg(format!("launch Gemma RMSNorm+add+scale: {e}")))?;
+    } else if let Some(residual) = residual {
         unsafe {
             function.launch(
                 config,
@@ -267,6 +308,10 @@ mod tests {
             let expected_add = (&expected + &residual)?;
             let actual_add =
                 forward_add(&input, &weight, &residual, eps)?.expect("contiguous BF16 residual");
+            let layer_scale = Tensor::from_vec(vec![0.75f32], 1, &device)?.to_dtype(DType::BF16)?;
+            let expected_scaled = expected_add.broadcast_mul(&layer_scale)?;
+            let actual_scaled = forward_add_scale(&input, &weight, &residual, &layer_scale, eps)?
+                .expect("contiguous BF16 layer scale");
             let pre_weight = Tensor::from_vec(
                 (0..columns)
                     .map(|i| 0.75 + (i % 23) as f32 / 53.0)
@@ -314,6 +359,18 @@ mod tests {
             assert!(
                 max_add_abs <= 0.03125,
                 "rows={rows} columns={columns} max_add_abs={max_add_abs}"
+            );
+            let expected_scaled = expected_scaled
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let actual_scaled = actual_scaled
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert_eq!(
+                actual_scaled, expected_scaled,
+                "rows={rows} columns={columns}"
             );
             let paired_add = paired_add
                 .to_dtype(DType::F32)?

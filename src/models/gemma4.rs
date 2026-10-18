@@ -65,6 +65,32 @@ fn gemma4_norm_add(norm: &NormX, xs: &Tensor, residual: &Tensor, fused: bool) ->
     norm.forward(xs)? + residual
 }
 
+fn gemma4_norm_add_scale(
+    norm: &NormX,
+    xs: &Tensor,
+    residual: &Tensor,
+    layer_scale: &Tensor,
+    fused_norm: bool,
+    fused_scale: bool,
+) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if fused_scale {
+        if let Some((weight, eps)) = norm.f32_rms_weight_eps() {
+            if let Some(output) = crate::models::layers::gemma4_rms_norm::forward_add_scale(
+                xs,
+                &weight,
+                residual,
+                layer_scale,
+                eps,
+            )? {
+                return Ok(output);
+            }
+        }
+    }
+    gemma4_norm_add(norm, xs, residual, fused_norm)?
+        .broadcast_mul(&layer_scale.to_dtype(xs.dtype())?)
+}
+
 struct Gemma4Router {
     scale: Tensor,
     proj: candle_nn::Linear,
@@ -220,6 +246,7 @@ pub struct Gemma4DecoderLayer {
     moe: Option<Gemma4MoE>,
     gemma4_router: Option<Gemma4Router>,
     fused_rms_norm: bool,
+    fused_layer_scale: bool,
     input_layernorm: NormX,
     post_attention_layernorm: NormX,
     pre_feedforward_layernorm: NormX,
@@ -260,6 +287,8 @@ impl Gemma4DecoderLayer {
         let default_fusions = default_cuda_nvfp4_fusions(config, dtype, &vb.device());
         let fused_gelu = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_GELU", default_fusions);
         let fused_rms_norm = gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_RMSNORM", default_fusions);
+        let fused_layer_scale = fused_rms_norm
+            && gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_LAYER_SCALE", default_fusions);
         let fused_qk_rope = default_fusions
             && gemma4_fusion_enabled("XINFER_GEMMA4_FUSED_QK_ROPE", default_fusions);
 
@@ -552,6 +581,7 @@ impl Gemma4DecoderLayer {
             mlp,
             moe,
             fused_rms_norm,
+            fused_layer_scale,
             input_layernorm,
             post_attention_layernorm,
             pre_feedforward_layernorm,
@@ -702,29 +732,42 @@ impl Gemma4DecoderLayer {
             mlp_output
         };
 
-        let mut xs = gemma4_norm_add(
-            &self.post_feedforward_layernorm,
-            &combined,
-            &residual,
-            self.fused_rms_norm,
-        )?;
-
         if let (Some(gate), Some(proj), Some(norm), Some(pli)) = (
             &self.per_layer_input_gate,
             &self.per_layer_projection,
             &self.post_per_layer_input_norm,
             per_layer_input,
         ) {
+            let xs = gemma4_norm_add(
+                &self.post_feedforward_layernorm,
+                &combined,
+                &residual,
+                self.fused_rms_norm,
+            )?;
             let residual_ple = xs.clone();
             let gated = gate
                 .forward(&xs)?
                 .apply(&candle_nn::Activation::GeluPytorchTanh)?;
             let gated = (gated * pli)?;
             let projected = proj.forward(&gated)?;
-            xs = gemma4_norm_add(norm, &projected, &residual_ple, self.fused_rms_norm)?;
+            return gemma4_norm_add_scale(
+                norm,
+                &projected,
+                &residual_ple,
+                &self.layer_scalar,
+                self.fused_rms_norm,
+                self.fused_layer_scale,
+            );
         }
 
-        xs.broadcast_mul(&self.layer_scalar.to_dtype(xs.dtype())?)
+        gemma4_norm_add_scale(
+            &self.post_feedforward_layernorm,
+            &combined,
+            &residual,
+            &self.layer_scalar,
+            self.fused_rms_norm,
+            self.fused_layer_scale,
+        )
     }
 }
 

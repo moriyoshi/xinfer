@@ -85,6 +85,20 @@ An Nsight Systems interval for one fused 8K prefill records 1,057 ms summed GPU 
 
 The same 8K interval has 737 host-to-device copies totaling only 9,356 bytes; 603 are four-byte copies. Two four-byte scalar uploads occur in each of the 301 NVFP4 linear calls at `attention-rs/src/nvfp4_linear.rs` when calibrated input scales are used. Nsight reports 211 ms summed CPU API time for the 737 copies and 0.385 ms of GPU transfer time. The API duration overlaps GPU work and is **not** an additive 211 ms saving opportunity. A resident per-linear GPU scale pair, passed through an attention-rs NVFP4 API, is a plausible next cross-crate lever to test before another GEMM rewrite. The other remaining Xinfer candidates are the residual/norm chain and prefill host launch overhead. The four paired sweeps recorded no competing GPU process; minimum `MemAvailable` after the prior fuzz process exited was 99.1 GiB.
 
+## Fused layer output scale
+
+Each Gemma 4 decoder layer multiplies its BF16 output by a BF16 `layer_scalar` after the final RMSNorm and residual addition. A Xinfer-owned CUDA kernel now performs that multiply within the final RMSNorm/add launch, preserving the separate BF16 rounding of the norm and residual sum. It is enabled by default for the BF16 NVFP4 CUDA configuration when fused RMSNorm is enabled; set `XINFER_GEMMA4_FUSED_LAYER_SCALE=0` to use the separate multiply. Other dtypes, devices, and unsupported tensor layouts use the existing operations. The real checkpoint yielded bit-identical logits for 40, 2,048, and 8,192-token prefixes and 48 teacher-forced continuation positions after each prefix (147/147 top-1). The focused CUDA test also compares every output BF16 word with separate RMSNorm/add/multiply.
+
+With no other GPU compute process, two six-sample sweeps in baseline/fused/fused/baseline order used the same checkpoint, token IDs, default Q/K and GELU/RMSNorm fusions, hardware NVFP4 decode, and `XINFER_GEMMA4_BF16_GEMV=1`. The baseline retained fused RMSNorm/add and disabled only the final scale fusion:
+
+| Prompt tokens | Separate scale prefill | Fused scale prefill | Separate scale decode | Fused scale decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 35.15 ms | 35.46 ms | 31.24 ms/step | 29.93 ms/step |
+| 2,048 | 263.44 ms | 255.76 ms | 32.67 ms/step | 32.58 ms/step |
+| 8,192 | 1,311.79 ms | 1,236.59 ms | 36.40 ms/step | 34.73 ms/step |
+
+These are medians of six samples per mode. The 8K median difference is 75.2 ms (5.7%); compared with the earlier vLLM first-token median of 903.1 ms, the remaining Xinfer prefill gap is 333 ms (1.37×). Host fuzz processes consumed several CPU cores during this sweep and individual baseline 8K samples ranged from 1,270 to 1,633 ms, so the end-to-end gain is less certain than the exact-logit result. The runs did not remeasure vLLM. Raw Xinfer logs are `/tmp/xinfer-gemma4-layer-scale-v2-{baseline1,fused1,fused2,baseline2}.log` on the measurement host. An initial sweep accidentally disabled the fused final RMSNorm in its baseline and is excluded from these numbers. The scalar-upload change still needs an attention-rs API, and its 211 ms summed CPU API duration cannot be counted as recoverable wall time without a paired measurement.
+
 ## Reproduction
 
 `tests/prepare_gemma4_vllm_bench.py` builds the exact token streams and a two-file BF16-KV metadata overlay from the checkpoint and the 40-token reference. It leaves the weight shards untouched; the symlinks in the overlay resolve when the original checkpoint is mounted at `/weights` in Docker. Xinfer's opt-in test is `bench_real_e4b_nvfp4_single_sequence` in `tests/gemma4_shared_kv.rs`.

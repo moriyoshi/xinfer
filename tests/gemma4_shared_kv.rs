@@ -254,20 +254,30 @@ fn real_e4b_nvfp4_default_fusions_match_opt_out() -> Result<()> {
 #[test]
 #[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
 fn real_e4b_nvfp4_fused_qk_rope_matches_baseline() -> Result<()> {
+    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_FUSED_QK_ROPE")
+}
+
+#[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_fused_layer_scale_matches_baseline() -> Result<()> {
+    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_FUSED_LAYER_SCALE")
+}
+
+fn real_e4b_nvfp4_single_fusion_matches_baseline(setting: &str) -> Result<()> {
     let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
         .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
     let bench_dir =
         std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
     let device = Device::new_cuda(0)?;
-    let previous = std::env::var_os("XINFER_GEMMA4_FUSED_QK_ROPE");
-    std::env::set_var("XINFER_GEMMA4_FUSED_QK_ROPE", "0");
+    let previous = std::env::var_os(setting);
+    std::env::set_var(setting, "0");
     let (baseline, config) = load_model(Path::new(&model_dir), &device)?;
-    std::env::remove_var("XINFER_GEMMA4_FUSED_QK_ROPE");
+    std::env::remove_var(setting);
     let (fused, fused_config) = load_model(Path::new(&model_dir), &device)?;
     if let Some(value) = previous {
-        std::env::set_var("XINFER_GEMMA4_FUSED_QK_ROPE", value);
+        std::env::set_var(setting, value);
     } else {
-        std::env::remove_var("XINFER_GEMMA4_FUSED_QK_ROPE");
+        std::env::remove_var(setting);
     }
     ensure!(config.hidden_size == fused_config.hidden_size);
     for size in [40usize, 2048, 8192] {
@@ -290,15 +300,15 @@ fn real_e4b_nvfp4_fused_qk_rope_matches_baseline() -> Result<()> {
             next = argmax(&base_logits) as u32;
         }
         eprintln!(
-            "gemma4_qk_rope_parity tokens={size} prefix_max_abs={prefix_max_abs} continuation_max_abs={continuation_max_abs} top1={top1_equal}/49"
+            "gemma4_fusion_parity setting={setting} tokens={size} prefix_max_abs={prefix_max_abs} continuation_max_abs={continuation_max_abs} top1={top1_equal}/49"
         );
         ensure!(
             prefix_max_abs == 0.0 && continuation_max_abs == 0.0,
-            "fused Q/K RoPE changed logits at {size}"
+            "{setting} changed logits at {size}"
         );
         ensure!(
             top1_equal == 49,
-            "fused Q/K RoPE changed a top-1 choice at {size}"
+            "{setting} changed a top-1 choice at {size}"
         );
     }
     Ok(())
