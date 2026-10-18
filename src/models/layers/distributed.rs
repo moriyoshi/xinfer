@@ -244,6 +244,45 @@ impl MergedParallelColumnLinear {
         })
     }
 
+    /// Reshape the full packed output before slicing heads, so the returned
+    /// views retain the packed token stride without copying rows.
+    pub fn forward_head_views(&self, x: &Tensor, head_dim: usize) -> Result<Vec<Tensor>> {
+        let Some(output_splits) = &self.output_splits else {
+            candle_core::bail!("head views require a packed linear")
+        };
+        if self.linears.len() != 1 || head_dim == 0 {
+            candle_core::bail!("head views require one packed linear and a nonzero head width")
+        }
+        if output_splits
+            .iter()
+            .any(|split| !split.is_multiple_of(head_dim))
+        {
+            candle_core::bail!("packed output split is not a whole number of heads")
+        }
+        let mut ys = self.linears[0].forward(x)?;
+        if let Some(Some(bias)) = self.biases.first() {
+            ys = ys.broadcast_add(bias)?;
+        }
+        let (tokens, total_dim) = ys.dims2()?;
+        let expected_dim: usize = output_splits.iter().sum();
+        if total_dim != expected_dim {
+            candle_core::bail!(
+                "packed head view output dim {} vs expected {}",
+                total_dim,
+                expected_dim
+            )
+        }
+        let heads = ys.reshape((tokens, total_dim / head_dim, head_dim))?;
+        let mut outputs = Vec::with_capacity(output_splits.len());
+        let mut start = 0usize;
+        for split in output_splits {
+            let head_count = split / head_dim;
+            outputs.push(heads.narrow(1, start, head_count)?);
+            start += head_count;
+        }
+        Ok(outputs)
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Vec<Tensor>> {
         if let Some(output_splits) = &self.output_splits {
             if self.linears.len() != 1 {

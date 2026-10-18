@@ -2,6 +2,7 @@ use crate::models::layers::distributed::{
     kv_head_shard, shard, Comm, MergedParallelColumnLinear, ReplicatedLinear,
     TensorParallelColumnLinear, TensorParallelRowLinear,
 };
+use crate::models::layers::linear::{LinearX, LnNvfp4};
 use crate::models::layers::others::{rms_norm, rms_norm_sharded, NormX};
 use crate::models::layers::rotary_emb::ApplyRotaryEmbedding;
 use crate::models::layers::sparse_attention::{
@@ -24,6 +25,7 @@ enum QkvProjection {
         v_proj: TensorParallelColumnLinear,
     },
     Packed(MergedParallelColumnLinear),
+    PackedViews(MergedParallelColumnLinear),
 }
 
 /// Opt-in observation of the exact query sent to paged attention and its
@@ -83,6 +85,64 @@ pub struct Attention {
 }
 
 impl Attention {
+    fn try_pack_gemma4_nvfp4_qkv(
+        q_proj: &TensorParallelColumnLinear,
+        k_proj: &TensorParallelColumnLinear,
+        v_proj: &TensorParallelColumnLinear,
+    ) -> Result<Option<MergedParallelColumnLinear>> {
+        let (Some(q), Some(k), Some(v)) = (q_proj.as_nvfp4(), k_proj.as_nvfp4(), v_proj.as_nvfp4())
+        else {
+            return Ok(None);
+        };
+        // A single activation quantization and GEMM must use the same scalar
+        // calibration as each original projection. Other checkpoints retain
+        // their separate projections if either scalar differs.
+        if [k, v].iter().any(|p| {
+            p.input_scale.to_bits() != q.input_scale.to_bits()
+                || p.global_scale.to_bits() != q.global_scale.to_bits()
+                || p.bias.is_some()
+        }) || q.bias.is_some()
+        {
+            return Ok(None);
+        }
+        let local_dims = [q.blocks.dim(0)?, k.blocks.dim(0)?, v.blocks.dim(0)?];
+        if local_dims.iter().any(|dim| !dim.is_multiple_of(32))
+            || k.blocks.dim(1)? != q.blocks.dim(1)?
+            || v.blocks.dim(1)? != q.blocks.dim(1)?
+            || k.scales.dim(1)? != q.scales.dim(1)?
+            || v.scales.dim(1)? != q.scales.dim(1)?
+        {
+            return Ok(None);
+        }
+
+        let blocks = Tensor::cat(&[&q.blocks, &k.blocks, &v.blocks], 0)?;
+        let scales = Tensor::cat(&[&q.scales, &k.scales, &v.scales], 0)?;
+        #[cfg(feature = "cuda")]
+        let weight_scale_swizzled = if q.weight_scale_swizzled.is_some()
+            && k.weight_scale_swizzled.is_some()
+            && v.weight_scale_swizzled.is_some()
+        {
+            Some(attention_rs::nvfp4_linear::swizzle_nvfp4_weight_scales(
+                &scales,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let weight_scale_swizzled = None;
+        let packed = LinearX::LnNvfp4(LnNvfp4 {
+            blocks,
+            scales,
+            global_scale: q.global_scale,
+            input_scale: q.input_scale,
+            bias: None,
+            weight_scale_swizzled,
+            resident_scales: q.resident_scales.clone(),
+        });
+        MergedParallelColumnLinear::from_packed_local_qlinear(packed, None, local_dims.to_vec())
+            .map(Some)
+    }
+
     fn normalize_sharded_2d(
         t: Tensor,
         shard: candle_nn::var_builder::Shard,
@@ -527,6 +587,24 @@ impl Attention {
         let world_size = comm.world_size();
         let attention_heads = num_heads / world_size;
         let (kv_heads, kv_shard) = kv_head_shard(num_kv_heads, comm.rank(), world_size)?;
+        #[cfg(feature = "cuda")]
+        let packed_gemma4_nvfp4 = matches!(
+            arch.as_str(),
+            "Gemma4ForConditionalGeneration" | "Gemma4ForCausalLM"
+        ) && !attention_bias
+            && !attn_output_gate
+            && dtype == DType::BF16
+            && cfg!(feature = "cutlass")
+            && vb.device().is_cuda()
+            && attention_rs::cuda_utils::sm_version(vb.device().as_cuda_device()?).unwrap_or(0)
+                >= 100
+            && config
+                .quantization_config
+                .as_ref()
+                .is_some_and(|cfg| cfg.quant_method == "nvfp4")
+            && std::env::var_os("XINFER_GEMMA4_PACKED_QKV_NVFP4").is_some_and(|value| value == "1");
+        #[cfg(not(feature = "cuda"))]
+        let packed_gemma4_nvfp4 = false;
 
         let qkv_proj = if query_only {
             QkvProjection::QueryOnly(TensorParallelColumnLinear::load_with_hints(
@@ -608,10 +686,22 @@ impl Attention {
                 },
                 dtype,
             )?;
-            QkvProjection::Separate {
-                q_proj,
-                k_proj,
-                v_proj,
+            if packed_gemma4_nvfp4 {
+                if let Some(packed) = Self::try_pack_gemma4_nvfp4_qkv(&q_proj, &k_proj, &v_proj)? {
+                    QkvProjection::PackedViews(packed)
+                } else {
+                    QkvProjection::Separate {
+                        q_proj,
+                        k_proj,
+                        v_proj,
+                    }
+                }
+            } else {
+                QkvProjection::Separate {
+                    q_proj,
+                    k_proj,
+                    v_proj,
+                }
             }
         };
 
@@ -1098,7 +1188,7 @@ impl Attention {
     ) -> Result<Tensor> {
         let (seq_len, _) = xs.dims2()?;
 
-        let (q_raw, k, v) = match &self.qkv_proj {
+        let (q_raw, k, v, head_views) = match &self.qkv_proj {
             QkvProjection::QueryOnly(_) => {
                 candle_core::bail!("query-only attention requires forward_with_shared_kv")
             }
@@ -1110,6 +1200,7 @@ impl Attention {
                 q_proj.forward(xs)?,
                 k_proj.forward(xs)?,
                 v_proj.forward(xs)?,
+                false,
             ),
             QkvProjection::Packed(qkv_proj) => {
                 let qkv = qkv_proj.forward(xs)?;
@@ -1119,11 +1210,18 @@ impl Attention {
                         qkv.len()
                     );
                 }
-                (qkv[0].clone(), qkv[1].clone(), qkv[2].clone())
+                (qkv[0].clone(), qkv[1].clone(), qkv[2].clone(), false)
+            }
+            QkvProjection::PackedViews(qkv_proj) => {
+                let qkv = qkv_proj.forward_head_views(xs, self.head_dim)?;
+                (qkv[0].clone(), qkv[1].clone(), qkv[2].clone(), true)
             }
         };
 
         let local_q_dim = self.num_heads * self.head_dim;
+        if head_views && self.attn_output_gate {
+            candle_core::bail!("packed head views do not support a gated query projection")
+        }
         let (q_linear, gate) = if self.attn_output_gate {
             let q_dim = q_raw.dim(1)?;
             if q_dim != local_q_dim * 2 {
@@ -1144,9 +1242,17 @@ impl Attention {
             (q_raw, None)
         };
 
-        let q = q_linear.reshape((seq_len, self.num_heads, self.head_dim))?;
-        let k = k.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
-        let v = v.reshape((seq_len, self.num_kv_heads, self.head_dim))?;
+        let (q, k, v) = if head_views {
+            // The fused Q/K transform accepts the packed row stride. The
+            // paged KV writer expects V rows to be contiguous.
+            (q_linear, k, v.contiguous()?)
+        } else {
+            (
+                q_linear.reshape((seq_len, self.num_heads, self.head_dim))?,
+                k.reshape((seq_len, self.num_kv_heads, self.head_dim))?,
+                v.reshape((seq_len, self.num_kv_heads, self.head_dim))?,
+            )
+        };
 
         let (q, k) = if let Some((q, Some(k))) =
             self.fused_gemma4_qk_rope(&q, Some(&k), rotary_emb, positions)?
@@ -1343,7 +1449,7 @@ impl Attention {
                 k_proj.forward(xs)?,
                 v_proj.forward(xs)?,
             ),
-            QkvProjection::Packed(qkv_proj) => {
+            QkvProjection::Packed(qkv_proj) | QkvProjection::PackedViews(qkv_proj) => {
                 let qkv = qkv_proj.forward(xs)?;
                 (qkv[0].clone(), qkv[1].clone(), qkv[2].clone())
             }
@@ -1404,6 +1510,35 @@ impl Attention {
             y.to_dtype(xs.dtype())?
         };
         self.o_proj.forward(&y)
+    }
+}
+
+#[cfg(test)]
+mod packed_nvfp4_qkv_tests {
+    use super::*;
+
+    fn projection(input_scale: f32) -> Result<TensorParallelColumnLinear> {
+        let device = candle_core::Device::Cpu;
+        Ok(TensorParallelColumnLinear::new(LinearX::LnNvfp4(LnNvfp4 {
+            blocks: Tensor::zeros((32, 16), DType::U8, &device)?,
+            scales: Tensor::zeros((32, 2), DType::U8, &device)?,
+            global_scale: 0.25,
+            input_scale,
+            bias: None,
+            weight_scale_swizzled: None,
+            resident_scales: None,
+        })))
+    }
+
+    #[test]
+    fn packing_requires_identical_calibration() -> Result<()> {
+        let q = projection(0.5)?;
+        let k = projection(0.5)?;
+        let v = projection(0.25)?;
+        assert!(Attention::try_pack_gemma4_nvfp4_qkv(&q, &k, &v)?.is_none());
+        let v = projection(0.5)?;
+        assert!(Attention::try_pack_gemma4_nvfp4_qkv(&q, &k, &v)?.is_some());
+        Ok(())
     }
 }
 

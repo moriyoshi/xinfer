@@ -32,7 +32,9 @@ extern "C" __global__ void xinfer_gemma4_qk_norm_rope(
     const int64_t* __restrict__ positions,
     uint16_t* __restrict__ q_out,
     uint16_t* __restrict__ k_out,
-    int q_heads, int k_heads, int width, float q_eps, float k_eps,
+    int q_heads, int k_heads, int width,
+    uint64_t q_token_stride, uint64_t k_token_stride,
+    float q_eps, float k_eps,
     int interleaved) {
   const int token = blockIdx.x;
   const int head = blockIdx.y;
@@ -43,12 +45,16 @@ extern "C" __global__ void xinfer_gemma4_qk_norm_rope(
   uint16_t* output = is_q ? q_out : k_out;
   const float* weight = is_q ? q_weight : k_weight;
   const float eps = is_q ? q_eps : k_eps;
-  const uint64_t row = (static_cast<uint64_t>(token) * heads + local_head) * width;
+  const uint64_t input_row = static_cast<uint64_t>(token) *
+      (is_q ? q_token_stride : k_token_stride) +
+      static_cast<uint64_t>(local_head) * width;
+  const uint64_t output_row =
+      (static_cast<uint64_t>(token) * heads + local_head) * width;
   const int tid = threadIdx.x;
 
   float sum = 0.0f;
   for (int col = tid; col < width; col += blockDim.x) {
-    const float x = as_f32(input[row + col]);
+    const float x = as_f32(input[input_row + col]);
     sum = fmaf(x, x, sum);
   }
   sum = warp_sum(sum);
@@ -71,11 +77,11 @@ extern "C" __global__ void xinfer_gemma4_qk_norm_rope(
   for (int pair = tid; pair < width / 2; pair += blockDim.x) {
     const int x_col = interleaved ? 2 * pair : pair;
     const int y_col = interleaved ? 2 * pair + 1 : pair + width / 2;
-    const float x = scale * as_f32(input[row + x_col]) * weight[x_col];
-    const float y = scale * as_f32(input[row + y_col]) * weight[y_col];
+    const float x = scale * as_f32(input[input_row + x_col]) * weight[x_col];
+    const float y = scale * as_f32(input[input_row + y_col]) * weight[y_col];
     const float c = cos[cs_row + pair];
     const float s = sin[cs_row + pair];
-    output[row + x_col] = as_bf16(x * c - y * s);
-    output[row + y_col] = as_bf16(y * c + x * s);
+    output[output_row + x_col] = as_bf16(x * c - y * s);
+    output[output_row + y_col] = as_bf16(y * c + x * s);
   }
 }

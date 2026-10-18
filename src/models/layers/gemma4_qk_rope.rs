@@ -31,7 +31,7 @@ fn module(device: &candle_core::CudaDevice) -> Result<String> {
     if sm < 80 {
         candle_core::bail!("Gemma Q/K RoPE requires compute capability 8.0 or later")
     }
-    let name = format!("xinfer_gemma4_qk_rope_sm{sm}_v1");
+    let name = format!("xinfer_gemma4_qk_rope_sm{sm}_v2");
     let _guard = COMPILE_LOCK.lock().unwrap();
     if !cuda.has_func(&name, KERNEL) {
         let capture = capture_status(*cuda.cu_stream())
@@ -75,7 +75,7 @@ pub(crate) fn forward(
         || cos.dtype() != DType::F32
         || sin.dtype() != DType::F32
         || positions.dtype() != DType::I64
-        || ![q, q_weight, cos, sin, positions]
+        || ![q_weight, cos, sin, positions]
             .iter()
             .all(|t| t.is_contiguous() && t.device().same_device(q.device()))
         || q.rank() != 3
@@ -87,12 +87,21 @@ pub(crate) fn forward(
         return Ok(None);
     }
     let (tokens, q_heads, width) = q.dims3()?;
-    let k_heads = if let Some((k, weight, _)) = &k {
+    let (q_storage, q_layout) = q.storage_and_layout();
+    let q_stride = q_layout.stride().to_vec();
+    drop(q_storage);
+    if q_stride.len() != 3
+        || q_stride[1] != width
+        || q_stride[2] != 1
+        || q_stride[0] < q_heads * width
+    {
+        return Ok(None);
+    }
+    let (k_heads, k_token_stride) = if let Some((k, weight, _)) = &k {
         if k.dtype() != DType::BF16
             || weight.dtype() != DType::F32
             || !k.device().same_device(q.device())
             || !weight.device().same_device(q.device())
-            || !k.is_contiguous()
             || !weight.is_contiguous()
             || k.rank() != 3
             || k.dim(0)? != tokens
@@ -101,9 +110,16 @@ pub(crate) fn forward(
         {
             return Ok(None);
         }
-        k.dim(1)?
+        let heads = k.dim(1)?;
+        let (k_storage, k_layout) = k.storage_and_layout();
+        let stride = k_layout.stride().to_vec();
+        drop(k_storage);
+        if stride.len() != 3 || stride[1] != width || stride[2] != 1 || stride[0] < heads * width {
+            return Ok(None);
+        }
+        (heads, stride[0])
     } else {
-        0
+        (0, 0)
     };
     if tokens == 0
         || tokens > u32::MAX as usize
@@ -161,6 +177,8 @@ pub(crate) fn forward(
                 q_heads as i32,
                 k_heads as i32,
                 width as i32,
+                q_stride[0] as u64,
+                k_token_stride as u64,
                 q_eps,
                 k_eps,
                 interleaved as i32,
@@ -176,6 +194,59 @@ mod tests {
     use super::*;
     use attention_rs::fused_rope::FusedRope;
     use std::time::Instant;
+
+    #[test]
+    fn packed_qk_row_strides_match_contiguous_inputs() -> Result<()> {
+        let Ok(device) = candle_core::Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let (tokens, q_heads, k_heads, width) = (7, 8, 2, 256);
+        let q_cols = q_heads * width;
+        let k_cols = k_heads * width;
+        let packed_cols = q_cols + 2 * k_cols;
+        let packed = Tensor::from_vec(
+            (0..tokens * packed_cols)
+                .map(|i| ((i * 53 % 401) as f32 - 200.0) / 59.0)
+                .collect::<Vec<_>>(),
+            (tokens, packed_cols),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let packed_heads = packed.reshape((tokens, packed_cols / width, width))?;
+        let q = packed_heads.narrow(1, 0, q_heads)?;
+        let k = packed_heads.narrow(1, q_heads, k_heads)?;
+        assert!(!q.is_contiguous() && !k.is_contiguous());
+        let weight = Tensor::ones((width,), DType::F32, &device)?;
+        let cos = Tensor::ones((1, width / 2), DType::F32, &device)?;
+        let sin = Tensor::zeros((1, width / 2), DType::F32, &device)?;
+        let positions = Tensor::zeros((tokens,), DType::I64, &device)?;
+        let run = |q: &Tensor, k: &Tensor| -> Result<(Tensor, Tensor)> {
+            let (q_out, k_out) = forward(
+                q,
+                Some((k, weight.clone(), 1e-6)),
+                &weight,
+                1e-6,
+                &cos,
+                &sin,
+                &positions,
+                true,
+            )?
+            .expect("supported Q/K layout");
+            Ok((q_out, k_out.expect("key output")))
+        };
+        let (q_view, k_view) = run(&q, &k)?;
+        let (q_ref, k_ref) = run(&q.contiguous()?, &k.contiguous()?)?;
+        for (actual, expected) in [(q_view, q_ref), (k_view, k_ref)] {
+            let actual = actual.flatten_all()?.to_vec1::<half::bf16>()?;
+            let expected = expected.flatten_all()?.to_vec1::<half::bf16>()?;
+            assert_eq!(actual.len(), expected.len());
+            assert!(actual
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+        Ok(())
+    }
 
     #[test]
     fn fused_qk_matches_f32_norm_then_rope() -> Result<()> {

@@ -276,6 +276,12 @@ fn real_e4b_nvfp4_gated_gelu_fp4_matches_baseline() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_packed_qkv_matches_baseline() -> Result<()> {
+    real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_PACKED_QKV_NVFP4", Some("1"))
+}
+
+#[test]
 fn nvfp4_resident_scales_reject_malformed_tensors() -> Result<()> {
     let device = Device::Cpu;
     let input = Tensor::zeros((1, 16), DType::F16, &device)?;
