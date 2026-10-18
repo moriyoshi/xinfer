@@ -46,8 +46,8 @@ ahash = "0.8.11"
 reedline = "0.40.0"
 pyo3 = { version = "0.25.1", features = ["extension-module", "abi3-py38"], optional = true }
 parking_lot = "0.12.4"
-attention-rs = { git = "https://github.com/moriyoshi/attention.rs.git", version="0.6.9", rev = "9a00ef599e16cc2f2d5c43633885eccd8531f18e" }
-kernels = { git = "https://github.com/moriyoshi/attention.rs.git", version = "0.6.9", rev = "9a00ef599e16cc2f2d5c43633885eccd8531f18e", optional = true }
+attention-rs = { git = "https://github.com/moriyoshi/attention.rs.git", version="0.6.9", rev = "4d51b974c3cd35097c2913ef3cac55474903848c" }
+kernels = { git = "https://github.com/moriyoshi/attention.rs.git", version = "0.6.9", rev = "4d51b974c3cd35097c2913ef3cac55474903848c", optional = true }
 once_cell = "1.21.3"
 memmap2 = "0.9"
 tqdm = "0.8.0"
