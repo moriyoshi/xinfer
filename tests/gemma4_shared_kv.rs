@@ -282,6 +282,86 @@ fn real_e4b_nvfp4_packed_qkv_matches_baseline() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires the real NVFP4 checkpoint and CUDA; run alone in its process"]
+fn real_e4b_nvfp4_swizzled_attention_matches_baseline() -> Result<()> {
+    let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
+        .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
+    let bench_dir =
+        std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
+    let device = Device::new_cuda(0)?;
+    let (model, config) = load_model(Path::new(&model_dir), &device)?;
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            if let Some(value) = &self.0 {
+                std::env::set_var("XINFER_FLASH_512_SWIZZLED", value);
+            } else {
+                std::env::remove_var("XINFER_FLASH_512_SWIZZLED");
+            }
+        }
+    }
+    let _restore = RestoreEnv(std::env::var_os("XINFER_FLASH_512_SWIZZLED"));
+    for size in [40usize, 2048, 8192] {
+        let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(
+            Path::new(&bench_dir).join(format!("tokens-{size}.json")),
+        )?)?;
+        for continued in [false, true] {
+            let base_cache = cache(&config, size + 64, true, &device)?;
+            let opt_cache = cache(&config, size + 64, true, &device)?;
+            let mut maximum = 0f32;
+            let mut top1 = 0usize;
+            let mut next = 0;
+            let chunks = if continued {
+                vec![0, size / 2, size]
+            } else {
+                vec![0, size]
+            };
+            for bounds in chunks.windows(2) {
+                std::env::set_var("XINFER_FLASH_512_SWIZZLED", "0");
+                let baseline = forward(
+                    &model,
+                    &device,
+                    &base_cache,
+                    &tokens[bounds[0]..bounds[1]],
+                    bounds[0],
+                    true,
+                )?;
+                std::env::set_var("XINFER_FLASH_512_SWIZZLED", "1");
+                let opt = forward(
+                    &model,
+                    &device,
+                    &opt_cache,
+                    &tokens[bounds[0]..bounds[1]],
+                    bounds[0],
+                    true,
+                )?;
+                ensure!(baseline.iter().chain(&opt).all(|x| x.is_finite()));
+                maximum = maximum.max(max_abs(&baseline, &opt));
+                top1 += usize::from(argmax(&baseline) == argmax(&opt));
+                next = argmax(&baseline) as u32;
+            }
+            for step in 0..48 {
+                std::env::set_var("XINFER_FLASH_512_SWIZZLED", "0");
+                let baseline = forward(&model, &device, &base_cache, &[next], size + step, false)?;
+                std::env::set_var("XINFER_FLASH_512_SWIZZLED", "1");
+                let opt = forward(&model, &device, &opt_cache, &[next], size + step, false)?;
+                ensure!(baseline.iter().chain(&opt).all(|x| x.is_finite()));
+                maximum = maximum.max(max_abs(&baseline, &opt));
+                top1 += usize::from(argmax(&baseline) == argmax(&opt));
+                next = argmax(&baseline) as u32;
+            }
+            let positions = chunks.len() - 1 + 48;
+            eprintln!("gemma4_swizzled_attention_parity tokens={size} continued={continued} max_abs={maximum} top1={top1}/{positions}");
+            ensure!(
+                maximum == 0. && top1 == positions,
+                "attention layout changed logits"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn nvfp4_resident_scales_reject_malformed_tensors() -> Result<()> {
     let device = Device::Cpu;
     let input = Tensor::zeros((1, 16), DType::F16, &device)?;
