@@ -144,6 +144,66 @@ The 8K prefill gain is 13.34 ms (1.1%); the 2K prefill result is effectively fla
 
 An Nsight comparison before the strided-view change showed why an ordinary packed projection was insufficient. Per 8K prefill window, FP4 activation quantization fell from about 139 to 127 ms, while contiguous Q/K/V splitting added 72 BF16 copy kernels taking about 23 ms. The strided-view path removes the Q/K copies; V remains contiguous for KV correctness. Raw sweep logs are under `/tmp/xinfer-gemma4-qkv-bench-20261019/`, and the initial packed/split Nsight exports are `/tmp/xinfer-gemma4-qkv-{baseline,packed}-profile.sqlite` on the measurement host. This option adds temporary concatenation buffers during model construction; peak construction memory was not measured.
 
+## Opt-in 512-wide attention shared-memory layout
+
+`XINFER_FLASH_512_SWIZZLED=1` selects a shared-memory permutation for native
+512-wide FP16/BF16 paged prefill. The attention-rs implementation is pinned at
+`f011ee482357a62774f38d6acffab2fc0d14938b`. It XORs aligned 16-byte chunks
+within each 128-byte row segment, avoiding the original power-of-two row-stride
+bank conflicts without increasing the 101,120-byte shared-memory arena. Global
+Q/K/V layouts, logical positions, masks, softmax and MMA accumulation order stay
+the same. The default, decode, FP8 KV and other head widths retain their existing
+paths. Runtime validation so far is limited to GB10; this remains opt-in.
+
+In the retained 8K trace, the seven full-attention layers accounted for about
+256 ms of 317 ms summed attention time. An isolated BF16 kernel experiment
+reduced one 8K full-attention launch from approximately 35 to 21 ms, with all
+33,554,432 output words identical. Hardware counter access was denied by the
+host, so bank-conflict counts were not measured directly.
+
+A 2026-10-22 baseline/swizzled/swizzled/baseline sweep used the same binary, checkpoint,
+token streams and BF16 KV, with resident scales, fused GELU/FP4, packed QKV and
+BF16 GEMV enabled in both modes. Medians use six samples per size and mode;
+loading and compilation are excluded. No other compute context was visible
+before or after any run; minimum monitored `MemAvailable` was 101.0 GiB.
+
+| Prompt tokens | Original prefill | Swizzled prefill | Original decode | Swizzled decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 27.82 ms | 28.17 ms | 24.67 ms/step | 24.77 ms/step |
+| 2,048 | 216.06 ms | 210.28 ms | 27.19 ms/step | 27.27 ms/step |
+| 8,192 | 1,075.49 ms | 974.22 ms | 29.44 ms/step | 29.46 ms/step |
+
+The 8K prefill reduction is 101.28 ms (9.4%); 2K improves by 2.7%. Decode does
+not use this kernel and is effectively unchanged. A fresh vLLM control was
+initially deferred when another GPU job started. The older vLLM 8K result of
+903.1 ms would put this Xinfer result about 1.08x slower, but that is a comparison
+between separate measurement windows, not a new paired engine comparison.
+
+`tests/flash_512_swizzle.rs` compares every FP16/BF16 output word, including
+partial tiles, shuffled physical pages, unequal batched sequence lengths,
+continued prefill, sliding windows and softcapping. A separate FP64 CPU softmax
+oracle has maximum absolute differences 0.00266 (BF16) and 0.000340 (FP16).
+CUDA initcheck reports zero errors with an uninitialized output allocation.
+`real_e4b_nvfp4_swizzled_attention_matches_baseline` checks the real checkpoint
+at 40/2K/8K, both full and split prefill, followed by 48 teacher-forced positions
+per schedule: maximum logit difference zero, top-1 agreement 297/297.
+
+```sh
+cargo test --release --features cuda,cutlass --test flash_512_swizzle \
+  swizzled_512_matches_original_and_cpu -- --exact --ignored --nocapture
+XINFER_GEMMA4_NVFP4_CHECKPOINT="$MODEL" XINFER_GEMMA4_BENCH_DIR="$BENCH" \
+XINFER_GEMMA4_BF16_GEMV=1 XINFER_NVFP4_HW_DECODE=1 \
+XINFER_NVFP4_RESIDENT_SCALES=1 XINFER_GEMMA4_FUSED_GELU_FP4=1 \
+XINFER_GEMMA4_PACKED_QKV_NVFP4=1 \
+cargo test --release --features cuda,cutlass --test gemma4_shared_kv \
+  real_e4b_nvfp4_swizzled_attention_matches_baseline -- --exact --ignored --nocapture
+```
+
+For the existing latency test, set `XINFER_FLASH_512_SWIZZLED` to `0` and `1`
+in interleaved process runs, keeping all other options identical. Raw results,
+watchdog records and the kernel experiment are retained under
+`/tmp/xinfer-gemma4-smem512-experiment/` on the measurement host.
+
 ## Reproduction
 
 `tests/prepare_gemma4_vllm_bench.py` builds the exact token streams and a two-file BF16-KV metadata overlay from the checkpoint and the 40-token reference. It leaves the weight shards untouched; the symlinks in the overlay resolve when the original checkpoint is mounted at `/weights` in Docker. Xinfer's opt-in test is `bench_real_e4b_nvfp4_single_sequence` in `tests/gemma4_shared_kv.rs`.
