@@ -1245,6 +1245,11 @@ impl Gemma4ForCausalLM {
             crate::models::layers::gemma4_qk_rope::prepare(device)?;
         }
 
+        #[cfg(feature = "flash")]
+        for layer in &mut layers {
+            layer.self_attn.prepare_gemma4_shared_kv_splitk(device)?;
+        }
+
         Ok(Self {
             embed_tokens,
             embed_tokens_per_layer,

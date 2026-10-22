@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--base-tokens", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--sizes", nargs="+", type=int, default=(40, 2048, 8192))
     args = parser.parse_args()
     if args.checkpoint.resolve() == args.output.resolve():
         raise ValueError("output must be separate from checkpoint")
@@ -28,7 +29,9 @@ def main():
         raise ValueError("expected the 40-token Gemma 4 reference prompt")
     args.output.mkdir(parents=True, exist_ok=True)
     head, body, tail = ids[:15], ids[15:35], ids[35:]
-    for size in (40, 2048, 8192):
+    for size in args.sizes:
+        if size <= len(head) + len(tail):
+            raise ValueError("prompt size must leave room for user content")
         count = size - len(head) - len(tail)
         repeats = (count + len(body) - 1) // len(body)
         tokens = ids if size == 40 else head + (body * repeats)[:count] + tail
