@@ -204,6 +204,109 @@ in interleaved process runs, keeping all other options identical. Raw results,
 watchdog records and the kernel experiment are retained under
 `/tmp/xinfer-gemma4-smem512-experiment/` on the measurement host.
 
+## Shared-KV split-K decode and graph control
+
+Follow-up measured 2026-10-22/23 on the same GB10 and checkpoint. The optimized
+8K trace showed three shared full-attention layers using single-pass decode
+(2.20 ms total), while four ordinary full-attention layers used split-K
+(1.54 ms total). `Attention::forward_with_shared_kv` supplied no workspace.
+One representative decode window took 29.69 ms wall time, including 12.40 ms
+of FP4 GEMM, 5.37 ms of vocabulary GEMV, and approximately 5 ms beyond summed
+kernel time. These components identify separate GPU and host-side opportunities.
+
+`XINFER_GEMMA4_SHARED_KV_SPLITK=1` now prepares a fixed FP32 workspace for each
+shared **full-attention** layer. Sliding-window layers retain single-pass decode.
+Allocation happens after all weights load and before model construction returns,
+so graph capture requires no growth. `XINFER_GEMMA4_SHARED_KV_SPLITK_MAX_BATCH`
+defaults to 8 and accepts 1 through 64; larger incoming batches fall back to
+single-pass attention. For E4B, the default adds exactly **6,316,032 live GPU
+bytes** across the three layers. This option is disabled by default.
+
+The final single/split-K/split-K/single sweep used six samples per mode and size,
+with all preceding optimization flags enabled in both modes. Each sample
+prefilled once and then decoded 48 greedy tokens. Loading and compilation are
+excluded. A one-second monitor recorded 243 workload samples with no foreign
+compute process; minimum `MemAvailable` was 89.36 GiB.
+
+| Prompt tokens | Single-pass prefill | Split-K prefill | Single-pass decode | Split-K decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 220.59 ms | 220.54 ms | 28.46 ms/step | 28.39 ms/step |
+| 8,192 | 1,021.19 ms | 1,022.78 ms | 30.74 ms/step | 29.58 ms/step |
+| 32,768 | 7,582.38 ms | 7,651.63 ms | 39.75 ms/step | 32.16 ms/step |
+
+The decode reduction is 3.8% at 8K and 19.1% at 32K. Prefill does not use this
+workspace; its measured difference is +0.16% at 8K and +0.91% at 32K. Initial
+scratch placement between weight loads coincided with roughly 4% slower prefill;
+the final implementation prepares scratch after weight loading. The memory-pool
+counter confirms the exact live-byte increase. Peak reserved pool memory was
+about 20.7 GB in both final modes, with small differences between samples.
+
+### Existing CUDA graph path
+
+`real_e4b_nvfp4_decode_graph_matches_eager` exercises the existing public
+`CudaGraphWrapper` and `GraphCapturer` APIs with the real model. Both controls use
+`Device::new_cuda_with_stream(0)`, matching the engine; the legacy default stream
+cannot be captured. Each row below is the median of 48 teacher-forced steps in
+one process per configuration, with eager and graph steps alternating. These
+are separate runs from the six-sample direct-call table above.
+
+| Prompt tokens | Eager, single-pass | Graph, single-pass | Eager, split-K | Graph, split-K |
+| ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 26.45 ms | 24.00 ms | 26.29 ms | 24.01 ms |
+| 8,192 | 28.61 ms | 26.12 ms | 27.51 ms | 25.01 ms |
+| 32,768 | 37.95 ms | 35.02 ms | 30.32 ms | 27.34 ms |
+
+Graphs and eager execution produced **bit-identical logits and all attention KV
+words**, for 48 positions after each prefix, with and without the new workspace.
+The engine already supports graphs; this control does not introduce a new graph
+implementation. Direct adapters must retain the model and KV tensors for the
+graph's lifetime, use an explicit CUDA stream, and capture before prefill or on
+disposable caches because capture warmup writes slot zero. The test captures a
+capacity of `prefix length + 64`; it does not establish parity across different
+split-count thresholds or arbitrary serving batch schedules.
+
+The earlier vLLM decode medians were 24.5 ms at 2K and 25.4 ms at 8K. These new
+graph results are within about 2% of them, but the measurements used different
+windows and different request interfaces. They do not establish a reliable
+cross-engine lead. The final 8K prefill sweep remains approximately 1.02 s versus
+the earlier vLLM 903 ms; this follow-up primarily improves decode.
+
+### Numerics and limits
+
+Split-K changes FP32 reduction order. Through quantized later layers this can
+change logits substantially even when the context error is small. A differential
+test uses 256 teacher-forced positions per prefix:
+
+| Prefix tokens | Maximum logit difference | Mean KL, old → new | Maximum KL | Top-1 agreement |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 0 | 0 | 0 | 257/257 |
+| 2,048 | 0 | 0 | 0 | 257/257 |
+| 8,192 | 0.923874 | 3.82e-7 | 5.93e-5 | 257/257 |
+| 32,768 | 7.724427 | 8.91e-5 | 0.01281 | 257/257 |
+
+Top-1 counts include the prefill result; KL covers continuation positions.
+Prefill logits and every cached K/V word were bit-identical across the new option.
+These are repetitive extensions of one prompt, not broad quality evidence or a
+guarantee of free-running equivalence. Keep the option experimental.
+
+An independent FP64 softmax oracle tests two unequal sequence lengths (8,193 and
+17), reversed physical pages, and GQA. Both single-pass and split-K BF16 context
+errors are bounded by 0.001305. CUDA initcheck reports zero errors. CPU tests
+reject invalid/overflowing workspace sizes and verify the batch-capacity fallback.
+Formatting and focused Clippy pass with the repository's existing two lint
+allowances; the existing 543 library warnings remain.
+
+Generate extended fixtures with `tests/prepare_gemma4_vllm_bench.py --sizes 40
+2048 8192 32768` alongside its usual arguments. `XINFER_GEMMA4_BENCH_SIZES` selects
+the comma-separated sizes for the Xinfer probes. The 32K token-file SHA-256 is
+`865f3f0d2156600f83c171361c7e4a03a79d5df7a86465398bbfd5e84f055cef`.
+The existing vLLM probe still has an 8K capacity and was not rerun at 32K.
+Probe names are `real_e4b_nvfp4_shared_kv_splitk_preserves_teacher_choices` and
+`real_e4b_nvfp4_decode_graph_matches_eager`; enable resident scales and the other
+optimization flags used above before constructing the models. Raw logs and
+workload/memory records are under `/tmp/xinfer-gemma4-smem512-experiment/`, with
+`splitk-postweight-bench-*` and `postweight-*` identifying the final runs.
+
 ## Reproduction
 
 `tests/prepare_gemma4_vllm_bench.py` builds the exact token streams and a two-file BF16-KV metadata overlay from the checkpoint and the 40-token reference. It leaves the weight shards untouched; the symlinks in the overlay resolve when the original checkpoint is mounted at `/weights` in Docker. Xinfer's opt-in test is `bench_real_e4b_nvfp4_single_sequence` in `tests/gemma4_shared_kv.rs`.

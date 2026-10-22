@@ -61,6 +61,43 @@ struct AttentionHooks<'a> {
     sparse_provider: Option<&'a SparseAttentionProvider>,
 }
 
+#[cfg(feature = "flash")]
+struct SharedKvSplitKWorkspace {
+    tensor: Tensor,
+    max_batch: usize,
+}
+
+#[cfg(feature = "flash")]
+impl SharedKvSplitKWorkspace {
+    fn new(
+        max_batch: usize,
+        heads: usize,
+        width: usize,
+        device: &candle_core::Device,
+    ) -> Result<Self> {
+        if !(1..=64).contains(&max_batch) || heads == 0 || width == 0 {
+            candle_core::bail!(
+                "shared-KV split-K requires batch capacity 1..=64 and nonzero heads/width"
+            )
+        }
+        let elements = max_batch
+            .checked_mul(heads)
+            .and_then(|v| v.checked_mul(attention_rs::flash::NUM_SPLITS as usize))
+            .and_then(|v| width.checked_add(2).and_then(|width| v.checked_mul(width)))
+            .ok_or_else(|| {
+                candle_core::Error::Msg("shared-KV split-K workspace overflow".into())
+            })?;
+        Ok(Self {
+            tensor: Tensor::zeros(elements, DType::F32, device)?,
+            max_batch,
+        })
+    }
+
+    fn for_batch(&self, batch: usize) -> Option<&Tensor> {
+        (batch > 0 && batch <= self.max_batch).then_some(&self.tensor)
+    }
+}
+
 pub struct Attention {
     qkv_proj: QkvProjection,
     o_proj: TensorParallelRowLinear,
@@ -82,6 +119,8 @@ pub struct Attention {
     v_norm_eps: Option<f64>,
     nemotron_attention_gemm: bool,
     gemma4_fused_qk_rope: bool,
+    #[cfg(feature = "flash")]
+    shared_kv_splitk: Option<SharedKvSplitKWorkspace>,
 }
 
 impl Attention {
@@ -840,7 +879,41 @@ impl Attention {
             v_norm_eps,
             nemotron_attention_gemm: false,
             gemma4_fused_qk_rope: false,
+            #[cfg(feature = "flash")]
+            shared_kv_splitk: None,
         })
+    }
+
+    /// Prepare shared-KV decode after all model weights have been loaded.
+    /// Keeping scratch allocation out of weight loading preserves its layout.
+    #[cfg(feature = "flash")]
+    pub(crate) fn prepare_gemma4_shared_kv_splitk(
+        &mut self,
+        device: &candle_core::Device,
+    ) -> Result<()> {
+        if !matches!(self.qkv_proj, QkvProjection::QueryOnly(_))
+            || self.sliding_window.is_some()
+            || !device.is_cuda()
+            || std::env::var_os("XINFER_GEMMA4_SHARED_KV_SPLITK").as_deref()
+                != Some(std::ffi::OsStr::new("1"))
+        {
+            return Ok(());
+        }
+        let capacity = match std::env::var("XINFER_GEMMA4_SHARED_KV_SPLITK_MAX_BATCH") {
+            Ok(value) => value.parse::<usize>().map_err(|_| {
+                candle_core::Error::Msg("invalid shared-KV split-K batch capacity".into())
+            })?,
+            Err(std::env::VarError::NotPresent) => 8,
+            Err(_) => candle_core::bail!("invalid shared-KV split-K batch capacity"),
+        };
+        // Allocate before graph capture. Larger batches retain single-pass.
+        self.shared_kv_splitk = Some(SharedKvSplitKWorkspace::new(
+            capacity,
+            self.num_heads,
+            self.head_dim,
+            device,
+        )?);
+        Ok(())
     }
 
     /// Enables the experimental Nemotron-only BF16 paged prefill backend.
@@ -1101,7 +1174,9 @@ impl Attention {
                     self.sliding_window,
                     None,
                     None,
-                    None,
+                    self.shared_kv_splitk
+                        .as_ref()
+                        .and_then(|ws| ws.for_batch(seq_len)),
                 )?
             };
             let y = context.reshape((seq_len, self.num_heads * self.head_dim))?;
@@ -1538,6 +1613,151 @@ mod packed_nvfp4_qkv_tests {
         assert!(Attention::try_pack_gemma4_nvfp4_qkv(&q, &k, &v)?.is_none());
         let v = projection(0.5)?;
         assert!(Attention::try_pack_gemma4_nvfp4_qkv(&q, &k, &v)?.is_some());
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "flash"))]
+mod shared_kv_splitk_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_has_a_fixed_batch_bound() -> Result<()> {
+        let device = candle_core::Device::Cpu;
+        let ws = SharedKvSplitKWorkspace::new(8, 8, 512, &device)?;
+        assert_eq!(ws.tensor.elem_count(), 8 * 8 * 16 * 514);
+        assert!(ws.for_batch(0).is_none());
+        assert!(ws.for_batch(1).is_some());
+        assert!(ws.for_batch(8).is_some());
+        assert!(ws.for_batch(9).is_none());
+        for (batch, heads, width) in [
+            (0, 8, 512),
+            (65, 8, 512),
+            (8, 0, 512),
+            (8, 8, 0),
+            (8, usize::MAX, 512),
+        ] {
+            assert!(SharedKvSplitKWorkspace::new(batch, heads, width, &device).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    fn shared_kv_splitk_matches_cpu_softmax() -> Result<()> {
+        let device = candle_core::Device::new_cuda(0)?;
+        let (batch, heads, kv_heads, width, block, length) = (2, 8, 2, 512, 16, 8193usize);
+        let pages = length.div_ceil(block);
+        let mut rng = 0x1785_3624u32;
+        let mut random = |len| {
+            (0..len)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    (rng % 2001) as f32 / 1000. - 1.
+                })
+                .collect::<Vec<_>>()
+        };
+        let query = Tensor::from_vec(
+            random(batch * heads * width),
+            (batch, heads, width),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let key = Tensor::from_vec(
+            random(pages * block * kv_heads * width),
+            (pages, block, kv_heads, width),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let value = Tensor::from_vec(random(key.elem_count()), key.shape(), &device)?
+            .to_dtype(DType::BF16)?;
+        let table = (0..batch)
+            .flat_map(|_| (0..pages).rev().map(|i| i as u32))
+            .collect::<Vec<_>>();
+        let table_gpu = Tensor::from_vec(table.clone(), (batch, pages), &device)?;
+        let lengths = [length, 17];
+        let lengths_gpu = Tensor::from_vec(lengths.map(|v| v as u32).to_vec(), batch, &device)?;
+        let ws = SharedKvSplitKWorkspace::new(batch, heads, width, &device)?;
+        let scale = 1. / (width as f32).sqrt();
+        let mut outputs = Vec::new();
+        for workspace in [None, ws.for_batch(batch)] {
+            let output = Tensor::zeros(query.shape(), DType::BF16, &device)?;
+            outputs.push(
+                attention_rs::flash::flash_decode(
+                    &query,
+                    &key,
+                    &value,
+                    &table_gpu,
+                    &lengths_gpu,
+                    &output,
+                    length,
+                    heads,
+                    kv_heads,
+                    width,
+                    scale,
+                    0.,
+                    None,
+                    None,
+                    None,
+                    workspace,
+                )?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?,
+            );
+        }
+        let q = query
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let k = key.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let v = value
+            .to_dtype(DType::F32)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut maximum = [0f64; 2];
+        for (seq, &len) in lengths.iter().enumerate() {
+            for head in 0..heads {
+                let qb = (seq * heads + head) * width;
+                let kv_base = |token: usize| {
+                    let physical = table[seq * pages + token / block] as usize;
+                    ((physical * block + token % block) * kv_heads + head / (heads / kv_heads))
+                        * width
+                };
+                let scores = (0..len)
+                    .map(|token| {
+                        let kb = kv_base(token);
+                        (0..width)
+                            .map(|d| q[qb + d] as f64 * k[kb + d] as f64)
+                            .sum::<f64>()
+                            * scale as f64
+                    })
+                    .collect::<Vec<_>>();
+                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let p = scores.iter().map(|s| (s - max).exp()).collect::<Vec<_>>();
+                let denominator: f64 = p.iter().sum();
+                for d in 0..width {
+                    let expected = p
+                        .iter()
+                        .enumerate()
+                        .map(|(t, p)| p * v[kv_base(t) + d] as f64)
+                        .sum::<f64>()
+                        / denominator;
+                    for (i, output) in outputs.iter().enumerate() {
+                        let actual = output[qb + d] as f64;
+                        assert!(actual.is_finite());
+                        maximum[i] = maximum[i].max((actual - expected).abs());
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "shared_kv_splitk_cpu_oracle single_max_abs={} splitk_max_abs={}",
+            maximum[0], maximum[1]
+        );
+        assert!(maximum.iter().all(|&delta| delta < 0.003));
         Ok(())
     }
 }

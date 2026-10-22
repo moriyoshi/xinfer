@@ -22,6 +22,44 @@ use xinfer::{
 
 const BLOCK: usize = 16;
 
+fn bench_sizes() -> Result<Vec<usize>> {
+    let sizes = std::env::var("XINFER_GEMMA4_BENCH_SIZES")
+        .unwrap_or_else(|_| "40,2048,8192".into())
+        .split(',')
+        .map(|s| s.trim().parse::<usize>())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    ensure!(!sizes.is_empty() && sizes.iter().all(|&s| s > 0));
+    Ok(sizes)
+}
+
+fn pool_peak_bytes(device: &Device) -> Result<(u64, u64)> {
+    use candle_core::cuda_backend::cudarc::driver::sys::{lib, CUmemPool_attribute};
+    let cuda = device.as_cuda_device()?;
+    let mut pool = std::ptr::null_mut();
+    let mut used = 0u64;
+    let mut reserved = 0u64;
+    unsafe {
+        lib()
+            .cuDeviceGetDefaultMemPool(&mut pool, *cuda.cu_device())
+            .result()?;
+        for (attribute, destination) in [
+            (
+                CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                &mut used,
+            ),
+            (
+                CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH,
+                &mut reserved,
+            ),
+        ] {
+            lib()
+                .cuMemPoolGetAttribute(pool, attribute, destination as *mut u64 as *mut _)
+                .result()?;
+        }
+    }
+    Ok((used, reserved))
+}
+
 fn engine_config(dir: &Path) -> EngineConfig {
     EngineConfig::new(
         None,
@@ -96,8 +134,20 @@ fn forward(
     start: usize,
     prefill: bool,
 ) -> Result<Vec<f32>> {
-    let end = start + tokens.len();
     let _guard = xinfer::models::layers::linear::set_linear_is_prefill(prefill);
+    let (input, positions, metadata) = prepare_inputs(device, tokens, start, prefill)?;
+    let logits = model.forward(&input, &positions, Some(kv), &metadata, false)?;
+    device.synchronize()?;
+    Ok(logits.flatten_all()?.to_vec1::<f32>()?)
+}
+
+fn prepare_inputs(
+    device: &Device,
+    tokens: &[u32],
+    start: usize,
+    prefill: bool,
+) -> Result<(Tensor, Tensor, InputMetadata)> {
+    let end = start + tokens.len();
     let positions: Vec<i64> = (start..end).map(|i| i as i64).collect();
     let block_ids: Vec<u32> = (0..end.div_ceil(BLOCK) as u32).collect();
     let metadata = InputMetadata {
@@ -127,15 +177,11 @@ fn forward(
         flashinfer_metadata: None,
         is_mtp_verify: false,
     };
-    let logits = model.forward(
-        &Tensor::from_vec(tokens.to_vec(), tokens.len(), device)?,
-        &Tensor::from_vec(positions, tokens.len(), device)?,
-        Some(kv),
-        &metadata,
-        false,
-    )?;
-    device.synchronize()?;
-    Ok(logits.flatten_all()?.to_vec1::<f32>()?)
+    Ok((
+        Tensor::from_vec(tokens.to_vec(), tokens.len(), device)?,
+        Tensor::from_vec(positions, tokens.len(), device)?,
+        metadata,
+    ))
 }
 
 fn argmax(values: &[f32]) -> usize {
@@ -152,6 +198,54 @@ fn max_abs(left: &[f32], right: &[f32]) -> f32 {
         .zip(right.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f32::max)
+}
+
+fn kl_divergence(left: &[f32], right: &[f32]) -> f64 {
+    let max_left = left.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let max_right = right.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let log_z_left = left
+        .iter()
+        .map(|&x| (x as f64 - max_left).exp())
+        .sum::<f64>()
+        .ln();
+    let log_z_right = right
+        .iter()
+        .map(|&x| (x as f64 - max_right).exp())
+        .sum::<f64>()
+        .ln();
+    left.iter()
+        .zip(right)
+        .map(|(&p, &q)| {
+            let log_p = p as f64 - max_left - log_z_left;
+            let log_q = q as f64 - max_right - log_z_right;
+            log_p.exp() * (log_p - log_q)
+        })
+        .sum::<f64>()
+        .max(0.)
+}
+
+fn ensure_identical_kv(left: &[(Tensor, Tensor)], right: &[(Tensor, Tensor)]) -> Result<()> {
+    ensure!(left.len() == right.len());
+    for ((lk, lv), (rk, rv)) in left.iter().zip(right) {
+        for (left, right) in [(lk, rk), (lv, rv)] {
+            ensure!(left.shape() == right.shape());
+            let left = left.flatten_all()?.to_vec1::<half::bf16>()?;
+            let right = right.flatten_all()?.to_vec1::<half::bf16>()?;
+            ensure!(
+                left.iter()
+                    .map(|x| x.to_bits())
+                    .eq(right.iter().map(|x| x.to_bits())),
+                "KV words differ"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn teacher_kl_is_stable_under_large_common_shifts() {
+    assert!(kl_divergence(&[1000., -1000.], &[999., -1001.]) < 1e-12);
+    assert!((kl_divergence(&[0., 0.], &[3f32.ln(), 0.]) - 0.5 * (4f64 / 3.).ln()).abs() < 1e-7);
 }
 
 fn load_model(dir: &Path, device: &Device) -> Result<(Gemma4ForCausalLM, Config)> {
@@ -186,7 +280,7 @@ fn bench_real_e4b_nvfp4_single_sequence() -> Result<()> {
             .is_some_and(|quant| quant.quant_method == "nvfp4"),
         "expected an NVFP4 checkpoint"
     );
-    let sizes = [40usize, 2048, 8192];
+    let sizes = bench_sizes()?;
     let mut prompts = Vec::new();
     for size in sizes {
         let path = Path::new(&bench_dir).join(format!("tokens-{size}.json"));
@@ -194,7 +288,7 @@ fn bench_real_e4b_nvfp4_single_sequence() -> Result<()> {
         ensure!(tokens.len() == size, "wrong token count for {size}");
         prompts.push(tokens);
     }
-    let warm_cache = cache(&config, 64, true, &device)?;
+    let warm_cache = cache(&config, (prompts[0].len() + 1).max(64), true, &device)?;
     let warm = forward(&model, &device, &warm_cache, &prompts[0], 0, true)?;
     forward(
         &model,
@@ -220,13 +314,16 @@ fn bench_real_e4b_nvfp4_single_sequence() -> Result<()> {
                 next = argmax(&logits) as u32;
             }
             let decode_ms_per_step = started.elapsed().as_secs_f64() * 1000.0 / 48.0;
+            let (pool_used_peak, pool_reserved_peak) = pool_peak_bytes(&device)?;
             eprintln!(
-                "gemma4_nvfp4_bench tokens={} sample={} prefill_ms={:.3} decode_ms_per_step={:.3} first_token={}",
+                "gemma4_nvfp4_bench tokens={} sample={} prefill_ms={:.3} decode_ms_per_step={:.3} first_token={} pool_used_peak={} pool_reserved_peak={}",
                 tokens.len(),
                 sample,
                 prefill_ms,
                 decode_ms_per_step,
-                first_token
+                first_token,
+                pool_used_peak,
+                pool_reserved_peak,
             );
         }
     }
@@ -279,6 +376,90 @@ fn real_e4b_nvfp4_gated_gelu_fp4_matches_baseline() -> Result<()> {
 #[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
 fn real_e4b_nvfp4_packed_qkv_matches_baseline() -> Result<()> {
     real_e4b_nvfp4_single_fusion_matches_baseline("XINFER_GEMMA4_PACKED_QKV_NVFP4", Some("1"))
+}
+
+#[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_shared_kv_splitk_preserves_teacher_choices() -> Result<()> {
+    // Split-K changes FP32 reduction order. Quantized layers can amplify
+    // the BF16 context difference; report that delta rather than claiming
+    // the bit-identical control required for the other fusions.
+    real_e4b_nvfp4_compare_mode("XINFER_GEMMA4_SHARED_KV_SPLITK", Some("1"), 256, false)
+}
+
+#[cfg(feature = "graph")]
+#[test]
+#[ignore = "requires real NVFP4 checkpoint, resident scales, and an idle CUDA GPU"]
+fn real_e4b_nvfp4_decode_graph_matches_eager() -> Result<()> {
+    use xinfer::utils::graph::{CudaGraphWrapper, GraphCapturer};
+
+    let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
+        .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
+    let bench_dir =
+        std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
+    // CUDA cannot capture the legacy default stream. Match the engine's
+    // explicit-stream device for both eager and captured controls.
+    let device = Device::new_cuda_with_stream(0)?;
+    let (model, config) = load_model(Path::new(&model_dir), &device)?;
+    for size in bench_sizes()? {
+        let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(
+            Path::new(&bench_dir).join(format!("tokens-{size}.json")),
+        )?)?;
+        // Keep both model and cache alive for every capture/replay. Capture
+        // precedes prefill because the dummy warmup writes slot zero.
+        let eager_kv = cache(&config, size + 64, true, &device)?;
+        let graph_kv = cache(&config, size + 64, true, &device)?;
+        let closure =
+            |input: &Tensor,
+             positions: &Tensor,
+             kv: Option<&Vec<(Tensor, Tensor)>>,
+             metadata: &InputMetadata,
+             _embedded| { model.forward(input, positions, kv, metadata, false) };
+        let wrapper = CudaGraphWrapper::new(closure, device.as_cuda_device()?.clone().into());
+        let mut graph = GraphCapturer::new(
+            wrapper,
+            1,
+            size + 64,
+            BLOCK,
+            config.hidden_size,
+            #[cfg(feature = "flashinfer")]
+            &None,
+            false,
+        );
+        graph.capture(&device, Some(&graph_kv))?;
+        let mut logits = forward(&model, &device, &eager_kv, &tokens, 0, true)?;
+        ensure!(logits == forward(&model, &device, &graph_kv, &tokens, 0, true)?);
+        let mut eager_ms = Vec::new();
+        let mut graph_ms = Vec::new();
+        let mut maximum = 0f32;
+        let mut top1 = 0;
+        let mut identical = true;
+        for step in 0..48 {
+            let next = argmax(&logits) as u32;
+            let started = Instant::now();
+            logits = forward(&model, &device, &eager_kv, &[next], size + step, false)?;
+            eager_ms.push(started.elapsed().as_secs_f64() * 1000.);
+            let started = Instant::now();
+            let (input, positions, metadata) =
+                prepare_inputs(&device, &[next], size + step, false)?;
+            let captured = graph.replay(&input, &positions, &metadata)?;
+            let captured = captured.flatten_all()?.to_vec1::<f32>()?;
+            graph_ms.push(started.elapsed().as_secs_f64() * 1000.);
+            ensure!(logits.iter().chain(&captured).all(|x| x.is_finite()));
+            maximum = maximum.max(max_abs(&logits, &captured));
+            top1 += usize::from(argmax(&logits) == argmax(&captured));
+            identical &= logits
+                .iter()
+                .map(|x| x.to_bits())
+                .eq(captured.iter().map(|x| x.to_bits()));
+        }
+        eager_ms.sort_by(f64::total_cmp);
+        graph_ms.sort_by(f64::total_cmp);
+        eprintln!("gemma4_decode_graph tokens={size} eager_p50_ms={} graph_p50_ms={} max_abs={maximum} top1={top1}/48 bit_identical={identical}", (eager_ms[23]+eager_ms[24])/2., (graph_ms[23]+graph_ms[24])/2.);
+        ensure!(identical && top1 == 48, "graph changed decode logits");
+        ensure_identical_kv(&eager_kv, &graph_kv)?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -416,6 +597,15 @@ fn real_e4b_nvfp4_single_fusion_matches_baseline(
     setting: &str,
     enabled_value: Option<&str>,
 ) -> Result<()> {
+    real_e4b_nvfp4_compare_mode(setting, enabled_value, 48, true)
+}
+
+fn real_e4b_nvfp4_compare_mode(
+    setting: &str,
+    enabled_value: Option<&str>,
+    continuation_steps: usize,
+    exact: bool,
+) -> Result<()> {
     let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
         .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
     let bench_dir =
@@ -436,36 +626,51 @@ fn real_e4b_nvfp4_single_fusion_matches_baseline(
         std::env::remove_var(setting);
     }
     ensure!(config.hidden_size == fused_config.hidden_size);
-    for size in [40usize, 2048, 8192] {
+    for size in bench_sizes()? {
         let tokens: Vec<u32> = serde_json::from_slice(&std::fs::read(
             Path::new(&bench_dir).join(format!("tokens-{size}.json")),
         )?)?;
-        let base_cache = cache(&config, size + 64, true, &device)?;
-        let fused_cache = cache(&config, size + 64, true, &device)?;
+        let base_cache = cache(&config, size + continuation_steps + 1, true, &device)?;
+        let fused_cache = cache(&config, size + continuation_steps + 1, true, &device)?;
         let mut base_logits = forward(&baseline, &device, &base_cache, &tokens, 0, true)?;
         let mut fused_logits = forward(&fused, &device, &fused_cache, &tokens, 0, true)?;
         let prefix_max_abs = max_abs(&base_logits, &fused_logits);
         let mut continuation_max_abs = 0.0f32;
+        let mut kl_sum = 0f64;
+        let mut kl_max = 0f64;
         let mut top1_equal = usize::from(argmax(&base_logits) == argmax(&fused_logits));
         let mut next = argmax(&base_logits) as u32;
-        for step in 0..48 {
+        for step in 0..continuation_steps {
             base_logits = forward(&baseline, &device, &base_cache, &[next], size + step, false)?;
             fused_logits = forward(&fused, &device, &fused_cache, &[next], size + step, false)?;
+            ensure!(base_logits
+                .iter()
+                .chain(&fused_logits)
+                .all(|x| x.is_finite()));
             continuation_max_abs = continuation_max_abs.max(max_abs(&base_logits, &fused_logits));
+            if !exact && base_logits != fused_logits {
+                let kl = kl_divergence(&base_logits, &fused_logits);
+                kl_sum += kl;
+                kl_max = kl_max.max(kl);
+            }
             top1_equal += usize::from(argmax(&base_logits) == argmax(&fused_logits));
             next = argmax(&base_logits) as u32;
         }
         eprintln!(
-            "gemma4_fusion_parity setting={setting} tokens={size} prefix_max_abs={prefix_max_abs} continuation_max_abs={continuation_max_abs} top1={top1_equal}/49"
+            "gemma4_fusion_parity setting={setting} tokens={size} prefix_max_abs={prefix_max_abs} continuation_max_abs={continuation_max_abs} top1={top1_equal}/{} mean_kl={} max_kl={kl_max}", continuation_steps+1, kl_sum/continuation_steps as f64
         );
         ensure!(
-            prefix_max_abs == 0.0 && continuation_max_abs == 0.0,
+            prefix_max_abs == 0.0 && (!exact || continuation_max_abs == 0.0),
             "{setting} changed logits at {size}"
         );
         ensure!(
-            top1_equal == 49,
+            top1_equal == continuation_steps + 1,
             "{setting} changed a top-1 choice at {size}"
         );
+        if !exact {
+            ensure_identical_kv(&base_cache, &fused_cache)?;
+            eprintln!("gemma4_mode_kv_parity setting={setting} tokens={size} bit_identical=true");
+        }
     }
     Ok(())
 }
