@@ -22,6 +22,18 @@ use xinfer::{
 
 const BLOCK: usize = 16;
 
+fn bench_device() -> Result<Device> {
+    Ok(
+        if std::env::var_os("XINFER_GEMMA4_BENCH_EXPLICIT_STREAM").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            Device::new_cuda_with_stream(0)?
+        } else {
+            Device::new_cuda(0)?
+        },
+    )
+}
+
 fn bench_sizes() -> Result<Vec<usize>> {
     let sizes = std::env::var("XINFER_GEMMA4_BENCH_SIZES")
         .unwrap_or_else(|_| "40,2048,8192".into())
@@ -242,6 +254,17 @@ fn ensure_identical_kv(left: &[(Tensor, Tensor)], right: &[(Tensor, Tensor)]) ->
     Ok(())
 }
 
+fn ensure_identical_logits(left: &[f32], right: &[f32]) -> Result<()> {
+    ensure!(left.iter().chain(right).all(|x| x.is_finite()));
+    ensure!(
+        left.iter()
+            .map(|x| x.to_bits())
+            .eq(right.iter().map(|x| x.to_bits())),
+        "logit words differ"
+    );
+    Ok(())
+}
+
 #[test]
 fn teacher_kl_is_stable_under_large_common_shifts() {
     assert!(kl_divergence(&[1000., -1000.], &[999., -1001.]) < 1e-12);
@@ -271,7 +294,7 @@ fn bench_real_e4b_nvfp4_single_sequence() -> Result<()> {
         .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
     let bench_dir =
         std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
-    let device = Device::new_cuda(0)?;
+    let device = bench_device()?;
     let (model, config) = load_model(Path::new(&model_dir), &device)?;
     ensure!(
         config
@@ -384,7 +407,19 @@ fn real_e4b_nvfp4_shared_kv_splitk_preserves_teacher_choices() -> Result<()> {
     // Split-K changes FP32 reduction order. Quantized layers can amplify
     // the BF16 context difference; report that delta rather than claiming
     // the bit-identical control required for the other fusions.
-    real_e4b_nvfp4_compare_mode("XINFER_GEMMA4_SHARED_KV_SPLITK", Some("1"), 256, false)
+    real_e4b_nvfp4_compare_mode(
+        "XINFER_GEMMA4_SHARED_KV_SPLITK",
+        Some("1"),
+        256,
+        false,
+        true,
+    )
+}
+
+#[test]
+#[ignore = "requires the real NVFP4 checkpoint and two model instances on CUDA"]
+fn real_e4b_nvfp4_paged_prefill_without_dense_masks_matches_baseline() -> Result<()> {
+    real_e4b_nvfp4_compare_mode("XINFER_GEMMA4_SKIP_DENSE_MASKS", Some("1"), 48, true, true)
 }
 
 #[cfg(feature = "graph")]
@@ -597,7 +632,17 @@ fn real_e4b_nvfp4_single_fusion_matches_baseline(
     setting: &str,
     enabled_value: Option<&str>,
 ) -> Result<()> {
-    real_e4b_nvfp4_compare_mode(setting, enabled_value, 48, true)
+    real_e4b_nvfp4_compare_mode(setting, enabled_value, 48, true, false)
+}
+
+#[test]
+#[ignore = "requires the real Gemma 4 E4B NVFP4 checkpoint and explicit-stream CUDA"]
+fn real_e4b_nvfp4_prefill_overwrite_matches_baseline() -> Result<()> {
+    ensure!(
+        std::env::var("XINFER_GEMMA4_BENCH_EXPLICIT_STREAM").as_deref() == Ok("1"),
+        "overwrite requires the explicit stream used by the engine"
+    );
+    real_e4b_nvfp4_compare_mode("XINFER_NVFP4_PREFILL_OVERWRITE", Some("1"), 48, true, true)
 }
 
 fn real_e4b_nvfp4_compare_mode(
@@ -605,12 +650,20 @@ fn real_e4b_nvfp4_compare_mode(
     enabled_value: Option<&str>,
     continuation_steps: usize,
     exact: bool,
+    check_kv: bool,
 ) -> Result<()> {
     let model_dir = std::env::var_os("XINFER_GEMMA4_NVFP4_CHECKPOINT")
         .expect("XINFER_GEMMA4_NVFP4_CHECKPOINT is required");
     let bench_dir =
         std::env::var_os("XINFER_GEMMA4_BENCH_DIR").expect("XINFER_GEMMA4_BENCH_DIR is required");
-    let device = Device::new_cuda(0)?;
+    let device = bench_device()?;
+    // Most options are model-owned; output overwrite is deliberately a
+    // call-time experiment. Select it independently for each forward below.
+    let select_call_mode = |enabled: bool| {
+        if setting == "XINFER_NVFP4_PREFILL_OVERWRITE" {
+            std::env::set_var(setting, if enabled { "1" } else { "0" });
+        }
+    };
     let previous = std::env::var_os(setting);
     std::env::set_var(setting, "0");
     let (baseline, config) = load_model(Path::new(&model_dir), &device)?;
@@ -620,7 +673,7 @@ fn real_e4b_nvfp4_compare_mode(
         std::env::remove_var(setting);
     }
     let (fused, fused_config) = load_model(Path::new(&model_dir), &device)?;
-    if let Some(value) = previous {
+    if let Some(value) = &previous {
         std::env::set_var(setting, value);
     } else {
         std::env::remove_var(setting);
@@ -632,8 +685,13 @@ fn real_e4b_nvfp4_compare_mode(
         )?)?;
         let base_cache = cache(&config, size + continuation_steps + 1, true, &device)?;
         let fused_cache = cache(&config, size + continuation_steps + 1, true, &device)?;
+        select_call_mode(false);
         let mut base_logits = forward(&baseline, &device, &base_cache, &tokens, 0, true)?;
+        select_call_mode(true);
         let mut fused_logits = forward(&fused, &device, &fused_cache, &tokens, 0, true)?;
+        if exact && check_kv {
+            ensure_identical_logits(&base_logits, &fused_logits)?;
+        }
         let prefix_max_abs = max_abs(&base_logits, &fused_logits);
         let mut continuation_max_abs = 0.0f32;
         let mut kl_sum = 0f64;
@@ -641,12 +699,17 @@ fn real_e4b_nvfp4_compare_mode(
         let mut top1_equal = usize::from(argmax(&base_logits) == argmax(&fused_logits));
         let mut next = argmax(&base_logits) as u32;
         for step in 0..continuation_steps {
+            select_call_mode(false);
             base_logits = forward(&baseline, &device, &base_cache, &[next], size + step, false)?;
+            select_call_mode(true);
             fused_logits = forward(&fused, &device, &fused_cache, &[next], size + step, false)?;
             ensure!(base_logits
                 .iter()
                 .chain(&fused_logits)
                 .all(|x| x.is_finite()));
+            if exact && check_kv {
+                ensure_identical_logits(&base_logits, &fused_logits)?;
+            }
             continuation_max_abs = continuation_max_abs.max(max_abs(&base_logits, &fused_logits));
             if !exact && base_logits != fused_logits {
                 let kl = kl_divergence(&base_logits, &fused_logits);
@@ -667,9 +730,52 @@ fn real_e4b_nvfp4_compare_mode(
             top1_equal == continuation_steps + 1,
             "{setting} changed a top-1 choice at {size}"
         );
-        if !exact {
+        if check_kv {
             ensure_identical_kv(&base_cache, &fused_cache)?;
             eprintln!("gemma4_mode_kv_parity setting={setting} tokens={size} bit_identical=true");
+        }
+        if exact && check_kv && tokens.len() > 1 {
+            // Reuse the caches: future rows are excluded by context lengths.
+            // This checks a continued prefill at a nonzero logical position.
+            let split = tokens.len() / 2;
+            for (start, end) in [(0, split), (split, tokens.len())] {
+                select_call_mode(false);
+                base_logits = forward(
+                    &baseline,
+                    &device,
+                    &base_cache,
+                    &tokens[start..end],
+                    start,
+                    true,
+                )?;
+                select_call_mode(true);
+                fused_logits = forward(
+                    &fused,
+                    &device,
+                    &fused_cache,
+                    &tokens[start..end],
+                    start,
+                    true,
+                )?;
+                ensure_identical_logits(&base_logits, &fused_logits)?;
+            }
+            let next = argmax(&base_logits) as u32;
+            select_call_mode(false);
+            base_logits = forward(&baseline, &device, &base_cache, &[next], size, false)?;
+            select_call_mode(true);
+            fused_logits = forward(&fused, &device, &fused_cache, &[next], size, false)?;
+            ensure_identical_logits(&base_logits, &fused_logits)?;
+            ensure_identical_kv(&base_cache, &fused_cache)?;
+            eprintln!(
+                "gemma4_chunked_mode_parity setting={setting} tokens={size} bit_identical=true"
+            );
+        }
+    }
+    if setting == "XINFER_NVFP4_PREFILL_OVERWRITE" {
+        if let Some(value) = previous {
+            std::env::set_var(setting, value);
+        } else {
+            std::env::remove_var(setting);
         }
     }
     Ok(())
