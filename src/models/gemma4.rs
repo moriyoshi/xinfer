@@ -36,6 +36,25 @@ fn gemma4_fusion_enabled(name: &str, default_enabled: bool) -> bool {
     gemma4_fusion_setting(std::env::var_os(name).as_deref(), default_enabled)
 }
 
+fn skip_dense_prefill_masks(
+    enabled: bool,
+    cuda: bool,
+    has_cache: bool,
+    has_block_tables: bool,
+    is_prefill: bool,
+) -> bool {
+    // Only cached native CUDA flash dispatch bypasses the explicit-mask SDP
+    // path. Its kernels apply causal and sliding-window masks themselves.
+    cfg!(feature = "flash")
+        && !cfg!(feature = "flashinfer")
+        && !cfg!(feature = "flashattn")
+        && enabled
+        && cuda
+        && has_cache
+        && has_block_tables
+        && is_prefill
+}
+
 fn gemma4_norm_forward(norm: &NormX, xs: &Tensor, fused: bool) -> Result<Tensor> {
     #[cfg(feature = "cuda")]
     if fused {
@@ -796,6 +815,7 @@ pub struct Gemma4ForCausalLM {
     first_kv_shared_layer: usize,
     fused_rms_norm: bool,
     kv_source_layers: Vec<usize>,
+    skip_dense_masks: bool,
     #[cfg(feature = "cuda")]
     fast_bf16_gemv: bool,
 }
@@ -1270,6 +1290,7 @@ impl Gemma4ForCausalLM {
             first_kv_shared_layer,
             fused_rms_norm,
             kv_source_layers,
+            skip_dense_masks: gemma4_fusion_enabled("XINFER_GEMMA4_SKIP_DENSE_MASKS", false),
             #[cfg(feature = "cuda")]
             fast_bf16_gemv,
         })
@@ -1339,7 +1360,14 @@ impl Gemma4ForCausalLM {
         let per_layer_inputs = self.get_per_layer_embeddings(input_ids, &xs)?;
         let seqlens = input_metadata.seqlens.clone().unwrap_or_default();
 
-        let full_mask = if input_metadata.is_prefill && !seqlens.is_empty() {
+        let skip_dense_masks = skip_dense_prefill_masks(
+            self.skip_dense_masks,
+            self.device.is_cuda(),
+            kv_caches.is_some(),
+            input_metadata.block_tables.is_some(),
+            input_metadata.is_prefill,
+        );
+        let full_mask = if !skip_dense_masks && input_metadata.is_prefill && !seqlens.is_empty() {
             let mut masks = Vec::new();
             let mut start = 0u32;
             for seq_offset in &seqlens {
@@ -1358,14 +1386,18 @@ impl Gemma4ForCausalLM {
             None
         };
 
-        let sliding_mask = get_attention_causal_mask(
-            &self.device,
-            self.dtype,
-            positions,
-            seqlens.clone(),
-            self.config.sliding_window,
-            input_metadata.is_prefill,
-        );
+        let sliding_mask = if skip_dense_masks {
+            None
+        } else {
+            get_attention_causal_mask(
+                &self.device,
+                self.dtype,
+                positions,
+                seqlens.clone(),
+                self.config.sliding_window,
+                input_metadata.is_prefill,
+            )
+        };
 
         if let Some(kv_caches) = kv_caches {
             // The standard caller keeps one pair per layer. A compact caller
@@ -1478,7 +1510,23 @@ impl Gemma4ForCausalLM {
 
 #[cfg(test)]
 mod tests {
-    use super::{gemma4_fusion_setting, kv_source_layers};
+    use super::{gemma4_fusion_setting, kv_source_layers, skip_dense_prefill_masks};
+
+    #[test]
+    fn dense_masks_remain_for_sdp_and_unvalidated_backends() {
+        let supported = cfg!(feature = "flash")
+            && !cfg!(feature = "flashinfer")
+            && !cfg!(feature = "flashattn");
+        assert_eq!(
+            skip_dense_prefill_masks(true, true, true, true, true),
+            supported
+        );
+        assert!(!skip_dense_prefill_masks(false, true, true, true, true));
+        assert!(!skip_dense_prefill_masks(true, false, true, true, true));
+        assert!(!skip_dense_prefill_masks(true, true, false, true, true));
+        assert!(!skip_dense_prefill_masks(true, true, true, false, true));
+        assert!(!skip_dense_prefill_masks(true, true, true, true, false));
+    }
 
     #[test]
     fn fusion_defaults_and_explicit_overrides() {

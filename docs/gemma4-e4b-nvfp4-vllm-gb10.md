@@ -1,5 +1,11 @@
 # Gemma 4 E4B NVFP4 on GB10: Xinfer and vLLM
 
+The 2026-10-24 [allocation follow-up](#prefill-allocation-follow-up-2026-10-24)
+adds two default-off options. Native BF16 prefill output overwrite reduces 8K
+prefill from 980.3 to 875.5 ms with bit-identical logits/KV; a fresh vLLM control
+is 822.8 ms. Dense-mask skipping mainly reduces allocation pressure. The dated
+sections below retain the earlier measurements and their different controls.
+
 Measured 2026-10-18. This compares the same [Gemma 4 E4B NVFP4 checkpoint](https://huggingface.co/Neural-ICE/Gemma-4-E4B-it-NVFP4), one sequence, and identical token IDs on one NVIDIA GB10. The checkpoint is revision `cccd4fa40a99a8d525e050f014ea21dc2b680995`. The Xinfer side uses fork revision `c05608857bab9e691fc8f377a7b165466d18b8a9`, `Gemma4ForCausalLM` in a release `cuda,cutlass` build with the default hardware NVFP4 decode path. The vLLM side uses NVIDIA's `nvcr.io/nvidia/vllm:26.05-py3` image (digest `sha256:654e563e727be1968487d453de0733fb074cb59adf424c779d0f9e7cfcb2b6b6`), vLLM `0.20.1+7124b12a.dev`, `modelopt_fp4`, tensor parallel 1, and `language_model_only=True`. The [vLLM Gemma 4 recipe](https://docs.vllm.ai/projects/recipes/en/stable/Google/Gemma4.html) documents its text-only and KV-cache options.
 
 Both engines use BF16 attention KV. Xinfer allocates BF16 KV directly. The published checkpoint asks vLLM for FP8 KV in `config.json` and `hf_quant_config.json`; a temporary metadata overlay sets `kv_cache_scheme` and `kv_cache_quant_algo` to `null` respectively. All vLLM model files other than those two metadata files are symlinks to the original checkpoint. The installed vLLM ModelOpt parser reports `kv_cache_quant_algo=None` for the overlay. vLLM allocated 24.14 GiB of KV cache for 450,825 token slots, consistent with E4B's 57,344 BF16 KV bytes per token. vLLM uses a 0.35 GPU memory utilization limit, one sequence, prefix caching disabled, chunked prefill enabled, a maximum model length and batch token limit of 8,256, and its default CUDA graph setting. It selected FlashInfer CUTLASS NVFP4 linear kernels and Triton attention; the latter was forced by Gemma 4's heterogeneous attention head dimensions.
@@ -122,7 +128,7 @@ The earlier separate-time vLLM medians were 903.1 ms for 8K first token and 25.4
 
 An Nsight Systems comparison of one 8K prefill window per mode, on the same Xinfer revision, found 301 CUTLASS FP4 GEMMs in both. Baseline versus both-options kernel sums were 953.1 versus 892.4 ms. Attention was 304.4 versus 301.7 ms and CUTLASS GEMM was 249.7 versus 251.7 ms. The separate gated GELU kernels (89.0 ms) disappeared; 42 fused gated-GELU/FP4 quantization kernels took 69.0 ms. Resident scales reduced host-to-device copy count from 703 to 101, but GPU copy time was only 0.36 versus 0.07 ms. These sums explain some of the wall difference without assigning all of it to a single kernel.
 
-Both traces also show 392 GPU memsets totaling about **114 ms** and 24.1 GB of logical writes inside the prefill window. Forty-two of them each clear a 320 MiB FP4 GEMM output immediately before the native CUTLASS epilogue runs. The traces are `/tmp/xinfer-gemma4-nvfp4-{baseline,both}-profile.nsys-rep` on the measurement host. A guarded experiment attempted to omit the clear for native BF16 CUTLASS, whose epilogue declares `ElementC=void`. The real Gemma 4 checkpoint gave bit-identical logits at 40, 2,048, and 8,192 prefix tokens and 48 continuations per prefix. **The experiment was reverted:** synthetic full-output comparisons found unwritten or differing BF16 words at legal shapes including M=3/N=160/K=128, M=1/N=128/K=128, and M=2048/N=10240/K=2560. CUDA `compute-sanitizer --tool initcheck` also reported uninitialized device-to-host reads in the attempted zero-free output, matching the failing word regions. A follow-up disabled SM120 programmatic dependent launch and matched zero/one/empty output words at those shapes, but initcheck still flagged the empty buffer. The launch change alone measured 1,157.5 → 1,169.5 ms at 8K prefill and was not retained. The zero-initialized output therefore remains necessary until the launch or tile write coverage is corrected and proven across supported shapes. The retained fork revision `4d51b974c3cd35097c2913ef3cac55474903848c` makes native BF16 CUTLASS launch rejection an error rather than silently returning a partially computed tensor; it does not change normal inference latency.
+Both traces also show 392 GPU memsets totaling about **114 ms** and 24.1 GB of logical writes inside the prefill window. Forty-two of them each clear a 320 MiB FP4 GEMM output immediately before the native CUTLASS epilogue runs. The traces are `/tmp/xinfer-gemma4-nvfp4-{baseline,both}-profile.nsys-rep` on the measurement host. A guarded experiment attempted to omit the clear for native BF16 CUTLASS, whose epilogue declares `ElementC=void`. The real Gemma 4 checkpoint gave bit-identical logits at 40, 2,048, and 8,192 prefix tokens and 48 continuations per prefix. **The experiment was reverted:** synthetic full-output comparisons found unwritten or differing BF16 words at legal shapes including M=3/N=160/K=128, M=1/N=128/K=128, and M=2048/N=10240/K=2560. CUDA `compute-sanitizer --tool initcheck` also reported uninitialized device-to-host reads in the attempted zero-free output, matching the failing word regions. A follow-up disabled SM120 programmatic dependent launch and matched zero/one/empty output words at those shapes, but initcheck still flagged the empty buffer. The launch change alone measured 1,157.5 → 1,169.5 ms at 8K prefill and was not retained. At that point the zero-initialized output was retained. The explicit-stream revalidation below isolates a sanitizer limitation and uses stronger full-output controls; the old broad experiment is not reintroduced. The retained fork revision `4d51b974c3cd35097c2913ef3cac55474903848c` makes native BF16 CUTLASS launch rejection an error rather than silently returning a partially computed tensor; it does not change normal inference latency.
 
 ## Opt-in packed QKV for NVFP4 Gemma 4
 
@@ -306,6 +312,168 @@ Probe names are `real_e4b_nvfp4_shared_kv_splitk_preserves_teacher_choices` and
 optimization flags used above before constructing the models. Raw logs and
 workload/memory records are under `/tmp/xinfer-gemma4-smem512-experiment/`, with
 `splitk-postweight-bench-*` and `postweight-*` identifying the final runs.
+
+
+## Prefill allocation follow-up (2026-10-24)
+
+The new output-allocation helper is pinned to published `moriyoshi/attention.rs`
+commit `02b505c325bc7f179f774e1aa2d281280243f122`. Both root dependencies use
+that exact Git revision; no local patch or path dependency is required.
+
+Temporary `/tmp/xinfer-*` artifacts disappeared during this follow-up. The
+original sweep aggregates below were retained from completed tool outputs;
+their original raw-file names are historical. Rebuilt fixtures have identical
+SHA-256 values. Repeated correctness checks and subsequent benchmark records
+are retained under `.agents-workspace/gemma4-prefill-memory/` in this checkout,
+including `recovered-measurements.json` with the provenance of the aggregates.
+
+`XINFER_GEMMA4_SKIP_DENSE_MASKS=1` skips the unused dense full-causal mask
+only for CUDA native paged prefill with both K/V caches and block tables.
+The default, SDP, CPU and unvalidated backend combinations keep the existing
+behavior. Native paged attention applies causality and the sliding window.
+The flash sliding-mask helper already returned `None`; only one full mask
+was being allocated, not two.
+
+An interleaved dense/skip/skip/dense sweep, three samples per process, used an
+explicit stream and all previously listed fast options including shared-KV
+split-K. Medians over six samples per configuration:
+
+| Prefix tokens | Dense mask prefill, ms | Skip mask prefill, ms |
+| ---: | ---: | ---: |
+| 2,048 | 218.770 | 218.722 |
+| 8,192 | 1,018.454 | 1,014.225 |
+| 32,768 | 7,579.082 | 7,543.968 |
+
+This is primarily an allocation improvement: at 32K the removed tensor is
+2 GiB, while measured CUDA pool peak live allocation falls by only 96 MiB
+and peak reservation by 1.25 GiB. An earlier phase determines the live peak.
+No foreign compute contexts appeared in the watchdog samples; minimum host
+`MemAvailable` was 89.5 GiB. These direct-forward decode samples were unchanged
+within noise and are not the graph-decode figures above.
+
+`real_e4b_nvfp4_paged_prefill_without_dense_masks_matches_baseline` checks
+40/2K/8K/32K prefixes and 48 continuation positions per prefix. All F32 logit
+bits and cached BF16 K/V words match. The test also checks two-half continued
+prefill at nonzero logical positions followed by decode at each size.
+Logs and resource records are `mask-parity-final.*`, `mask-bench-*`, and
+`mask-benchmark-summary.json` in the scratch directory listed above.
+
+### Native FP4 output-write investigation
+
+The 8K prefill-only profile still contains about 115 ms of output clearing.
+A standalone control, `tests/probes/tma_initcheck.cu`, isolates a Compute
+Sanitizer initialization-tracking issue: ordinary scalar and flat async bulk
+stores pass, while a 2D TMA tensor store writes all 512 bytes correctly but
+Initcheck reports sixteen uninitialized regions. Each run uses a new,
+nonuniform data pattern checked by the host. This reproduces on GB10,
+driver 580.159.03, with sanitizer 2026.3.0; it does not establish that every
+kernel using TMA is correct.
+
+The ignored `native_fp4_output_coverage` diagnostic compares full BF16 words
+for zero, one and empty output allocations. With `NVFP4_COVERAGE_RANDOM=1`
+it uses varying packed FP4 data and finite positive block scales, including
+partial output tiles and the 8K-by-20,480 Gemma projection. The uniform mode
+has an independent exact-value oracle. Both explicit and legacy streams are
+available.
+
+The new `XINFER_NVFP4_PREFILL_OVERWRITE=1` option avoids output clearing only
+for multi-row native CUTLASS BF16 prefill, SM120+, on an explicit CUDA stream.
+Default, decode, single-row, legacy-stream, FP16, software and FlashInfer paths
+retain initialized allocation. The native BF16 epilogue has `ElementC=void`,
+so it cannot read the old output; checked launch rejection returns an error
+before the result can escape. Keep this option experimental; hardware validation
+is on SM121 GB10 only. The historical
+legacy-stream differences are not treated as resolved by the TMA reproducer.
+
+The full quantization pipeline test,
+`native_fp4_prefill_overwrite_matches_initialized_pipeline`, covers random BF16
+inputs, packed FP4 weights, varying scales, resident and scratch swizzles,
+bias/no bias, partial tiles and repeated runs. Every BF16 result word matches
+initialized allocation. The real checkpoint test
+`real_e4b_nvfp4_prefill_overwrite_matches_baseline` checks the same four prefix
+sizes and 48 continuation positions each: all F32 logit bits and BF16 K/V
+words match, including two-half continued prefill and subsequent decode.
+Run ignored tests individually, since they own process-global switches.
+The recovered source passes the real-model and full randomized tests again.
+A small-shape full-pipeline CUDA Memcheck run reports zero errors. Initcheck
+is not a passing gate for the empty TMA-written tensor, for the tracking reason
+isolated above; no suppression or blanket waiver is installed. Formatting,
+the CPU policy checks and focused Clippy pass with the two existing lint
+allowances (`never_loop`, `not_unsafe_ptr_arg_deref`); the existing 543 library
+warnings remain.
+
+The interleaved zero/overwrite/overwrite/zero sweep uses the same explicit
+stream and fast flags as the mask experiment, with mask skipping enabled in
+both arms. Six samples per configuration give:
+
+| Prefix tokens | Zeroed output prefill, ms | Overwrite prefill, ms | Reduction |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 210.961 | 182.617 | 13.4% |
+| 8,192 | 980.309 | 875.486 | 10.7% |
+| 32,768 | 7,276.739 | 6,854.448 | 5.8% |
+
+Direct decode medians are 26.804/26.768, 27.907/27.893 and 30.359/30.214 ms
+per step respectively (zeroed/overwrite). Output allocation sizes are unchanged,
+and measured pool peaks are identical. The watchdog recorded no foreign GPU
+contexts across 236 samples; minimum `MemAvailable` was 95.9 GiB. Do not compare
+absolute times between the two separate sweeps as if they were paired.
+The raw files are `overwrite-{real-parity,full-pipeline}.*`,
+`overwrite-bench-*`, and `overwrite-benchmark-summary.json`.
+
+For the overwrite measurements, set `XINFER_GEMMA4_BENCH_EXPLICIT_STREAM=1`,
+`XINFER_GEMMA4_SKIP_DENSE_MASKS=1`, `XINFER_NVFP4_PREFILL_OVERWRITE=1`,
+`XINFER_GEMMA4_BF16_GEMV=1`, `XINFER_NVFP4_HW_DECODE=1`,
+`XINFER_NVFP4_RESIDENT_SCALES=1`, `XINFER_GEMMA4_FUSED_GELU_FP4=1`,
+`XINFER_GEMMA4_PACKED_QKV_NVFP4=1`, `XINFER_FLASH_512_SWIZZLED=1`, and
+`XINFER_GEMMA4_SHARED_KV_SPLITK=1`. Select sizes with
+`XINFER_GEMMA4_BENCH_SIZES=2048,8192,32768`. The paired control changes only
+`XINFER_NVFP4_PREFILL_OVERWRITE=0`.
+
+With both new options enabled, a fresh graph/eager control gives graph decode
+24.041/25.045/27.481 ms at 2K/8K/32K respectively. All 48 continuation logits
+and every cached K/V word match bit for bit for each prefix. Graph capture and
+decode keep initialized FP4 outputs; the allocation optimization applies only
+to prefill. This control is `overwrite-current-graph.*`.
+
+The final ordinary remote-pin build succeeds, including CUDA kernels, and
+remote-pin CPU checks and Clippy pass. Its final GPU rerun is blocked by the
+host driver stack: `/proc/driver/nvidia/version` reports 580.159.03, while
+installed `libcuda`/NVML now report 580.178.04; `nvidia-smi` exits 18 with a
+driver/library mismatch. The retained real-model, randomized and sanitizer
+checks above ran successfully before this change on source byte-identical to
+the published dependency. There are no post-change GPU timing claims.
+Final build/check logs are `remote-{build,clippy,cpu}.log` in the retained
+workspace; a matching driver stack is required for further GPU runs.
+
+### Fresh vLLM control
+
+After the interleaved sweep, the same GB10 ran a fresh isolated vLLM control
+with the same checkpoint, token SHA-256 values and BF16 K/V metadata overlay.
+It uses `nvcr.io/nvidia/vllm:26.05-py3` (v0.20.1+7124b12a.dev), graph mode,
+`gpu_memory_utilization=0.25`, a 64 GiB container limit and a 16 GiB host-memory
+watchdog. Three samples per size give:
+
+| Prefix tokens | Xinfer zeroed prefill, ms | Xinfer overwrite prefill, ms | vLLM prefill, ms | Xinfer graph decode, ms/step | vLLM decode, ms/step |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 210.961 | 182.617 | 169.573 | 24.041 | 21.912 |
+| 8,192 | 980.309 | 875.486 | 822.809 | 25.045 | 23.090 |
+
+The remaining prefill overhead is about 7.7% at 2K and 6.4% at 8K, down from
+24.4% and 19.1% respectively for the paired zeroed-output control. Decode still
+has an observed gap of about 9.7% and 8.5%. These are sequential engine/probe
+measurements, not simultaneous paired kernel timings. Xinfer's probe retrieves
+full logits and chooses tokens on the CPU; vLLM includes scheduling and its
+sampling path. Both use the same prompts and weights, but this is not a claim
+of identical quantization implementations or cross-engine generated tokens.
+vLLM reported its existing unequal-global-scale warning for packed parallel
+linears. The new Xinfer path is bit-identical to its own initialized control.
+
+The retained control exits zero, with no watchdog rejection or foreign compute
+contexts across 142 samples; minimum host `MemAvailable` is 83.1 GiB. Its raw
+rows are `fixture/vllm-results.json`, with `vllm.log` and `vllm-monitor.json`
+under the retained workspace. An earlier completed control gave 817.2 ms at
+8K; its raw temporary logs were removed, so it is not the table's vLLM result.
+No fresh vLLM 32K result is available: this runner retains its 8,256-token limit.
 
 ## Reproduction
 
